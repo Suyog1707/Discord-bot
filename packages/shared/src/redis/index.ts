@@ -14,6 +14,34 @@ import type { Logger } from '../logger/index.js';
 
 export type { Redis, RedisOptions };
 
+type SocketError = Error & {
+  code?: string;
+  address?: string;
+  port?: number;
+  errors?: readonly unknown[];
+};
+
+/**
+ * Reduce a socket error to the fields that identify it.
+ *
+ * Node reports a refused connection as an `AggregateError` whose own `address`
+ * and `port` are undefined — those live on the individual attempts — so the
+ * first sub-error is used to fill them in.
+ */
+function summarizeConnectionError(error: Error): Record<string, unknown> {
+  const socketError = error as SocketError;
+  const [firstAttempt] = (socketError.errors ?? []) as SocketError[];
+  const detail = socketError.address === undefined ? firstAttempt : socketError;
+
+  return {
+    code: socketError.code ?? error.name,
+    address: detail?.address,
+    port: detail?.port,
+    // AggregateError carries an empty message; fall back to the first attempt.
+    reason: error.message || firstAttempt?.message,
+  };
+}
+
 export interface CreateRedisOptions {
   readonly url: string;
   /** Logger for connection lifecycle events. */
@@ -50,14 +78,23 @@ export function createRedisClient({ url, logger, keyPrefix, options }: CreateRed
       logger.info('Redis ready');
     });
     client.on('reconnecting', (delay: number) => {
-      logger.warn({ delay }, 'Redis reconnecting');
+      logger.debug({ delay }, 'Redis reconnecting');
     });
     client.on('end', () => {
-      logger.warn('Redis connection closed');
+      logger.debug('Redis connection closed');
     });
-    // Without a listener, ioredis emits an unhandled 'error' and crashes the process.
+    /**
+     * A listener is mandatory: without one, ioredis emits an unhandled 'error'
+     * and takes the process down.
+     *
+     * Logged as a compact summary rather than the full object. A refused
+     * connection arrives as an `AggregateError` holding one entry per resolved
+     * address (IPv6 and IPv4), so logging it whole prints several near-identical
+     * stacks made entirely of internal `node:net` frames — no signal, and it
+     * buries the actionable warning the caller emits a moment later.
+     */
     client.on('error', (error: Error) => {
-      logger.error({ err: error }, 'Redis error');
+      logger.warn(summarizeConnectionError(error), 'Redis connection error');
     });
   } else {
     client.on('error', () => {

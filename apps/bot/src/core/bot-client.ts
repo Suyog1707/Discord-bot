@@ -12,6 +12,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { getPrismaClient, pingDatabase, type PrismaClient } from '@discord-music/database';
+import { ConfigurationError } from '@discord-music/shared';
 import {
   closeRedis,
   connectRedis,
@@ -26,6 +27,15 @@ import { CommandRegistry } from './command-registry.js';
 import { EventRegistry } from './event-registry.js';
 
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));
+
+/** discord.js signals a rejected credential with the `TokenInvalid` error code. */
+function isInvalidTokenError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    ((error as { code?: unknown }).code === 'TokenInvalid' ||
+      (error as { code?: unknown }).code === 'TokenMissing')
+  );
+}
 
 /**
  * Gateway intents.
@@ -102,33 +112,79 @@ export class BotClient extends Client {
     this.events.attach(this);
 
     await this.#verifyDependencies();
+    await this.#connect();
 
-    await this.login(getEnv().BOT_TOKEN);
     this.logger.info({ durationMs: Date.now() - startedAt }, 'Bot startup complete');
+  }
+
+  /**
+   * Log in to the Discord gateway.
+   *
+   * discord.js reports a bad credential as `TokenInvalid`, whose message
+   * ("An invalid token was provided") does not say *which* value is wrong or
+   * where to get a correct one. It is translated into a `ConfigurationError` so
+   * it prints as a single actionable line instead of a stack trace — this is an
+   * operator problem, not a crash.
+   */
+  async #connect(): Promise<void> {
+    try {
+      await this.login(getEnv().BOT_TOKEN);
+    } catch (error) {
+      if (isInvalidTokenError(error)) {
+        throw new ConfigurationError(
+          'BOT_TOKEN is not a valid Discord bot token. Copy it from ' +
+            'https://discord.com/developers/applications → your application → Bot → Reset Token, ' +
+            'then set BOT_TOKEN in .env and re-run `pnpm run check:env`.',
+          { cause: error },
+        );
+      }
+      throw error;
+    }
   }
 
   /**
    * Verify dependencies before connecting to the gateway.
    *
-   * PostgreSQL is required everywhere — the bot cannot function without it.
-   * Redis and Lavalink are optional in development: an unreachable server logs
-   * a warning and the corresponding features stay disabled, rather than
-   * blocking local work. In production both are mandatory, so a failure here is
-   * fatal and surfaces at deploy time instead of mid-command.
+   * In production every dependency is mandatory and any failure here is fatal,
+   * so a bad deploy is caught at boot rather than mid-command.
+   *
+   * In development none of them block startup: the bot connects to Discord and
+   * commands that need no infrastructure work immediately. Each unavailable
+   * dependency is reported once, loudly, at startup.
    */
   async #verifyDependencies(): Promise<void> {
-    // Optional dependencies are checked first so their status is always visible,
-    // even when the run ends on a missing required one. A developer gets the
-    // whole picture in a single startup instead of fixing one thing at a time.
+    // All three are checked so a single startup reports the complete picture,
+    // rather than surfacing one missing service at a time.
     await this.#verifyRedis();
     this.#reportLavalink();
+    await this.#verifyDatabase();
+  }
 
-    if (!(await pingDatabase(this.prisma))) {
-      throw new Error(
-        'Database is unreachable. Check DATABASE_URL and that PostgreSQL is running.',
-      );
+  /**
+   * Check PostgreSQL connectivity.
+   *
+   * `DATABASE_URL` stays mandatory in every environment and `this.prisma` is
+   * always a real client — only *reachability* is tolerated in development.
+   * Keeping the client non-optional means no feature has to null-check the
+   * database; a command that queries while Postgres is down simply fails at
+   * that point, which is a far better trade than making every future call site
+   * handle an absent client.
+   */
+  async #verifyDatabase(): Promise<void> {
+    if (await pingDatabase(this.prisma)) {
+      this.logger.info('Database reachable');
+      return;
     }
-    this.logger.info('Database reachable');
+
+    const problem = 'Database is unreachable. Check DATABASE_URL and that PostgreSQL is running.';
+
+    if (isProduction()) {
+      throw new Error(problem);
+    }
+
+    this.logger.warn(
+      `${problem} Continuing anyway — any command that reads or writes data will fail until it is running. Start it with \`pnpm run docker:up\`.`,
+    );
   }
 
   async #verifyRedis(): Promise<void> {
@@ -148,10 +204,11 @@ export class BotClient extends Client {
     } catch (error) {
       if (production) throw error;
 
-      // Development: drop the connection and carry on degraded.
+      // Development: drop the connection and carry on degraded. The underlying
+      // socket error was already logged by the client's own error listener, so
+      // only the consequence is reported here.
       this.logger.warn(
-        { err: error },
-        'Redis is unreachable — continuing without it. Run `pnpm run docker:up` to enable caching and rate limiting.',
+        'Redis is unreachable — continuing without it. Caching and rate limiting are disabled. Start it with `pnpm run docker:up`.',
       );
       await closeRedis(this.#redis).catch(() => {
         /* Already failing; nothing useful to do. */
