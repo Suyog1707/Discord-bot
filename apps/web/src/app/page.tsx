@@ -1,4 +1,5 @@
 import { ListMusic, Music4, Radio, ShieldCheck } from 'lucide-react';
+import Link from 'next/link';
 
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -40,7 +41,7 @@ export default function HomePage() {
     <main className="mx-auto flex min-h-dvh w-full max-w-5xl flex-col items-center justify-center gap-12 px-6 py-16">
       <header className="flex flex-col items-center gap-4 text-center">
         <span className="border-border bg-secondary text-secondary-foreground rounded-full border px-3 py-1 text-xs font-medium">
-          Phase 1 · Project setup
+          Open beta
         </span>
         <h1 className="text-balance text-4xl font-bold tracking-tight sm:text-5xl">
           Discord Music Platform
@@ -50,8 +51,8 @@ export default function HomePage() {
           shared packages are in place — features arrive phase by phase.
         </p>
         <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
-          <Button size="lg" disabled>
-            Sign in with Discord (Phase 2)
+          <Button size="lg" asChild>
+            <Link href="/login">Sign in with Discord</Link>
           </Button>
           <Button size="lg" variant="outline" asChild>
             <a href="https://discord.js.org" target="_blank" rel="noreferrer noopener">

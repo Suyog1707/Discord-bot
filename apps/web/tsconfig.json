@@ -4,6 +4,11 @@
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "jsx": "preserve",
     "noEmit": true,
+    // Apps emit no .d.ts; declaration checking would otherwise reject
+    // next-auth's inferred types as "not portable" under pnpm's isolated
+    // node_modules layout.
+    "declaration": false,
+    "declarationMap": false,
     "allowJs": true,
     "module": "ESNext",
     "moduleResolution": "Bundler",

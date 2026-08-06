@@ -33,6 +33,8 @@ model User {
   discriminator String?
   avatar        String?
   email         String?   @unique
+  /// Set by Auth.js when an email is verified; required by the Prisma adapter.
+  emailVerified DateTime? @db.Timestamptz(3)
   locale        String?
   /// Set on every dashboard sign-in; drives retention analytics.
   lastLoginAt   DateTime? @db.Timestamptz(3)
