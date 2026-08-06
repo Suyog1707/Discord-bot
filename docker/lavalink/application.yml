@@ -1,0 +1,96 @@
+# Lavalink v4 configuration.
+#
+# Source support (docs/MUSIC_SYSTEM.md): YouTube, Spotify, SoundCloud, Deezer.
+# YouTube, Spotify and Deezer are served by plugins — Lavalink v4 removed
+# built-in YouTube support, and Spotify/Deezer always required LavaSrc.
+#
+# Plugins are downloaded on first start into the `lavalink-plugins` volume.
+
+server:
+  port: 2333
+  address: 0.0.0.0
+
+lavalink:
+  server:
+    password: '${LAVALINK_SERVER_PASSWORD:youshallnotpass}'
+    sources:
+      # Handled by the youtube-source plugin below, not the built-in source.
+      youtube: false
+      soundcloud: true
+      bandcamp: false
+      twitch: false
+      vimeo: false
+      http: true
+      local: false
+    filters:
+      volume: true
+      equalizer: true
+      karaoke: false
+      timescale: true
+      tremolo: false
+      vibrato: false
+      distortion: false
+      rotation: false
+      channelMix: false
+      lowPass: false
+    bufferDurationMs: 400
+    frameBufferDurationMs: 5000
+    opusEncodingQuality: 10
+    resamplingQuality: LOW
+    trackStuckThresholdMs: 10000
+    useSeekGhosting: true
+    youtubePlaylistLoadLimit: 6
+    playerUpdateInterval: 5
+    gc-warnings: true
+
+  plugins:
+    - dependency: 'dev.lavalink.youtube:youtube-plugin:1.13.5'
+      repository: 'https://maven.lavalink.dev/releases'
+    - dependency: 'com.github.topi314.lavasrc:lavasrc-plugin:4.7.3'
+      repository: 'https://maven.lavalink.dev/releases'
+
+plugins:
+  youtube:
+    enabled: true
+    # MUSIC and WEBEMBEDDED are the most reliable clients; ANDROID_MUSIC covers gaps.
+    clients: ['MUSIC', 'ANDROID_VR', 'WEB', 'WEBEMBEDDED']
+
+  lavasrc:
+    providers:
+      - 'ytsearch:"%ISRC%"'
+      - 'ytsearch:%QUERY%'
+      - 'scsearch:%QUERY%'
+    sources:
+      # Spotify and Deezer resolve metadata, then stream via YouTube/SoundCloud.
+      # Spotify requires client credentials — see docs/MUSIC_SYSTEM.md (Phase 4).
+      spotify: false
+      applemusic: false
+      deezer: false
+      yandexmusic: false
+    spotify:
+      clientId: ''
+      clientSecret: ''
+      countryCode: 'US'
+      playlistLoadLimit: 6
+      albumLoadLimit: 6
+    deezer:
+      masterDecryptionKey: ''
+
+metrics:
+  prometheus:
+    enabled: false
+    endpoint: /metrics
+
+sentry:
+  dsn: ''
+
+logging:
+  file:
+    path: ./logs/
+  level:
+    root: INFO
+    lavalink: INFO
+  logback:
+    rollingpolicy:
+      max-file-size: 25MB
+      max-history: 7

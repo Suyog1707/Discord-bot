@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "allowJs": true,
+    "checkJs": false,
+    "types": ["node"]
+  },
+  "include": ["scripts/**/*.mjs", "*.ts", "*.mjs"],
+  "exclude": ["node_modules", "apps", "packages", "dist", ".next", ".turbo"]
+}

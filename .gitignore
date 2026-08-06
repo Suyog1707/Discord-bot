@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+
+# Turborepo
+.turbo/
+
+# Environment — NEVER commit real secrets (SECURITY.md)
+.env
+.env.*
+!.env.example
+
+# Prisma
+packages/database/generated/
+prisma/*.db
+prisma/*.db-journal
+
+# Testing
+coverage/
+playwright-report/
+test-results/
+.playwright/
+blob-report/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Docker volumes
+docker/data/
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json

@@ -1,0 +1,385 @@
+// Discord Music Platform — database schema
+//
+// Models follow docs/DATABASE.md: User, Guild, Playlist, Queue, SongHistory,
+// Premium, Verification, Session. Auth.js additionally requires Account and
+// VerificationToken, which are included so Phase 2 can adopt the Prisma adapter
+// without a schema migration.
+//
+// Conventions:
+//   - Internal primary keys are cuids; Discord snowflakes are stored as
+//     `String` (they exceed Number.MAX_SAFE_INTEGER) in a `discordId` column.
+//   - Every foreign key is indexed; cascade rules are explicit on every relation.
+//   - Timestamps are `@db.Timestamptz(3)` so no value is stored without a zone.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  /// Discord snowflake — the real identity anchor.
+  discordId     String    @unique
+  username      String
+  globalName    String?
+  discriminator String?
+  avatar        String?
+  email         String?   @unique
+  locale        String?
+  /// Set on every dashboard sign-in; drives retention analytics.
+  lastLoginAt   DateTime? @db.Timestamptz(3)
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime  @updatedAt @db.Timestamptz(3)
+
+  accounts      Account[]
+  sessions      Session[]
+  playlists     Playlist[]
+  premium       Premium?
+  verifications Verification[]
+  guildMembers  GuildMember[]
+  queueTracks   QueueTrack[]
+  songHistory   SongHistory[]
+
+  @@index([createdAt])
+  @@map("users")
+}
+
+/// OAuth provider link (Auth.js `Account` model). One row per provider.
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  /// Encrypted at the application layer before persistence (docs/SECURITY.md).
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+  @@map("accounts")
+}
+
+/// Database-backed session (Auth.js `Session` model).
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime @db.Timestamptz(3)
+  /// Audit fields — useful for "sign out other devices".
+  ipAddress    String?
+  userAgent    String?  @db.Text
+  createdAt    DateTime @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expires])
+  @@map("sessions")
+}
+
+/// Auth.js email/token verification (`VerificationToken` model).
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime @db.Timestamptz(3)
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Guilds
+// ---------------------------------------------------------------------------
+
+model Guild {
+  id          String    @id @default(cuid())
+  /// Discord guild snowflake.
+  discordId   String    @unique
+  name        String
+  icon        String?
+  ownerId     String?
+  /// Cleared when the bot is removed; the row is retained for settings restore.
+  botJoinedAt DateTime? @db.Timestamptz(3)
+  botLeftAt   DateTime? @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(3)
+
+  settings    GuildSettings?
+  queue       Queue?
+  members     GuildMember[]
+  playlists   Playlist[]
+  songHistory SongHistory[]
+  premium     Premium[]
+
+  @@index([botJoinedAt])
+  @@map("guilds")
+}
+
+/// Per-guild configuration, split from `Guild` so hot settings reads stay narrow.
+model GuildSettings {
+  id                 String   @id @default(cuid())
+  guildId            String   @unique
+  prefix             String   @default("!")
+  locale             String   @default("en-US")
+  /// Default playback volume, 0–200 (LIMITS.VOLUME_*).
+  defaultVolume      Int      @default(100)
+  /// Leave the voice channel after this many seconds of inactivity.
+  leaveOnEmptyAfter  Int      @default(300)
+  djRoleId           String?
+  musicChannelId     String?
+  announceNowPlaying Boolean  @default(true)
+  createdAt          DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime @updatedAt @db.Timestamptz(3)
+
+  guild Guild @relation(fields: [guildId], references: [id], onDelete: Cascade)
+
+  @@map("guild_settings")
+}
+
+/// Cached membership + dashboard permissions for a user in a guild.
+model GuildMember {
+  id          String   @id @default(cuid())
+  userId      String
+  guildId     String
+  nickname    String?
+  /// Discord permission bitfield, stored as a string (64-bit).
+  permissions String?
+  isAdmin     Boolean  @default(false)
+  isDj        Boolean  @default(false)
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(3)
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  guild Guild @relation(fields: [guildId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, guildId])
+  @@index([guildId])
+  @@map("guild_members")
+}
+
+// ---------------------------------------------------------------------------
+// Music
+// ---------------------------------------------------------------------------
+
+enum MusicSource {
+  YOUTUBE
+  SPOTIFY
+  SOUNDCLOUD
+  DEEZER
+
+  @@map("music_source")
+}
+
+enum LoopMode {
+  OFF
+  TRACK
+  QUEUE
+
+  @@map("loop_mode")
+}
+
+enum PlaylistVisibility {
+  PRIVATE
+  UNLISTED
+  PUBLIC
+
+  @@map("playlist_visibility")
+}
+
+/// Live playback queue. Exactly one per guild.
+model Queue {
+  id             String   @id @default(cuid())
+  guildId        String   @unique
+  voiceChannelId String?
+  textChannelId  String?
+  /// Index of the currently playing track within `tracks`.
+  currentIndex   Int      @default(0)
+  volume         Int      @default(100)
+  loopMode       LoopMode @default(OFF)
+  shuffled       Boolean  @default(false)
+  paused         Boolean  @default(false)
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @db.Timestamptz(3)
+
+  guild  Guild        @relation(fields: [guildId], references: [id], onDelete: Cascade)
+  tracks QueueTrack[]
+
+  @@map("queues")
+}
+
+model QueueTrack {
+  id            String      @id @default(cuid())
+  queueId       String
+  /// Zero-based position. Unique per queue so reordering stays consistent.
+  position      Int
+  /// Opaque Lavalink encoded track, replayable without re-resolving the source.
+  encoded       String      @db.Text
+  identifier    String
+  title         String
+  author        String
+  /// Track length in milliseconds.
+  durationMs    Int
+  uri           String?     @db.Text
+  artworkUrl    String?     @db.Text
+  isStream      Boolean     @default(false)
+  source        MusicSource
+  requestedById String?
+  createdAt     DateTime    @default(now()) @db.Timestamptz(3)
+
+  queue       Queue @relation(fields: [queueId], references: [id], onDelete: Cascade)
+  requestedBy User? @relation(fields: [requestedById], references: [id], onDelete: SetNull)
+
+  @@unique([queueId, position])
+  @@index([queueId])
+  @@index([requestedById])
+  @@map("queue_tracks")
+}
+
+model Playlist {
+  id          String             @id @default(cuid())
+  ownerId     String
+  /// Set when the playlist is shared with a specific guild rather than a user.
+  guildId     String?
+  name        String
+  description String?            @db.Text
+  coverUrl    String?            @db.Text
+  visibility  PlaylistVisibility @default(PRIVATE)
+  /// Denormalised counters kept in sync inside the same transaction as writes.
+  trackCount  Int                @default(0)
+  playCount   Int                @default(0)
+  createdAt   DateTime           @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime           @updatedAt @db.Timestamptz(3)
+
+  owner  User            @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  guild  Guild?          @relation(fields: [guildId], references: [id], onDelete: SetNull)
+  tracks PlaylistTrack[]
+
+  @@unique([ownerId, name])
+  @@index([guildId])
+  @@index([visibility])
+  @@map("playlists")
+}
+
+model PlaylistTrack {
+  id         String      @id @default(cuid())
+  playlistId String
+  position   Int
+  encoded    String      @db.Text
+  identifier String
+  title      String
+  author     String
+  durationMs Int
+  uri        String?     @db.Text
+  artworkUrl String?     @db.Text
+  source     MusicSource
+  createdAt  DateTime    @default(now()) @db.Timestamptz(3)
+
+  playlist Playlist @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+
+  @@unique([playlistId, position])
+  @@index([playlistId])
+  @@map("playlist_tracks")
+}
+
+/// Append-only playback log powering the Analytics feature.
+model SongHistory {
+  id         String      @id @default(cuid())
+  guildId    String
+  userId     String?
+  identifier String
+  title      String
+  author     String
+  durationMs Int
+  uri        String?     @db.Text
+  source     MusicSource
+  /// How much of the track actually played before skip/stop.
+  playedMs   Int         @default(0)
+  skipped    Boolean     @default(false)
+  playedAt   DateTime    @default(now()) @db.Timestamptz(3)
+
+  guild Guild @relation(fields: [guildId], references: [id], onDelete: Cascade)
+  user  User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([guildId, playedAt])
+  @@index([userId, playedAt])
+  @@index([identifier])
+  @@map("song_history")
+}
+
+// ---------------------------------------------------------------------------
+// Premium & verification
+// ---------------------------------------------------------------------------
+
+enum PremiumTier {
+  FREE
+  PLUS
+  PRO
+
+  @@map("premium_tier")
+}
+
+/// A premium entitlement, attached to a user and optionally scoped to a guild.
+model Premium {
+  id                     String      @id @default(cuid())
+  userId                 String      @unique
+  guildId                String?
+  tier                   PremiumTier @default(FREE)
+  /// Null means "no expiry" (lifetime grant).
+  expiresAt              DateTime?   @db.Timestamptz(3)
+  cancelledAt            DateTime?   @db.Timestamptz(3)
+  /// External billing reference; no card data is ever stored locally.
+  providerCustomerId     String?
+  providerSubscriptionId String?     @unique
+  createdAt              DateTime    @default(now()) @db.Timestamptz(3)
+  updatedAt              DateTime    @updatedAt @db.Timestamptz(3)
+
+  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  guild Guild? @relation(fields: [guildId], references: [id], onDelete: SetNull)
+
+  @@index([guildId])
+  @@index([expiresAt])
+  @@map("premium")
+}
+
+enum VerificationType {
+  ACCOUNT_LINK
+  GUILD_CLAIM
+  PREMIUM_REDEEM
+
+  @@map("verification_type")
+}
+
+/// Short-lived, single-use token for linking accounts or claiming a guild.
+model Verification {
+  id         String           @id @default(cuid())
+  userId     String
+  type       VerificationType
+  /// Hashed token — the plaintext is only ever shown to the requester once.
+  tokenHash  String           @unique
+  metadata   Json?
+  expiresAt  DateTime         @db.Timestamptz(3)
+  consumedAt DateTime?        @db.Timestamptz(3)
+  createdAt  DateTime         @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("verifications")
+}
