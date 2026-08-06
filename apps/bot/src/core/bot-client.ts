@@ -1,12 +1,9 @@
 /**
  * `BotClient` — the discord.js `Client` extended with this project's services.
  *
- * Everything long-lived (registries, database, Redis) hangs off the client so
- * handlers receive it explicitly through their context instead of importing
- * module-level singletons, which keeps them testable.
- *
- * Music (Shoukaku) is attached in Phase 4; the intents and structure needed for
- * it are already in place here.
+ * Everything long-lived (registries, database, Redis, the music engine) hangs
+ * off the client so handlers receive it explicitly through their context
+ * instead of importing module-level singletons, which keeps them testable.
  */
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';

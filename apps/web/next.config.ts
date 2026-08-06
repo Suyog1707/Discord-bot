@@ -17,13 +17,31 @@ if (existsSync(rootEnvPath)) {
 }
 
 /**
- * Security headers applied to every response (docs/SECURITY.md).
+ * Content-Security-Policy.
  *
- * A full Content-Security-Policy is added in Phase 2, once Auth.js and the
- * Discord CDN origins the dashboard actually loads from are known — a CSP
- * written before then would either be wrong or so permissive it is pointless.
+ * Origins are the ones this app actually uses: Discord CDN for avatars/guild
+ * icons, YouTube/Spotify CDNs for artwork. `'unsafe-inline'` on script/style
+ * is required by Next's inline runtime and Tailwind's injected styles; a
+ * nonce-based policy is the known upgrade path once per-request middleware
+ * nonces are worth the complexity.
  */
+const contentSecurityPolicy = [
+  "default-src 'self'",
+  "script-src 'self' 'unsafe-inline'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob: https://cdn.discordapp.com https://media.discordapp.net https://i.ytimg.com https://i.scdn.co",
+  "font-src 'self'",
+  "connect-src 'self'",
+  "frame-ancestors 'none'",
+  "form-action 'self'",
+  "base-uri 'self'",
+  "object-src 'none'",
+  'upgrade-insecure-requests',
+].join('; ');
+
+/** Security headers applied to every response (docs/SECURITY.md). */
 const securityHeaders = [
+  { key: 'Content-Security-Policy', value: contentSecurityPolicy },
   { key: 'X-Content-Type-Options', value: 'nosniff' },
   { key: 'X-Frame-Options', value: 'DENY' },
   { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
