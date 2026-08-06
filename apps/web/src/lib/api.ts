@@ -10,6 +10,23 @@ import { NextResponse } from 'next/server';
 
 import { getLogger } from './logger';
 
+/**
+ * Log without ever throwing.
+ *
+ * The logger reads validated configuration, so a misconfigured environment
+ * makes `getLogger` itself throw. Called from the error path that would be
+ * reporting exactly that failure, it would replace a precise
+ * `ConfigurationError` response with an opaque, body-less 500. The fallback
+ * keeps the diagnosis visible when structured logging is unavailable.
+ */
+function logSafely(level: 'warn' | 'error', payload: Record<string, unknown>): void {
+  try {
+    getLogger('api')[level](payload, 'API request failed');
+  } catch {
+    console.error('API request failed', payload);
+  }
+}
+
 /** `{ success: true, data }` with the given status. */
 export function apiSuccess<TData>(
   data: TData,
@@ -32,8 +49,7 @@ export function apiSuccess<TData>(
 export function handleApiError(error: unknown, route: string): NextResponse<ApiResponse<never>> {
   const appError = toAppError(error);
 
-  const level = appError.expected ? 'warn' : 'error';
-  getLogger('api')[level]({ err: appError, route }, 'API request failed');
+  logSafely(appError.expected ? 'warn' : 'error', { err: appError, route });
 
   const headers: Record<string, string> = {};
   if (appError.code === 'RATE_LIMITED') {

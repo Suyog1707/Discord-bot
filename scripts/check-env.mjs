@@ -92,15 +92,46 @@ const runtimes = [
   { label: 'apps/bot', schema: botEnvSchema },
 ];
 
+/**
+ * `--production` validates against production rules regardless of the NODE_ENV
+ * in `.env`. Redis and Lavalink are optional locally but mandatory once
+ * deployed, so this answers "would this configuration boot in production?"
+ * without having to edit `.env` to find out.
+ */
+const asProduction = process.argv.includes('--production');
+const source = asProduction ? { ...env, NODE_ENV: 'production' } : env;
+
+if (asProduction) {
+  console.log(`${DIM}Validating against production rules (NODE_ENV=production).${RESET}\n`);
+}
+
 let failed = false;
 
 for (const { label, schema } of runtimes) {
   try {
-    parseEnv(schema, env, label);
+    parseEnv(schema, source, label);
     console.log(`${GREEN}✓${RESET} ${label} configuration is valid`);
   } catch (error) {
     failed = true;
     console.error(`${RED}✗${RESET} ${error.message}\n`);
+  }
+}
+
+// Surface optional-but-absent infrastructure so a degraded local setup is a
+// conscious choice rather than a surprise when a feature silently does nothing.
+if (!asProduction && !failed) {
+  const disabled = [];
+  if (!source.REDIS_URL) disabled.push('Redis — caching and rate limiting disabled');
+  if (!source.LAVALINK_HOST || !source.LAVALINK_PASSWORD) {
+    disabled.push('Lavalink — music playback disabled');
+  }
+
+  if (disabled.length > 0) {
+    console.warn(`\n${YELLOW}!${RESET} Optional infrastructure not configured:`);
+    for (const item of disabled) console.warn(`  ${DIM}• ${item}${RESET}`);
+    console.warn(
+      `  ${DIM}Required in production — verify with: pnpm run check:env -- --production${RESET}`,
+    );
   }
 }
 

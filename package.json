@@ -32,7 +32,8 @@
     "docker:down": "docker compose -f docker/docker-compose.yml down",
     "docker:logs": "docker compose -f docker/docker-compose.yml logs -f",
     "clean": "turbo run clean && rm -rf node_modules .turbo",
-    "prepare": "husky"
+    "prepare": "husky",
+    "check:env:prod": "node scripts/check-env.mjs --production"
   },
   "devDependencies": {
     "@discord-music/shared": "workspace:*",

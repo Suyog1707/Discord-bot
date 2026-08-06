@@ -77,7 +77,7 @@ describe('botEnvSchema', () => {
     ).toThrow(/DATABASE_URL must be a PostgreSQL connection string/u);
   });
 
-  it('reports every missing variable at once', () => {
+  it('reports every missing required variable at once', () => {
     let message = '';
     try {
       parseEnv(botEnvSchema, { NODE_ENV: 'test' }, 'apps/bot');
@@ -88,12 +88,96 @@ describe('botEnvSchema', () => {
     expect(message).toContain('apps/bot');
     expect(message).toContain('DATABASE_URL');
     expect(message).toContain('BOT_TOKEN');
-    expect(message).toContain('LAVALINK_HOST');
+    expect(message).toContain('BOT_CLIENT_ID');
+    // Redis and Lavalink are optional outside production, so they must not be
+    // reported here — see the "optional infrastructure" suite below.
+    expect(message).not.toContain('LAVALINK_HOST');
+    expect(message).not.toContain('REDIS_URL');
   });
 
   it('returns a frozen object', () => {
     const env = parseEnv(botEnvSchema, validBotEnv);
     expect(Object.isFrozen(env)).toBe(true);
+  });
+});
+
+describe('optional infrastructure', () => {
+  const withoutOptional = () => {
+    const {
+      REDIS_URL: _redis,
+      LAVALINK_HOST: _host,
+      LAVALINK_PASSWORD: _password,
+      ...rest
+    } = validBotEnv;
+    return rest;
+  };
+
+  it('allows Redis and Lavalink to be omitted outside production', () => {
+    for (const nodeEnv of ['development', 'test'] as const) {
+      const env = parseEnv(botEnvSchema, { ...withoutOptional(), NODE_ENV: nodeEnv }, 'apps/bot');
+
+      expect(env.REDIS_URL).toBeUndefined();
+      expect(env.LAVALINK_HOST).toBeUndefined();
+      expect(env.LAVALINK_PASSWORD).toBeUndefined();
+    }
+  });
+
+  it('treats blank values as omitted outside production', () => {
+    const env = parseEnv(botEnvSchema, {
+      ...validBotEnv,
+      REDIS_URL: '',
+      LAVALINK_HOST: '',
+      LAVALINK_PASSWORD: '',
+    });
+
+    expect(env.REDIS_URL).toBeUndefined();
+    expect(env.LAVALINK_HOST).toBeUndefined();
+  });
+
+  it('requires all of them in production, reporting each by name', () => {
+    let message = '';
+    try {
+      parseEnv(botEnvSchema, { ...withoutOptional(), NODE_ENV: 'production' }, 'apps/bot');
+      expect.unreachable('should have thrown');
+    } catch (error) {
+      message = (error as ConfigurationError).message;
+    }
+
+    expect(message).toContain('REDIS_URL is required when NODE_ENV=production');
+    expect(message).toContain('LAVALINK_HOST is required when NODE_ENV=production');
+    expect(message).toContain('LAVALINK_PASSWORD is required when NODE_ENV=production');
+  });
+
+  it('accepts a fully configured production environment', () => {
+    const env = parseEnv(botEnvSchema, { ...validBotEnv, NODE_ENV: 'production' }, 'apps/bot');
+
+    expect(env.REDIS_URL).toBe('redis://localhost:6379');
+    expect(env.LAVALINK_HOST).toBe('localhost');
+  });
+
+  it('still rejects a malformed value even though it is optional', () => {
+    expect(() => parseEnv(botEnvSchema, { ...validBotEnv, REDIS_URL: 'http://localhost' })).toThrow(
+      /must start with redis:\/\/ or rediss:\/\//u,
+    );
+  });
+
+  it('requires REDIS_URL in production for the web app too', () => {
+    const base = {
+      NODE_ENV: 'production',
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+      NEXT_PUBLIC_APP_URL: 'https://example.com',
+      NEXTAUTH_URL: 'https://example.com',
+      NEXTAUTH_SECRET: 'x'.repeat(32),
+      DISCORD_CLIENT_ID: '123456789012345678',
+      DISCORD_CLIENT_SECRET: 'secret',
+    };
+
+    expect(() => parseEnv(webEnvSchema, base, 'apps/web')).toThrow(
+      /REDIS_URL is required when NODE_ENV=production/u,
+    );
+    expect(() =>
+      parseEnv(webEnvSchema, { ...base, REDIS_URL: 'redis://localhost:6379' }, 'apps/web'),
+    ).not.toThrow();
   });
 });
 

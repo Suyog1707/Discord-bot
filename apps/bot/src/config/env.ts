@@ -28,18 +28,42 @@ export function isDevelopment(): boolean {
   return getEnv().NODE_ENV === 'development';
 }
 
-/** Lavalink node descriptor derived from the validated env (wired up in Phase 4). */
-export function getLavalinkNode(): {
+/** Lavalink connection details. */
+export interface LavalinkNode {
   readonly name: string;
   readonly url: string;
   readonly auth: string;
   readonly secure: boolean;
-} {
+}
+
+/**
+ * Lavalink node descriptor, or `undefined` when Lavalink is not configured.
+ *
+ * Optional in development so the bot can run without an audio server; the env
+ * schema guarantees it is present in production, so this never returns
+ * `undefined` there. Wired into Shoukaku in Phase 4.
+ */
+export function getLavalinkNode(): LavalinkNode | undefined {
   const env = getEnv();
+
+  if (env.LAVALINK_HOST === undefined || env.LAVALINK_PASSWORD === undefined) {
+    return undefined;
+  }
+
   return {
     name: 'main',
     url: `${env.LAVALINK_HOST}:${String(env.LAVALINK_PORT)}`,
     auth: env.LAVALINK_PASSWORD,
     secure: env.LAVALINK_SECURE,
   };
+}
+
+/** Whether music playback can be enabled at all. */
+export function isLavalinkConfigured(): boolean {
+  return getLavalinkNode() !== undefined;
+}
+
+/** Whether Redis-backed features (caching, rate limiting) can be enabled. */
+export function isRedisConfigured(): boolean {
+  return getEnv().REDIS_URL !== undefined;
 }

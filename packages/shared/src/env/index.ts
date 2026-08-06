@@ -53,14 +53,45 @@ function optional<TSchema extends z.ZodType>(schema: TSchema) {
 /* Schemas                                                                     */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Enforce variables that are optional in development but mandatory in production.
+ *
+ * Redis and Lavalink are infrastructure a developer may not want running just to
+ * work on the dashboard or a slash command, so they may be omitted locally and
+ * the apps degrade gracefully. In production they are not optional: a missing
+ * value here is a deployment that silently loses caching, rate limiting or
+ * playback, so it is rejected at boot instead.
+ *
+ * Reported per field, alongside every other problem, in one message.
+ */
+function requireInProduction<TShape extends z.ZodRawShape>(
+  schema: z.ZodObject<TShape>,
+  keys: readonly Extract<keyof TShape, string>[],
+) {
+  return schema.superRefine((value, ctx) => {
+    const parsed = value as Record<string, unknown>;
+    if (parsed.NODE_ENV !== 'production') return;
+
+    for (const key of keys) {
+      if (parsed[key] === undefined) {
+        ctx.addIssue({
+          code: 'custom',
+          path: [key],
+          message: `${key} is required when NODE_ENV=production.`,
+        });
+      }
+    }
+  });
+}
+
 /** Present in every runtime. */
 export const baseEnvSchema = z.object({
   NODE_ENV: nodeEnvSchema,
   LOG_LEVEL: logLevelSchema,
 });
 
-/** Required by anything that talks to Postgres or Redis. */
-export const dataEnvSchema = z.object({
+/** PostgreSQL. Required in every environment — the apps are database-backed. */
+export const databaseEnvSchema = z.object({
   DATABASE_URL: z
     .string()
     .min(1, 'DATABASE_URL is required.')
@@ -68,25 +99,40 @@ export const dataEnvSchema = z.object({
       (value) => value.startsWith('postgres://') || value.startsWith('postgresql://'),
       'DATABASE_URL must be a PostgreSQL connection string.',
     ),
-  REDIS_URL: z
-    .string()
-    .min(1, 'REDIS_URL is required.')
-    .refine(
-      (value) => value.startsWith('redis://') || value.startsWith('rediss://'),
-      'REDIS_URL must start with redis:// or rediss://.',
-    ),
+});
+
+/** Redis. Optional in development, required in production (see `requireInProduction`). */
+export const redisEnvSchema = z.object({
+  REDIS_URL: optional(
+    z
+      .string()
+      .min(1)
+      .refine(
+        (value) => value.startsWith('redis://') || value.startsWith('rediss://'),
+        'REDIS_URL must start with redis:// or rediss://.',
+      ),
+  ),
 });
 
 /** Dashboard (`apps/web`) — server side only. */
-export const webEnvSchema = baseEnvSchema.extend(dataEnvSchema.shape).extend({
-  NEXT_PUBLIC_APP_URL: url,
-  NEXTAUTH_URL: url,
-  NEXTAUTH_SECRET: z
-    .string()
-    .min(32, 'NEXTAUTH_SECRET must be at least 32 characters. Generate: openssl rand -base64 32'),
-  DISCORD_CLIENT_ID: snowflake,
-  DISCORD_CLIENT_SECRET: z.string().min(1, 'DISCORD_CLIENT_SECRET is required.'),
-});
+export const webEnvSchema = requireInProduction(
+  baseEnvSchema
+    .extend(databaseEnvSchema.shape)
+    .extend(redisEnvSchema.shape)
+    .extend({
+      NEXT_PUBLIC_APP_URL: url,
+      NEXTAUTH_URL: url,
+      NEXTAUTH_SECRET: z
+        .string()
+        .min(
+          32,
+          'NEXTAUTH_SECRET must be at least 32 characters. Generate: openssl rand -base64 32',
+        ),
+      DISCORD_CLIENT_ID: snowflake,
+      DISCORD_CLIENT_SECRET: z.string().min(1, 'DISCORD_CLIENT_SECRET is required.'),
+    }),
+  ['REDIS_URL'],
+);
 
 /** Values safe to expose to the browser bundle. Keep this list minimal. */
 export const publicEnvSchema = z.object({
@@ -94,17 +140,24 @@ export const publicEnvSchema = z.object({
 });
 
 /** Bot (`apps/bot`). */
-export const botEnvSchema = baseEnvSchema.extend(dataEnvSchema.shape).extend({
-  BOT_TOKEN: z.string().min(1, 'BOT_TOKEN is required.'),
-  BOT_CLIENT_ID: snowflake,
-  BOT_PUBLIC_KEY: z.string().min(1, 'BOT_PUBLIC_KEY is required.'),
-  /** Register slash commands to one guild for instant iteration during development. */
-  BOT_DEV_GUILD_ID: optional(snowflake),
-  LAVALINK_HOST: z.string().min(1, 'LAVALINK_HOST is required.'),
-  LAVALINK_PORT: port.default(2333),
-  LAVALINK_PASSWORD: z.string().min(1, 'LAVALINK_PASSWORD is required.'),
-  LAVALINK_SECURE: booleanish.default(false),
-});
+export const botEnvSchema = requireInProduction(
+  baseEnvSchema
+    .extend(databaseEnvSchema.shape)
+    .extend(redisEnvSchema.shape)
+    .extend({
+      BOT_TOKEN: z.string().min(1, 'BOT_TOKEN is required.'),
+      BOT_CLIENT_ID: snowflake,
+      BOT_PUBLIC_KEY: z.string().min(1, 'BOT_PUBLIC_KEY is required.'),
+      /** Register slash commands to one guild for instant iteration during development. */
+      BOT_DEV_GUILD_ID: optional(snowflake),
+      /** Lavalink — optional in development, required in production. */
+      LAVALINK_HOST: optional(z.string().min(1)),
+      LAVALINK_PORT: port.default(2333),
+      LAVALINK_PASSWORD: optional(z.string().min(1)),
+      LAVALINK_SECURE: booleanish.default(false),
+    }),
+  ['REDIS_URL', 'LAVALINK_HOST', 'LAVALINK_PASSWORD'],
+);
 
 export type BaseEnv = z.output<typeof baseEnvSchema>;
 export type WebEnv = z.output<typeof webEnvSchema>;
