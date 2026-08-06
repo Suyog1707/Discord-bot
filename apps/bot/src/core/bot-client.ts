@@ -23,7 +23,9 @@ import { Client, GatewayIntentBits, Options, Partials } from 'discord.js';
 
 import { getEnv, getLavalinkNode, isDevelopment, isProduction } from '../config/env.js';
 import { getLogger, logger, type Logger } from '../lib/logger.js';
+import { GuildService } from '../services/guild-service.js';
 import { CommandRegistry } from './command-registry.js';
+import { CooldownManager } from './cooldown.js';
 import { EventRegistry } from './event-registry.js';
 
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));
@@ -55,6 +57,10 @@ export class BotClient extends Client {
   readonly events = new EventRegistry();
   readonly logger: Logger = logger;
   readonly prisma: PrismaClient;
+  /** Per-user command cooldowns (Redis-backed when available). */
+  readonly cooldowns: CooldownManager;
+  /** Domain services. Named container because discord.js already owns `client.guilds`. */
+  readonly services: { readonly guilds: GuildService };
 
   /**
    * Redis, or `undefined` when it is not configured or was unreachable at boot.
@@ -96,6 +102,9 @@ export class BotClient extends Client {
       env.REDIS_URL === undefined
         ? undefined
         : createRedisClient({ url: env.REDIS_URL, logger: getLogger('redis') });
+
+    this.cooldowns = new CooldownManager(this.#redis);
+    this.services = { guilds: new GuildService(this.prisma) };
   }
 
   /**

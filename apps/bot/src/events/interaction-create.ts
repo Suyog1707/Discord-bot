@@ -2,14 +2,15 @@
  * Central interaction dispatcher.
  *
  * All slash-command error handling lives here so individual commands can throw
- * freely and stay focused on their own logic. Full command guards (cooldowns,
- * permissions, DJ role) are implemented in Phase 3; this scaffold covers
- * routing, unknown-command handling and safe error replies.
+ * freely and stay focused on their own logic. Covers routing, guard
+ * enforcement (guild-only, permissions, cooldowns, DJ role), unknown-command
+ * handling and safe error replies.
  */
 import { AppError, toAppError } from '@discord-music/shared';
 import { Events, MessageFlags, type Interaction } from 'discord.js';
 
 import { defineEvent } from '../core/event.js';
+import { runGuards } from '../core/guards.js';
 
 /**
  * Reply with an error, choosing the correct method for the interaction's state.
@@ -70,12 +71,22 @@ export default defineEvent({
       userId: interaction.user.id,
     });
 
-    if (command.guildOnly === true && !interaction.inGuild()) {
-      await replyWithError(interaction, 'This command can only be used in a server.');
+    const startedAt = Date.now();
+
+    // Guards cover guild-only, permissions, cooldowns and the DJ role.
+    try {
+      const guard = await runGuards(client, command, interaction);
+      if (!guard.allowed) {
+        await replyWithError(interaction, guard.message ?? 'You cannot use that right now.');
+        return;
+      }
+    } catch (error) {
+      // A guard that *errors* (e.g. settings lookup with the DB down) must not
+      // dead-end the interaction with silence.
+      commandLogger.error({ err: error }, 'Guard evaluation failed');
+      await replyWithError(interaction, 'Something went wrong checking permissions. Try again.');
       return;
     }
-
-    const startedAt = Date.now();
 
     try {
       await command.execute({ interaction, logger: commandLogger });
