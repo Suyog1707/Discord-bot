@@ -1,0 +1,162 @@
+import 'server-only';
+
+/**
+ * Guild data for the dashboard: server list, detail (settings + queue
+ * snapshot), and settings updates. Authorization always goes through
+ * `requireManagedGuild`; this module never re-implements permission checks.
+ */
+import { LIMITS, parseOrThrow, z } from '@discord-music/shared';
+import type { GuildSettings } from '@discord-music/database';
+
+import { requireManagedGuild } from '@/lib/authz';
+import { getDb } from '@/lib/db';
+import { fetchManageableGuilds } from '@/lib/discord/api';
+import { omitUndefined } from '@/lib/object';
+
+export interface ServerListEntry {
+  readonly discordId: string;
+  readonly name: string;
+  readonly icon: string | null;
+  readonly owner: boolean;
+  /** False → show an invite button instead of a manage link. */
+  readonly botPresent: boolean;
+}
+
+/** Manageable guilds annotated with bot presence, bot-present first. */
+export async function listServers(userId: string): Promise<readonly ServerListEntry[]> {
+  const manageable = await fetchManageableGuilds(userId);
+  if (manageable.length === 0) return [];
+
+  const present = await getDb().guild.findMany({
+    where: { discordId: { in: manageable.map((guild) => guild.id) }, botLeftAt: null },
+    select: { discordId: true },
+  });
+  const presentIds = new Set(present.map((row) => row.discordId));
+
+  return manageable
+    .map((guild) => ({
+      discordId: guild.id,
+      name: guild.name,
+      icon: guild.icon,
+      owner: guild.owner,
+      botPresent: presentIds.has(guild.id),
+    }))
+    .sort((a, b) => Number(b.botPresent) - Number(a.botPresent) || a.name.localeCompare(b.name));
+}
+
+export interface QueueTrackView {
+  readonly position: number;
+  readonly title: string;
+  readonly author: string;
+  readonly durationMs: number;
+  readonly uri: string | null;
+  readonly artworkUrl: string | null;
+  readonly isStream: boolean;
+}
+
+export interface ServerDetail {
+  readonly discordId: string;
+  readonly name: string;
+  readonly icon: string | null;
+  readonly settings: Pick<
+    GuildSettings,
+    'defaultVolume' | 'djRoleId' | 'announceNowPlaying' | 'leaveOnEmptyAfter' | 'musicChannelId'
+  >;
+  readonly queue: {
+    readonly paused: boolean;
+    readonly volume: number;
+    readonly loopMode: string;
+    readonly currentIndex: number;
+    readonly tracks: readonly QueueTrackView[];
+  } | null;
+}
+
+/** Settings + persisted queue snapshot for the server page. */
+export async function getServerDetail(
+  userId: string,
+  discordGuildId: string,
+): Promise<ServerDetail> {
+  const { guild, summary } = await requireManagedGuild(userId, discordGuildId);
+  const db = getDb();
+
+  const [settings, queue] = await Promise.all([
+    db.guildSettings.upsert({
+      where: { guildId: guild.id },
+      update: {},
+      create: { guildId: guild.id },
+    }),
+    db.queue.findUnique({
+      where: { guildId: guild.id },
+      include: { tracks: { orderBy: { position: 'asc' } } },
+    }),
+  ]);
+
+  return {
+    discordId: guild.discordId,
+    name: summary.name,
+    icon: summary.icon,
+    settings: {
+      defaultVolume: settings.defaultVolume,
+      djRoleId: settings.djRoleId,
+      announceNowPlaying: settings.announceNowPlaying,
+      leaveOnEmptyAfter: settings.leaveOnEmptyAfter,
+      musicChannelId: settings.musicChannelId,
+    },
+    queue:
+      queue === null
+        ? null
+        : {
+            paused: queue.paused,
+            volume: queue.volume,
+            loopMode: queue.loopMode.toLowerCase(),
+            currentIndex: queue.currentIndex,
+            tracks: queue.tracks.map((track) => ({
+              position: track.position,
+              title: track.title,
+              author: track.author,
+              durationMs: track.durationMs,
+              uri: track.uri,
+              artworkUrl: track.artworkUrl,
+              isStream: track.isStream,
+            })),
+          },
+  };
+}
+
+export const updateGuildSettingsSchema = z
+  .object({
+    defaultVolume: z.number().int().min(LIMITS.VOLUME_MIN).max(LIMITS.VOLUME_MAX).optional(),
+    djRoleId: z
+      .string()
+      .regex(/^\d{17,20}$/u, 'Must be a Discord role ID.')
+      .nullable()
+      .optional(),
+    announceNowPlaying: z.boolean().optional(),
+    leaveOnEmptyAfter: z.number().int().min(60).max(3600).optional(),
+  })
+  .refine((value) => Object.keys(value).length > 0, 'Provide at least one setting to change.');
+
+export type UpdateGuildSettingsInput = z.input<typeof updateGuildSettingsSchema>;
+
+export async function updateGuildSettings(
+  userId: string,
+  discordGuildId: string,
+  input: unknown,
+): Promise<ServerDetail['settings']> {
+  const { guild } = await requireManagedGuild(userId, discordGuildId);
+  const data = omitUndefined(parseOrThrow(updateGuildSettingsSchema, input));
+
+  const settings = await getDb().guildSettings.upsert({
+    where: { guildId: guild.id },
+    update: data,
+    create: { guildId: guild.id, ...data },
+  });
+
+  return {
+    defaultVolume: settings.defaultVolume,
+    djRoleId: settings.djRoleId,
+    announceNowPlaying: settings.announceNowPlaying,
+    leaveOnEmptyAfter: settings.leaveOnEmptyAfter,
+    musicChannelId: settings.musicChannelId,
+  };
+}

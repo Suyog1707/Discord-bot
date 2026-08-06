@@ -23,6 +23,7 @@ import { Client, GatewayIntentBits, Options, Partials } from 'discord.js';
 
 import { getEnv, getLavalinkNode, isDevelopment, isProduction } from '../config/env.js';
 import { getLogger, logger, type Logger } from '../lib/logger.js';
+import { PlayerCommandSubscriber } from '../music/command-subscriber.js';
 import { MusicManager } from '../music/music-manager.js';
 import { QueueStore } from '../music/queue-store.js';
 import { GuildService } from '../services/guild-service.js';
@@ -82,6 +83,7 @@ export class BotClient extends Client {
   }
 
   #redis: Redis | undefined;
+  #commandSubscriber: PlayerCommandSubscriber | undefined;
   #shuttingDown = false;
 
   constructor() {
@@ -143,6 +145,7 @@ export class BotClient extends Client {
 
     await this.#verifyDependencies();
     await this.#connect();
+    await this.#startCommandSubscriber();
 
     this.logger.info({ durationMs: Date.now() - startedAt }, 'Bot startup complete');
   }
@@ -169,6 +172,26 @@ export class BotClient extends Client {
         );
       }
       throw error;
+    }
+  }
+
+  /**
+   * Listen for dashboard player commands over Redis pub/sub.
+   *
+   * Requires both Redis and the music engine; missing either just means live
+   * control from the dashboard is off, which #verifyDependencies already
+   * reported. Failure here is logged, not fatal — slash commands still work.
+   */
+  async #startCommandSubscriber(): Promise<void> {
+    const redisUrl = getEnv().REDIS_URL;
+    if (this.#redis === undefined || redisUrl === undefined || this.music === undefined) return;
+
+    try {
+      this.#commandSubscriber = new PlayerCommandSubscriber(redisUrl, this.music);
+      await this.#commandSubscriber.start();
+    } catch (error) {
+      this.logger.warn({ err: error }, 'Dashboard command subscriber failed to start');
+      this.#commandSubscriber = undefined;
     }
   }
 
@@ -287,6 +310,7 @@ export class BotClient extends Client {
     const results = await Promise.allSettled([
       this.destroy(),
       this.#redis === undefined ? Promise.resolve() : closeRedis(this.#redis),
+      this.#commandSubscriber === undefined ? Promise.resolve() : this.#commandSubscriber.stop(),
       this.prisma.$disconnect(),
     ]);
 
