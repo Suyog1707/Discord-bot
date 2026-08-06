@@ -4,6 +4,7 @@ import { redirect } from 'next/navigation';
 
 import { signIn } from '@/lib/auth';
 import { getCurrentUser } from '@/lib/auth/session';
+import { safeCallbackUrl } from '@/lib/safe-redirect';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 
@@ -17,12 +18,6 @@ const ERROR_MESSAGES: Record<string, string> = {
   Configuration: 'Sign-in is misconfigured on our side. Please try again later.',
   Verification: 'The sign-in link is no longer valid. Please try again.',
 };
-
-/** Only ever redirect within this site — never to a caller-supplied origin. */
-function safeCallbackUrl(raw: string | undefined): string {
-  if (raw !== undefined && raw.startsWith('/') && !raw.startsWith('//')) return raw;
-  return '/dashboard';
-}
 
 export default async function LoginPage({
   searchParams,

@@ -141,40 +141,56 @@ export async function addTrackToPlaylist(userId: string, playlistId: string, inp
   const track = parseOrThrow(addTrackSchema, input);
   const db = getDb();
 
-  // Ownership + capacity check up front; the write is transactional below.
-  const playlist = await db.playlist.findFirst({
-    where: { id: playlistId, ownerId: userId },
-    select: { id: true, trackCount: true },
-  });
-  if (playlist === null) throw new NotFoundError('Playlist not found.');
-  if (playlist.trackCount >= LIMITS.PLAYLIST_MAX_TRACKS) {
-    throw new ConflictError(
-      `This playlist is full (${String(LIMITS.PLAYLIST_MAX_TRACKS)} tracks).`,
-    );
+  try {
+    // Interactive transaction: the position is derived from the *actual* max
+    // inside the transaction, not a value read earlier — two concurrent adds
+    // would otherwise both compute the same position and hit the
+    // (playlistId, position) unique index.
+    return await db.$transaction(async (tx) => {
+      const playlist = await tx.playlist.findFirst({
+        where: { id: playlistId, ownerId: userId },
+        select: { id: true, trackCount: true },
+      });
+      if (playlist === null) throw new NotFoundError('Playlist not found.');
+      if (playlist.trackCount >= LIMITS.PLAYLIST_MAX_TRACKS) {
+        throw new ConflictError(
+          `This playlist is full (${String(LIMITS.PLAYLIST_MAX_TRACKS)} tracks).`,
+        );
+      }
+
+      const maxPosition = await tx.playlistTrack.aggregate({
+        where: { playlistId },
+        _max: { position: true },
+      });
+
+      const created = await tx.playlistTrack.create({
+        data: {
+          playlistId,
+          position: (maxPosition._max.position ?? -1) + 1,
+          encoded: track.encoded,
+          identifier: track.identifier,
+          title: track.title,
+          author: track.author,
+          durationMs: track.durationMs,
+          uri: track.uri ?? null,
+          artworkUrl: track.artworkUrl ?? null,
+          source: SOURCE_TO_DB[track.source],
+        },
+      });
+      await tx.playlist.update({
+        where: { id: playlistId },
+        data: { trackCount: { increment: 1 } },
+      });
+      return created;
+    });
+  } catch (error) {
+    // A racer can still win the position between our read and write; surface
+    // it as a retryable conflict instead of an opaque 500.
+    if (isUniqueConstraintError(error)) {
+      throw new ConflictError('The playlist changed while adding — try again.');
+    }
+    throw error;
   }
-
-  const [created] = await db.$transaction([
-    db.playlistTrack.create({
-      data: {
-        playlistId,
-        position: playlist.trackCount,
-        encoded: track.encoded,
-        identifier: track.identifier,
-        title: track.title,
-        author: track.author,
-        durationMs: track.durationMs,
-        uri: track.uri ?? null,
-        artworkUrl: track.artworkUrl ?? null,
-        source: SOURCE_TO_DB[track.source],
-      },
-    }),
-    db.playlist.update({
-      where: { id: playlistId },
-      data: { trackCount: { increment: 1 } },
-    }),
-  ]);
-
-  return created;
 }
 
 export async function removeTrackFromPlaylist(
@@ -196,12 +212,23 @@ export async function removeTrackFromPlaylist(
   });
   if (track === null) throw new NotFoundError('Track not found in that playlist.');
 
+  /**
+   * Two-phase gap close. A single `position - 1` updateMany can transiently
+   * collide with the (playlistId, position) unique index depending on row
+   * visit order, since Postgres validates non-deferrable uniques per row.
+   * Moving the tail far above the live range first makes every intermediate
+   * state collision-free regardless of order.
+   */
+  const SHIFT_OFFSET = 1_000_000;
   await db.$transaction([
     db.playlistTrack.delete({ where: { id: track.id } }),
-    // Close the position gap so ordering stays dense.
     db.playlistTrack.updateMany({
       where: { playlistId, position: { gt: track.position } },
-      data: { position: { decrement: 1 } },
+      data: { position: { increment: SHIFT_OFFSET } },
+    }),
+    db.playlistTrack.updateMany({
+      where: { playlistId, position: { gt: SHIFT_OFFSET } },
+      data: { position: { decrement: SHIFT_OFFSET + 1 } },
     }),
     db.playlist.update({
       where: { id: playlistId },

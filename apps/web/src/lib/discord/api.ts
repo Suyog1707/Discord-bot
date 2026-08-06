@@ -49,9 +49,32 @@ interface TokenResponse {
 }
 
 /**
+ * In-flight refreshes per user.
+ *
+ * A dashboard page fans out into several parallel requests that all need a
+ * token; Discord rotates refresh tokens on use, so two concurrent refreshes
+ * with the same token mean the second is rejected and — worse — could
+ * overwrite the freshly rotated pair with a dead one. Deduplicating per
+ * process closes the common same-instance race; the guarded DB write below
+ * protects the cross-instance case.
+ */
+const inFlightRefreshes = new Map<string, Promise<string>>();
+
+/**
  * Return a currently valid access token for the user, refreshing if needed.
  */
 export async function getValidAccessToken(userId: string): Promise<string> {
+  const existing = inFlightRefreshes.get(userId);
+  if (existing !== undefined) return existing;
+
+  const attempt = refreshIfNeeded(userId).finally(() => {
+    inFlightRefreshes.delete(userId);
+  });
+  inFlightRefreshes.set(userId, attempt);
+  return attempt;
+}
+
+async function refreshIfNeeded(userId: string): Promise<string> {
   const db = getDb();
   const account = await db.account.findFirst({
     where: { userId, provider: 'discord' },
@@ -86,19 +109,35 @@ export async function getValidAccessToken(userId: string): Promise<string> {
   });
 
   if (!response.ok) {
-    // A rejected refresh token is unrecoverable server-side; the user must
-    // sign in again. 4xx here means revoked/rotated-away, 5xx is Discord down.
     if (response.status >= 500) {
       throw new UpstreamError('Discord is unavailable. Please try again shortly.');
     }
+
+    // 4xx usually means the refresh token was already used — possibly by a
+    // concurrent request on another instance that won the rotation. Re-read
+    // once: if a fresh token landed meanwhile, use it instead of failing.
+    const rechecked = await db.account.findFirst({
+      where: { userId, provider: 'discord' },
+      select: { access_token: true, expires_at: true },
+    });
+    if (
+      rechecked?.access_token != null &&
+      (rechecked.expires_at ?? 0) * 1000 - EXPIRY_SKEW_MS > Date.now()
+    ) {
+      return rechecked.access_token;
+    }
+
     logger.warn({ userId, status: response.status }, 'Discord token refresh rejected');
     throw new UnauthenticatedError('Your Discord session has expired. Please sign in again.');
   }
 
   const token = (await response.json()) as TokenResponse;
 
-  await db.account.update({
-    where: { id: account.id },
+  // Guarded write: only the request that actually spent this refresh token may
+  // persist the rotation. A racer whose token is already stale matches zero
+  // rows and cannot clobber the winner's fresh pair.
+  await db.account.updateMany({
+    where: { id: account.id, refresh_token: account.refresh_token },
     data: {
       access_token: token.access_token,
       refresh_token: token.refresh_token,

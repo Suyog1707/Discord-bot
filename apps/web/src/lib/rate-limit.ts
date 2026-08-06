@@ -47,12 +47,25 @@ export async function enforceRateLimit(options: RateLimitOptions): Promise<void>
 
   if (redis !== undefined) {
     try {
-      const count = await redis.incr(key);
-      if (count === 1) {
-        await redis.expire(key, windowSeconds);
-      }
+      // Single atomic script: INCR + EXPIRE cannot be two round trips — a
+      // failure between them would leave a counter with no TTL, permanently
+      // rate-limiting the user. The TTL<0 branch also self-heals any key
+      // orphaned by an older code path.
+      const [count, ttl] = (await redis.eval(
+        `local count = redis.call('INCR', KEYS[1])
+if count == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+local ttl = redis.call('TTL', KEYS[1])
+if ttl < 0 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+  ttl = tonumber(ARGV[1])
+end
+return {count, ttl}`,
+        1,
+        key,
+        windowSeconds,
+      )) as [number, number];
+
       if (count > limit) {
-        const ttl = await redis.ttl(key);
         throw new RateLimitError(Math.max(ttl, 1));
       }
       return;
