@@ -1,0 +1,58 @@
+# Changelog
+
+All notable changes to this project. Format loosely follows
+[Keep a Changelog](https://keepachangelog.com); the project is pre-release, so
+everything lives under 0.1.0 until the first deploy.
+
+## 0.1.0 (unreleased)
+
+### Phase 5 — Dashboard
+
+- Full dashboard: servers grid with invite links, server detail with live
+  queue view + player controls + settings form, playlists CRUD, analytics
+  (30-day plays, top tracks, skip rate), premium tier preview, account
+  settings with session revocation.
+- REST API under `/api` (user, server, player, playlist, music, settings)
+  with a uniform response envelope, per-user rate limiting and Zod validation
+  on every input.
+- Live player control from the dashboard to the bot over Redis pub/sub, with
+  the message schema shared and validated on both ends.
+- Production Content-Security-Policy plus the Phase-1 security header set.
+
+### Phase 4 — Music
+
+- Lavalink v4 playback via Shoukaku: per-guild players, queue engine with
+  loop/shuffle semantics, track resolution for URLs and searches
+  (YouTube/SoundCloud, Spotify/Deezer via Lavalink plugins).
+- Slash commands: play, skip, stop, pause, resume, volume, seek, nowplaying,
+  disconnect, queue, shuffle, loop, remove, clear.
+- Queue persistence to PostgreSQL (powers the dashboard queue view) and
+  SongHistory recording (powers analytics).
+- Idle auto-leave driven by voice-channel occupancy and per-guild timeout.
+
+### Phase 3 — Bot core
+
+- Guard pipeline: guild-only, user/bot permissions, per-user cooldowns
+  (Redis-backed with in-memory fallback), DJ role.
+- Guild lifecycle persistence with settings retention across re-invites.
+- Commands: help, stats, settings (volume / dj-role / announce / auto-leave).
+
+### Phase 2 — Authentication
+
+- Discord OAuth2 via Auth.js v5 with database sessions and the Prisma
+  adapter; sessions are revocable from the dashboard.
+- Discord API client with automatic access-token refresh.
+- Protected dashboard shell with middleware fast-path and server-side
+  authoritative session checks.
+
+### Phase 1 — Setup
+
+- pnpm + Turborepo monorepo: `apps/web`, `apps/bot`, `packages/shared`,
+  `packages/database`.
+- Strict TypeScript, shared ESLint flat config, Prettier, Vitest, Playwright,
+  husky + lint-staged, GitHub Actions CI.
+- Prisma schema and initial migration; Docker Compose for PostgreSQL, Redis
+  and Lavalink.
+- Environment validation with per-runtime schemas; Redis/Lavalink optional in
+  development, required in production. PostgreSQL reachability is advisory in
+  development.

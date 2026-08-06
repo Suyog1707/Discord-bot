@@ -6,13 +6,16 @@ with Lavalink playback, Discord OAuth2 authentication and PostgreSQL.
 Development follows the phased process in [`docs/ROADMAP.md`](docs/ROADMAP.md) —
 one phase at a time, each approved before the next begins.
 
-| Phase | Scope     | Status         |
-| ----- | --------- | -------------- |
-| 1     | Setup     | ✅ Complete    |
-| 2     | Auth      | ⏳ Not started |
-| 3     | Bot       | ⏳ Not started |
-| 4     | Music     | ⏳ Not started |
-| 5     | Dashboard | ⏳ Not started |
+| Phase | Scope     | Status      |
+| ----- | --------- | ----------- |
+| 1     | Setup     | ✅ Complete |
+| 2     | Auth      | ✅ Complete |
+| 3     | Bot       | ✅ Complete |
+| 4     | Music     | ✅ Complete |
+| 5     | Dashboard | ✅ Complete |
+
+See [CHANGELOG.md](CHANGELOG.md) for what shipped in each phase and
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the deployment checklist.
 
 ## Requirements
 
