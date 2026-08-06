@@ -23,6 +23,8 @@ import { Client, GatewayIntentBits, Options, Partials } from 'discord.js';
 
 import { getEnv, getLavalinkNode, isDevelopment, isProduction } from '../config/env.js';
 import { getLogger, logger, type Logger } from '../lib/logger.js';
+import { MusicManager } from '../music/music-manager.js';
+import { QueueStore } from '../music/queue-store.js';
 import { GuildService } from '../services/guild-service.js';
 import { CommandRegistry } from './command-registry.js';
 import { CooldownManager } from './cooldown.js';
@@ -60,7 +62,12 @@ export class BotClient extends Client {
   /** Per-user command cooldowns (Redis-backed when available). */
   readonly cooldowns: CooldownManager;
   /** Domain services. Named container because discord.js already owns `client.guilds`. */
-  readonly services: { readonly guilds: GuildService };
+  readonly services: { readonly guilds: GuildService; readonly queueStore: QueueStore };
+  /**
+   * Music engine, or `undefined` when Lavalink is not configured (allowed in
+   * development). Commands go through `requireMusic()` for a friendly error.
+   */
+  readonly music: MusicManager | undefined;
 
   /**
    * Redis, or `undefined` when it is not configured or was unreachable at boot.
@@ -104,7 +111,21 @@ export class BotClient extends Client {
         : createRedisClient({ url: env.REDIS_URL, logger: getLogger('redis') });
 
     this.cooldowns = new CooldownManager(this.#redis);
-    this.services = { guilds: new GuildService(this.prisma) };
+    this.services = {
+      guilds: new GuildService(this.prisma),
+      queueStore: new QueueStore(this.prisma),
+    };
+
+    const lavalinkNode = getLavalinkNode();
+    this.music =
+      lavalinkNode === undefined
+        ? undefined
+        : new MusicManager({
+            client: this,
+            node: lavalinkNode,
+            store: this.services.queueStore,
+            guilds: this.services.guilds,
+          });
   }
 
   /**
@@ -254,6 +275,14 @@ export class BotClient extends Client {
     this.#shuttingDown = true;
 
     this.logger.info({ reason }, 'Shutting down');
+
+    // Players first: they persist their queues and leave voice cleanly while
+    // the gateway connection still exists.
+    if (this.music !== undefined) {
+      await this.music.destroyAll().catch((error: unknown) => {
+        this.logger.warn({ err: error }, 'Music teardown failed during shutdown');
+      });
+    }
 
     const results = await Promise.allSettled([
       this.destroy(),
