@@ -1,10 +1,16 @@
 /** `/play` — resolve a URL or search query and queue the result. */
 import { EmbedBuilder, PermissionFlagsBits } from 'discord.js';
+import { LoadType } from 'shoukaku';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import { formatTrackDuration, trackLink } from '../../music/track.js';
 import { requireMusic, requireVoiceContext } from '../../music/voice-context.js';
+
+/** Discord caps choice names and values at 100 characters. */
+function clip(value: string, max = 100): string {
+  return value.length <= max ? value : `${value.slice(0, max - 1)}…`;
+}
 
 export default defineCommand({
   data: new SlashCommandBuilder()
@@ -15,6 +21,7 @@ export default defineCommand({
         .setName('query')
         .setDescription('A URL (YouTube, Spotify, SoundCloud, Deezer) or a search term')
         .setRequired(true)
+        .setAutocomplete(true)
         .setMaxLength(500),
     )
     .addStringOption((option) =>
@@ -34,6 +41,47 @@ export default defineCommand({
   cooldownSeconds: 2,
   djOnly: true,
   botPermissions: [PermissionFlagsBits.Connect, PermissionFlagsBits.Speak],
+
+  /**
+   * Search-as-you-type suggestions. URLs pass through untouched (suggesting
+   * against them is noise), short inputs wait for more letters, and any
+   * Lavalink hiccup degrades to "no suggestions" — the command still accepts
+   * free text, so autocomplete failing costs nothing.
+   */
+  async autocomplete({ interaction }) {
+    const client = interaction.client as BotClient;
+    const query = interaction.options.getFocused().trim();
+
+    if (query.length < 3 || /^https?:\/\//iu.test(query)) {
+      await interaction.respond([]);
+      return;
+    }
+
+    const node = client.music?.shoukaku.getIdealNode();
+    if (node === undefined) {
+      await interaction.respond([]);
+      return;
+    }
+
+    const response = await node.rest.resolve(`ytsearch:${query}`);
+    if (response?.loadType !== LoadType.SEARCH) {
+      await interaction.respond([]);
+      return;
+    }
+
+    const suggestions = response.data.flatMap((track) => {
+      const uri = track.info.uri;
+      if (uri == null || uri.length > 100) return [];
+      return [
+        {
+          name: clip(`${track.info.title} — ${track.info.author}`),
+          // The URI as the value makes the eventual /play resolve exact.
+          value: uri,
+        },
+      ];
+    });
+    await interaction.respond(suggestions.slice(0, 10));
+  },
 
   async execute({ interaction }) {
     const client = interaction.client as BotClient;
