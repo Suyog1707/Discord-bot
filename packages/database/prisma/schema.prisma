@@ -48,6 +48,7 @@ model User {
   guildMembers  GuildMember[]
   queueTracks   QueueTrack[]
   songHistory   SongHistory[]
+  favorites     FavoriteTrack[]
 
   @@index([createdAt])
   @@map("users")
@@ -144,6 +145,10 @@ model GuildSettings {
   djRoleId           String?
   musicChannelId     String?
   announceNowPlaying Boolean  @default(true)
+  /// 24/7 mode: stay in the voice channel through inactivity and restarts.
+  stayConnected      Boolean  @default(false)
+  /// Smart autoplay: keep playing similar tracks when the queue drains.
+  autoplayEnabled    Boolean  @default(false)
   createdAt          DateTime @default(now()) @db.Timestamptz(3)
   updatedAt          DateTime @updatedAt @db.Timestamptz(3)
 
@@ -295,6 +300,26 @@ model PlaylistTrack {
   @@unique([playlistId, position])
   @@index([playlistId])
   @@map("playlist_tracks")
+}
+
+/// A track a user has marked as a favorite, playable from the bot or dashboard.
+model FavoriteTrack {
+  id         String      @id @default(cuid())
+  userId     String
+  identifier String
+  title      String
+  author     String
+  durationMs Int
+  uri        String?     @db.Text
+  source     MusicSource
+  artworkUrl String?     @db.Text
+  createdAt  DateTime    @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, identifier])
+  @@index([userId, createdAt])
+  @@map("favorite_tracks")
 }
 
 /// Append-only playback log powering the Analytics feature.
