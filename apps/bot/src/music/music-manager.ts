@@ -6,9 +6,22 @@
  * rest of the bot treats `client.music` as `MusicManager | undefined` and
  * degrades cleanly when the audio server is absent in development.
  */
-import { NotFoundError, UpstreamError, ValidationError } from '@discord-music/shared';
+import {
+  isUnreachableError,
+  NotFoundError,
+  summarizeSocketError,
+  UpstreamError,
+  ValidationError,
+} from '@discord-music/shared';
 import type { Client } from 'discord.js';
-import { Connectors, LoadType, Shoukaku, type LavalinkResponse } from 'shoukaku';
+import {
+  Connectors,
+  Constants,
+  LoadType,
+  Shoukaku,
+  type LavalinkResponse,
+  type Node,
+} from 'shoukaku';
 
 import type { LavalinkNode } from '../config/env.js';
 import { getLogger } from '../lib/logger.js';
@@ -18,6 +31,11 @@ import type { QueueStore } from './queue-store.js';
 import { buildSearchQuery, fromLavalinkTrack, type QueuedTrack } from './track.js';
 
 const logger = getLogger('music');
+
+/** How often to re-probe an audio server that Shoukaku gave up on. */
+const RECONNECT_PROBE_INTERVAL_MS = 30_000;
+/** A reachability probe should answer immediately or not at all. */
+const PROBE_TIMEOUT_MS = 2_000;
 
 export interface ResolveResult {
   readonly tracks: readonly QueuedTrack[];
@@ -38,6 +56,10 @@ export class MusicManager {
   readonly #client: Client;
   readonly #store: QueueStore;
   readonly #guilds: GuildService;
+  readonly #node: LavalinkNode;
+  /** Nodes already carrying a give-up listener, so retries never double-log. */
+  readonly #watchedNodes = new WeakSet<Node>();
+  #reconnectTimer: NodeJS.Timeout | undefined;
 
   constructor(options: {
     readonly client: Client;
@@ -48,6 +70,7 @@ export class MusicManager {
     this.#client = options.client;
     this.#store = options.store;
     this.#guilds = options.guilds;
+    this.#node = options.node;
 
     this.shoukaku = new Shoukaku(
       new Connectors.DiscordJS(options.client),
@@ -72,17 +95,121 @@ export class MusicManager {
     );
 
     this.shoukaku.on('ready', (name, lavalinkResume) => {
+      this.#ensureGiveUpWatched();
       logger.info({ node: name, resumed: lavalinkResume }, 'Lavalink node ready');
     });
     this.shoukaku.on('error', (name, error) => {
+      this.#ensureGiveUpWatched();
+      // An absent audio server is an operator problem, not a fault: Node reports
+      // it as an AggregateError whose stack is a wall of duplicated frames
+      // saying nothing the address does not. Log the address and move on — the
+      // give-up handler explains what to do about it.
+      if (isUnreachableError(error)) {
+        logger.warn({ node: name, ...summarizeSocketError(error) }, 'Lavalink node unreachable');
+        return;
+      }
       logger.error({ err: error, node: name }, 'Lavalink node error');
     });
-    this.shoukaku.on('close', (name, code) => {
-      logger.warn({ node: name, code }, 'Lavalink node closed');
+    this.shoukaku.on('close', (name, code, reason) => {
+      logger.warn(
+        { node: name, code, reason: reason === '' ? undefined : reason },
+        'Lavalink node closed',
+      );
     });
     this.shoukaku.on('reconnecting', (name, triesLeft) => {
+      this.#ensureGiveUpWatched();
       logger.warn({ node: name, triesLeft }, 'Lavalink node reconnecting');
     });
+
+    this.#startNodeSupervisor();
+  }
+
+  /**
+   * Announce the moment Shoukaku stops retrying.
+   *
+   * The manager never re-emits `disconnect` despite declaring it — `addNode`
+   * subscribes to the node's own event only to drop it from the pool — so this
+   * listens to the node directly. Without it the bot simply falls silent after
+   * the last retry, which is exactly when an operator needs to be told why
+   * music stopped working.
+   *
+   * Attached on demand rather than in the constructor: the discord.js connector
+   * does not register the node until the gateway client is ready, so there is
+   * nothing to subscribe to until the first node event arrives.
+   */
+  #ensureGiveUpWatched(): void {
+    const node = this.shoukaku.nodes.get(this.#node.name);
+    if (node === undefined || this.#watchedNodes.has(node)) return;
+    this.#watchedNodes.add(node);
+
+    node.once('disconnect', (movedPlayers) => {
+      logger.warn(
+        { node: this.#node.name, address: this.#node.url, movedPlayers },
+        'Lavalink gave up reconnecting — music commands are unavailable until it returns. ' +
+          'Start it with `pnpm run docker:up`; the bot re-checks every 30s.',
+      );
+    });
+  }
+
+  /**
+   * Restore an audio server that Shoukaku has abandoned.
+   *
+   * Once `reconnectTries` is exhausted the node is deleted from the pool and
+   * never retried, so a Lavalink that comes up late — the normal case when the
+   * bot starts before the audio container has finished booting — stays dead
+   * until the process restarts. Re-adding it is only safe once the server is
+   * actually answering: Shoukaku 4.3.0 also discards a retry that *succeeds*
+   * after an earlier failure (`connectError` is never cleared on the success
+   * path), so the probe guarantees the first attempt is the one that lands.
+   */
+  #startNodeSupervisor(): void {
+    if (this.#reconnectTimer !== undefined) return;
+
+    const timer = setInterval(() => {
+      void this.#superviseNode();
+    }, RECONNECT_PROBE_INTERVAL_MS);
+    // Never hold the process open purely to retry an optional dependency.
+    timer.unref();
+    this.#reconnectTimer = timer;
+  }
+
+  #stopNodeSupervisor(): void {
+    if (this.#reconnectTimer === undefined) return;
+    clearInterval(this.#reconnectTimer);
+    this.#reconnectTimer = undefined;
+  }
+
+  async #superviseNode(): Promise<void> {
+    const node = this.shoukaku.nodes.get(this.#node.name);
+    // Present means connected, still retrying, or closing — Shoukaku owns all
+    // three, and stepping in would open a second socket.
+    if (node !== undefined && node.state !== Constants.State.DISCONNECTED) return;
+
+    if (!(await this.#isNodeReachable())) return;
+
+    logger.info({ node: this.#node.name }, 'Lavalink reachable again — rejoining the node pool');
+    if (node !== undefined) this.shoukaku.removeNode(this.#node.name, 'Replaced by supervisor');
+    this.shoukaku.addNode({
+      name: this.#node.name,
+      url: this.#node.url,
+      auth: this.#node.auth,
+      secure: this.#node.secure,
+    });
+    this.#ensureGiveUpWatched();
+  }
+
+  /** Cheap liveness check against the Lavalink REST API. */
+  async #isNodeReachable(): Promise<boolean> {
+    const scheme = this.#node.secure ? 'https' : 'http';
+    try {
+      const response = await fetch(`${scheme}://${this.#node.url}/version`, {
+        headers: { Authorization: this.#node.auth },
+        signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+      });
+      return response.ok;
+    } catch {
+      return false;
+    }
   }
 
   /** Whether at least one Lavalink node is connected and usable. */
@@ -154,6 +281,7 @@ export class MusicManager {
 
   /** Tear down everything — shutdown path. */
   async destroyAll(): Promise<void> {
+    this.#stopNodeSupervisor();
     await Promise.allSettled([...this.#players.keys()].map((id) => this.destroyPlayer(id)));
   }
 

@@ -11,36 +11,9 @@ import { Redis, type RedisOptions } from 'ioredis';
 
 import { UpstreamError } from '../errors/index.js';
 import type { Logger } from '../logger/index.js';
+import { summarizeSocketError } from '../net/index.js';
 
 export type { Redis, RedisOptions };
-
-type SocketError = Error & {
-  code?: string;
-  address?: string;
-  port?: number;
-  errors?: readonly unknown[];
-};
-
-/**
- * Reduce a socket error to the fields that identify it.
- *
- * Node reports a refused connection as an `AggregateError` whose own `address`
- * and `port` are undefined — those live on the individual attempts — so the
- * first sub-error is used to fill them in.
- */
-function summarizeConnectionError(error: Error): Record<string, unknown> {
-  const socketError = error as SocketError;
-  const [firstAttempt] = (socketError.errors ?? []) as SocketError[];
-  const detail = socketError.address === undefined ? firstAttempt : socketError;
-
-  return {
-    code: socketError.code ?? error.name,
-    address: detail?.address,
-    port: detail?.port,
-    // AggregateError carries an empty message; fall back to the first attempt.
-    reason: error.message || firstAttempt?.message,
-  };
-}
 
 export interface CreateRedisOptions {
   readonly url: string;
@@ -94,7 +67,7 @@ export function createRedisClient({ url, logger, keyPrefix, options }: CreateRed
      * buries the actionable warning the caller emits a moment later.
      */
     client.on('error', (error: Error) => {
-      logger.warn(summarizeConnectionError(error), 'Redis connection error');
+      logger.warn(summarizeSocketError(error), 'Redis connection error');
     });
   } else {
     client.on('error', () => {

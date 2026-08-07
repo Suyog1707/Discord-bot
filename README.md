@@ -94,6 +94,23 @@ pnpm --filter @discord-music/bot run dev
 pnpm --filter @discord-music/bot run commands:deploy
 ```
 
+## Troubleshooting
+
+**`ECONNREFUSED …:2333` in the bot log.** Lavalink is not up. It takes ~15s to
+boot (longer on the first run, which downloads plugins), so this is expected
+briefly after `pnpm run docker:up`. The bot re-checks every 30s and connects
+itself once the server answers — no restart needed. If it never connects, read
+`docker logs dmp-lavalink`: a crash-looping container reports
+`Restarting (1)` in `docker ps`.
+
+**Music commands report the server is unavailable.** The bot logs `Lavalink gave
+up reconnecting` when it has exhausted its retries. Start the container and wait
+for the next probe; `curl -H "Authorization: $LAVALINK_PASSWORD"
+http://localhost:2333/version` confirms the server is reachable from the host.
+
+**Ports already in use.** Override `POSTGRES_PORT`, `REDIS_PORT` or
+`LAVALINK_PORT` in `.env` — the compose file reads all three.
+
 ## Conventions
 
 - **Strict TypeScript** everywhere — see [`tsconfig.base.json`](tsconfig.base.json).

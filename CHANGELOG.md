@@ -6,6 +6,22 @@ everything lives under 0.1.0 until the first deploy.
 
 ## 0.1.0 (unreleased)
 
+### Fixed
+
+- Lavalink never started: the image ships no `/opt/Lavalink/plugins`, so Docker
+  created the named volume owned by root while the server runs as uid 322 and
+  its plugin downloads failed with "Permission denied", crash-looping before it
+  could bind port 2333. A `lavalink-init` service now claims the volume first,
+  repairing volumes left root-owned by earlier runs.
+- The bot no longer stays mute for the rest of the process when Lavalink is slow
+  to boot. Shoukaku deletes a node from the pool once `reconnectTries` is
+  exhausted and never retries it; a supervisor now probes the REST API every 30s
+  and re-adds the node when it answers. Probing first also sidesteps a Shoukaku
+  4.3.0 bug that discards a retry succeeding after an earlier failure.
+- Unreachable-host errors are logged as one compact line (code, address, port,
+  reason) instead of an `AggregateError` stack wall, and exhausting the retries
+  now logs what broke and how to fix it rather than falling silent.
+
 ### Phase 5 — Dashboard
 
 - Full dashboard: servers grid with invite links, server detail with live
