@@ -265,6 +265,8 @@ model Playlist {
   description String?            @db.Text
   coverUrl    String?            @db.Text
   visibility  PlaylistVisibility @default(PRIVATE)
+  /// Optional folder name for organising a user's playlists; null = unfiled.
+  folder      String?
   /// Denormalised counters kept in sync inside the same transaction as writes.
   trackCount  Int                @default(0)
   playCount   Int                @default(0)
@@ -277,6 +279,7 @@ model Playlist {
 
   @@unique([ownerId, name])
   @@index([guildId])
+  @@index([ownerId, folder])
   @@index([visibility])
   @@map("playlists")
 }

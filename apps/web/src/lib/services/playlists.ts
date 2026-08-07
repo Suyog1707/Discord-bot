@@ -26,6 +26,7 @@ import { omitUndefined } from '@/lib/object';
 export const createPlaylistSchema = z.object({
   name: nonEmptyString(LIMITS.PLAYLIST_NAME_MAX_LENGTH, 'Playlist name'),
   description: z.string().trim().max(LIMITS.PLAYLIST_DESCRIPTION_MAX_LENGTH).optional(),
+  folder: z.string().trim().min(1).max(LIMITS.PLAYLIST_NAME_MAX_LENGTH).optional(),
 });
 
 export const updatePlaylistSchema = z
@@ -38,6 +39,7 @@ export const updatePlaylistSchema = z
       .nullable()
       .optional(),
     visibility: z.enum(['PRIVATE', 'UNLISTED', 'PUBLIC']).optional(),
+    folder: z.string().trim().min(1).max(LIMITS.PLAYLIST_NAME_MAX_LENGTH).nullable().optional(),
   })
   .refine((value) => Object.keys(value).length > 0, 'Provide at least one field to change.');
 
@@ -70,6 +72,7 @@ export async function listPlaylists(userId: string) {
       name: true,
       description: true,
       visibility: true,
+      folder: true,
       trackCount: true,
       playCount: true,
       updatedAt: true,
@@ -103,7 +106,12 @@ export async function createPlaylist(userId: string, input: unknown): Promise<Pl
 
   try {
     return await db.playlist.create({
-      data: { ownerId: userId, name: data.name, description: data.description ?? null },
+      data: {
+        ownerId: userId,
+        name: data.name,
+        description: data.description ?? null,
+        folder: data.folder ?? null,
+      },
     });
   } catch (error) {
     if (isUniqueConstraintError(error)) {
@@ -235,4 +243,111 @@ export async function removeTrackFromPlaylist(
       data: { trackCount: { decrement: 1 } },
     }),
   ]);
+}
+
+/* ------------------------------------------------- export / import / copy */
+
+/** Portable playlist document — version-tagged so future formats can evolve. */
+export const playlistExportSchema = z.object({
+  format: z.literal('discord-music-playlist/v1'),
+  name: nonEmptyString(LIMITS.PLAYLIST_NAME_MAX_LENGTH, 'Playlist name'),
+  description: z.string().trim().max(LIMITS.PLAYLIST_DESCRIPTION_MAX_LENGTH).nullable(),
+  folder: z.string().trim().min(1).max(LIMITS.PLAYLIST_NAME_MAX_LENGTH).nullable(),
+  tracks: z
+    .array(
+      addTrackSchema.extend({
+        // Lavalink's encoded blob is version-specific; imports may omit it and
+        // the bot re-resolves by URI at play time, exactly like favorites.
+        encoded: z.string().max(4096).optional(),
+      }),
+    )
+    .max(LIMITS.PLAYLIST_MAX_TRACKS),
+});
+
+export type PlaylistExport = z.infer<typeof playlistExportSchema>;
+
+const DB_TO_SOURCE = {
+  [MusicSource.YOUTUBE]: 'youtube',
+  [MusicSource.SPOTIFY]: 'spotify',
+  [MusicSource.SOUNDCLOUD]: 'soundcloud',
+  [MusicSource.DEEZER]: 'deezer',
+} as const;
+
+/** Serialise a playlist to the portable document. */
+export async function exportPlaylist(userId: string, playlistId: string): Promise<PlaylistExport> {
+  const playlist = await getPlaylist(userId, playlistId);
+
+  return {
+    format: 'discord-music-playlist/v1',
+    name: playlist.name,
+    description: playlist.description,
+    folder: playlist.folder,
+    tracks: playlist.tracks.map((track) => ({
+      encoded: track.encoded,
+      identifier: track.identifier,
+      title: track.title,
+      author: track.author,
+      durationMs: track.durationMs,
+      uri: track.uri,
+      artworkUrl: track.artworkUrl,
+      source: DB_TO_SOURCE[track.source],
+    })),
+  };
+}
+
+/** Create a playlist (plus tracks) from a portable document in one transaction. */
+export async function importPlaylist(userId: string, input: unknown) {
+  const data = parseOrThrow(playlistExportSchema, input);
+  const db = getDb();
+
+  const count = await db.playlist.count({ where: { ownerId: userId } });
+  if (count >= LIMITS.PLAYLIST_MAX_PER_USER) {
+    throw new ConflictError(
+      `You have reached the limit of ${String(LIMITS.PLAYLIST_MAX_PER_USER)} playlists.`,
+    );
+  }
+
+  // A name clash gets a suffix rather than an error: importing someone
+  // else's export of "Late night mix" should never require manual renaming.
+  const existing = await db.playlist.findUnique({
+    where: { ownerId_name: { ownerId: userId, name: data.name } },
+    select: { id: true },
+  });
+  const name = existing === null ? data.name : `${data.name} (imported)`.slice(0, 100);
+
+  try {
+    return await db.playlist.create({
+      data: {
+        ownerId: userId,
+        name,
+        description: data.description,
+        folder: data.folder,
+        trackCount: data.tracks.length,
+        tracks: {
+          create: data.tracks.map((track, position) => ({
+            position,
+            encoded: track.encoded ?? '',
+            identifier: track.identifier,
+            title: track.title,
+            author: track.author,
+            durationMs: track.durationMs,
+            uri: track.uri ?? null,
+            artworkUrl: track.artworkUrl ?? null,
+            source: SOURCE_TO_DB[track.source],
+          })),
+        },
+      },
+    });
+  } catch (error) {
+    if (isUniqueConstraintError(error)) {
+      throw new ConflictError('A playlist with that name appeared just now — try again.');
+    }
+    throw error;
+  }
+}
+
+/** Copy one of the user's own playlists, tracks included. */
+export async function duplicatePlaylist(userId: string, playlistId: string) {
+  const original = await exportPlaylist(userId, playlistId);
+  return importPlaylist(userId, { ...original, name: `${original.name} (copy)`.slice(0, 100) });
 }
