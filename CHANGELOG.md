@@ -6,6 +6,31 @@ everything lives under 0.1.0 until the first deploy.
 
 ## 0.1.0 (unreleased)
 
+### Added — feature expansion
+
+- **Queue navigation**: `/previous`, `/restart`, `/jump`, `/move`, `/swap`
+  alongside the existing skip/shuffle/loop/remove/clear; history stays
+  immutable, only upcoming tracks reorder.
+- **Audio filters**: `/filter` with 11 presets — bass boost, treble boost,
+  nightcore, vaporwave, karaoke, 8D, tremolo, vibrato, soft distortion,
+  mono, low pass — plus parameterised speed and pitch. All native Lavalink
+  filters; echo/reverb are not offered because the engine has no native
+  support.
+- **Favorites**: `/favorite add|list|play|remove` in Discord and a
+  Favorites dashboard page backed by `GET/DELETE /api/user/favorites`; the
+  Discord snowflake ties both to the same account.
+- **Smart autoplay**: when the queue drains with autoplay on, the bot seeds
+  searches from recently played artists and continues with fresh tracks —
+  nothing recently played, no streams, at most two picks per artist.
+- **24/7 mode**: `/247` (and a dashboard toggle) keeps the bot in voice
+  through inactivity and restores voice + queue after a restart.
+- **Dashboard live queue editing**: play-now, move and remove per upcoming
+  row, plus Previous and loop-mode controls; all through the shared
+  validated command channel.
+- **Transport buttons** on `/nowplaying` (previous, pause/resume, skip,
+  stop), gated to listeners in the bot's voice channel.
+- `/history` shows the server's recent plays.
+
 ### Removed
 
 - The entire premium system, before it ever gated anything: the `Premium`
