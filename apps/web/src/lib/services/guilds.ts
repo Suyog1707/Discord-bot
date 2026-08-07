@@ -8,10 +8,17 @@ import 'server-only';
 import { LIMITS, parseOrThrow, z } from '@discord-music/shared';
 import type { GuildSettings } from '@discord-music/database';
 
+import {
+  encodePlayerCommand,
+  PLAYER_COMMAND_CHANNEL,
+  playerCommandSchema,
+} from '@discord-music/shared';
+
 import { requireManagedGuild } from '@/lib/authz';
 import { getDb } from '@/lib/db';
 import { fetchManageableGuilds } from '@/lib/discord/api';
 import { omitUndefined } from '@/lib/object';
+import { getRedis } from '@/lib/redis';
 
 export interface ServerListEntry {
   readonly discordId: string;
@@ -60,7 +67,13 @@ export interface ServerDetail {
   readonly icon: string | null;
   readonly settings: Pick<
     GuildSettings,
-    'defaultVolume' | 'djRoleId' | 'announceNowPlaying' | 'leaveOnEmptyAfter' | 'musicChannelId'
+    | 'defaultVolume'
+    | 'djRoleId'
+    | 'announceNowPlaying'
+    | 'leaveOnEmptyAfter'
+    | 'musicChannelId'
+    | 'stayConnected'
+    | 'autoplayEnabled'
   >;
   readonly queue: {
     readonly paused: boolean;
@@ -101,6 +114,8 @@ export async function getServerDetail(
       announceNowPlaying: settings.announceNowPlaying,
       leaveOnEmptyAfter: settings.leaveOnEmptyAfter,
       musicChannelId: settings.musicChannelId,
+      stayConnected: settings.stayConnected,
+      autoplayEnabled: settings.autoplayEnabled,
     },
     queue:
       queue === null
@@ -133,6 +148,8 @@ export const updateGuildSettingsSchema = z
       .optional(),
     announceNowPlaying: z.boolean().optional(),
     leaveOnEmptyAfter: z.number().int().min(60).max(3600).optional(),
+    stayConnected: z.boolean().optional(),
+    autoplayEnabled: z.boolean().optional(),
   })
   .refine((value) => Object.keys(value).length > 0, 'Provide at least one setting to change.');
 
@@ -152,11 +169,31 @@ export async function updateGuildSettings(
     create: { guildId: guild.id, ...data },
   });
 
+  // Live players learn about 24/7 / autoplay changes immediately over the
+  // command channel; without Redis they pick them up on the next join.
+  if (data.stayConnected !== undefined || data.autoplayEnabled !== undefined) {
+    const redis = getRedis();
+    if (redis !== undefined) {
+      const sync = playerCommandSchema.parse({
+        action: 'sync-settings',
+        guildId: discordGuildId,
+        // System-issued on behalf of the guild manager; the guild snowflake
+        // stands in because the authorizer is already recorded in the API log.
+        issuedBy: discordGuildId,
+        ...(data.stayConnected === undefined ? {} : { stayConnected: data.stayConnected }),
+        ...(data.autoplayEnabled === undefined ? {} : { autoplayEnabled: data.autoplayEnabled }),
+      });
+      await redis.publish(PLAYER_COMMAND_CHANNEL, encodePlayerCommand(sync)).catch(() => 0);
+    }
+  }
+
   return {
     defaultVolume: settings.defaultVolume,
     djRoleId: settings.djRoleId,
     announceNowPlaying: settings.announceNowPlaying,
     leaveOnEmptyAfter: settings.leaveOnEmptyAfter,
     musicChannelId: settings.musicChannelId,
+    stayConnected: settings.stayConnected,
+    autoplayEnabled: settings.autoplayEnabled,
   };
 }
