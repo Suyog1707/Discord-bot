@@ -130,6 +130,9 @@ export const webEnvSchema = requireInProduction(
         ),
       DISCORD_CLIENT_ID: snowflake,
       DISCORD_CLIENT_SECRET: z.string().min(1, 'DISCORD_CLIENT_SECRET is required.'),
+      /** Spotify integration — optional; linking/import stay hidden without it. */
+      SPOTIFY_CLIENT_ID: optional(z.string().min(1)),
+      SPOTIFY_CLIENT_SECRET: optional(z.string().min(1)),
     }),
   ['REDIS_URL'],
 );
@@ -155,6 +158,9 @@ export const botEnvSchema = requireInProduction(
       LAVALINK_PORT: port.default(2333),
       LAVALINK_PASSWORD: optional(z.string().min(1)),
       LAVALINK_SECURE: booleanish.default(false),
+      /** Spotify Web API (client credentials) for URL metadata. Optional. */
+      SPOTIFY_CLIENT_ID: optional(z.string().min(1)),
+      SPOTIFY_CLIENT_SECRET: optional(z.string().min(1)),
     }),
   ['REDIS_URL', 'LAVALINK_HOST', 'LAVALINK_PASSWORD'],
 );

@@ -9,7 +9,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { getPrismaClient, pingDatabase, type PrismaClient } from '@discord-music/database';
-import { ConfigurationError } from '@discord-music/shared';
+import { ConfigurationError, PLAYER_EVENT_CHANNEL } from '@discord-music/shared';
 import {
   closeRedis,
   connectRedis,
@@ -130,6 +130,11 @@ export class BotClient extends Client {
             node: lavalinkNode,
             store: this.services.queueStore,
             guilds: this.services.guilds,
+            // Realtime events ride the shared Redis connection; without Redis
+            // the dashboard simply has no live stream (allowed in development).
+            publishEvent: (payload) => {
+              this.#redis?.publish(PLAYER_EVENT_CHANNEL, payload).catch(() => 0);
+            },
           });
   }
 

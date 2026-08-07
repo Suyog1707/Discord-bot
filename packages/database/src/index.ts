@@ -31,6 +31,7 @@ export type {
   QueueTrack,
   Session,
   SongHistory,
+  SpotifyAccount,
   User,
   Verification,
   VerificationToken,

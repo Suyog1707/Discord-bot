@@ -49,6 +49,7 @@ model User {
   queueTracks   QueueTrack[]
   songHistory   SongHistory[]
   favorites     FavoriteTrack[]
+  spotify       SpotifyAccount?
 
   @@index([createdAt])
   @@map("users")
@@ -257,21 +258,27 @@ model QueueTrack {
 }
 
 model Playlist {
-  id          String             @id @default(cuid())
-  ownerId     String
+  id                String             @id @default(cuid())
+  ownerId           String
   /// Set when the playlist is shared with a specific guild rather than a user.
-  guildId     String?
-  name        String
-  description String?            @db.Text
-  coverUrl    String?            @db.Text
-  visibility  PlaylistVisibility @default(PRIVATE)
+  guildId           String?
+  name              String
+  description       String?            @db.Text
+  coverUrl          String?            @db.Text
+  visibility        PlaylistVisibility @default(PRIVATE)
   /// Optional folder name for organising a user's playlists; null = unfiled.
-  folder      String?
+  folder            String?
+  /// Set when this playlist mirrors a Spotify playlist/album/liked-songs.
+  spotifyId         String?
+  /// Spotify's snapshot_id at last sync — unchanged snapshot ⇒ nothing to do.
+  spotifySnapshotId String?
+  /// Last successful Spotify synchronisation.
+  syncedAt          DateTime?          @db.Timestamptz(3)
   /// Denormalised counters kept in sync inside the same transaction as writes.
-  trackCount  Int                @default(0)
-  playCount   Int                @default(0)
-  createdAt   DateTime           @default(now()) @db.Timestamptz(3)
-  updatedAt   DateTime           @updatedAt @db.Timestamptz(3)
+  trackCount        Int                @default(0)
+  playCount         Int                @default(0)
+  createdAt         DateTime           @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime           @updatedAt @db.Timestamptz(3)
 
   owner  User            @relation(fields: [ownerId], references: [id], onDelete: Cascade)
   guild  Guild?          @relation(fields: [guildId], references: [id], onDelete: SetNull)
@@ -303,6 +310,30 @@ model PlaylistTrack {
   @@unique([playlistId, position])
   @@index([playlistId])
   @@map("playlist_tracks")
+}
+
+/// A linked Spotify account. Tokens are AES-256-GCM encrypted by the web app
+/// before storage — the database never sees plaintext credentials.
+model SpotifyAccount {
+  id           String   @id @default(cuid())
+  userId       String   @unique
+  spotifyId    String
+  displayName  String?
+  country      String?
+  /// Encrypted (AES-256-GCM, `iv:ciphertext:tag` base64) — never plaintext.
+  accessToken  String   @db.Text
+  /// Encrypted like `accessToken`.
+  refreshToken String   @db.Text
+  expiresAt    DateTime @db.Timestamptz(3)
+  /// Space-separated OAuth scopes granted at link time.
+  scopes       String
+  createdAt    DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([spotifyId])
+  @@map("spotify_accounts")
 }
 
 /// A track a user has marked as a favorite, playable from the bot or dashboard.

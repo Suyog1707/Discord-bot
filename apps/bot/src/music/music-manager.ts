@@ -7,11 +7,14 @@
  * degrades cleanly when the audio server is absent in development.
  */
 import {
+  encodePlayerEvent,
   isUnreachableError,
   NotFoundError,
   summarizeSocketError,
   UpstreamError,
   ValidationError,
+  type PlayerEventType,
+  type PlayerSnapshot,
 } from '@discord-music/shared';
 import type { Client } from 'discord.js';
 import {
@@ -61,16 +64,21 @@ export class MusicManager {
   readonly #watchedNodes = new WeakSet<Node>();
   #reconnectTimer: NodeJS.Timeout | undefined;
 
+  readonly #publishEvent: ((payload: string) => void) | undefined;
+
   constructor(options: {
     readonly client: Client;
     readonly node: LavalinkNode;
     readonly store: QueueStore;
     readonly guilds: GuildService;
+    /** Serialised event sink; absent when Redis is not configured. */
+    readonly publishEvent?: (payload: string) => void;
   }) {
     this.#client = options.client;
     this.#store = options.store;
     this.#guilds = options.guilds;
     this.#node = options.node;
+    this.#publishEvent = options.publishEvent;
 
     this.shoukaku = new Shoukaku(
       new Connectors.DiscordJS(options.client),
@@ -260,7 +268,12 @@ export class MusicManager {
         await this.destroyPlayer(guildId);
       },
       onAutoplayRequest: (guildId) => this.pickAutoplayTracks(guildId),
+      onEvent: (type, state) => {
+        this.#emitEvent(options.guildId, type, state);
+      },
     });
+
+    this.#emitEvent(options.guildId, 'PLAYER_CONNECT', guildPlayer.snapshot());
 
     this.#players.set(options.guildId, guildPlayer);
     logger.info({ guildId: options.guildId, channelId: options.voiceChannelId }, 'Player created');
@@ -373,6 +386,10 @@ export class MusicManager {
         logger.warn({ err: error, guildId }, '24/7 restore failed for this guild');
       }
     }
+  }
+
+  #emitEvent(guildId: string, type: PlayerEventType, state: PlayerSnapshot | null): void {
+    this.#publishEvent?.(encodePlayerEvent({ type, guildId, sentAt: Date.now(), state }));
   }
 
   /** Tear down a guild's player and leave its voice channel. */

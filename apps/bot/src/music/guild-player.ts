@@ -5,7 +5,12 @@
  * into queue transitions, announces tracks, records history, persists the
  * queue, and manages the idle timer that leaves empty channels.
  */
-import { LIMITS, type LoopMode } from '@discord-music/shared';
+import {
+  LIMITS,
+  type LoopMode,
+  type PlayerEventType,
+  type PlayerSnapshot,
+} from '@discord-music/shared';
 import { EmbedBuilder, type Client } from 'discord.js';
 import type { FilterOptions, Player } from 'shoukaku';
 
@@ -37,6 +42,8 @@ export interface GuildPlayerOptions {
    * continue with (may be empty — the player then parks as usual).
    */
   readonly onAutoplayRequest: (guildId: string) => Promise<readonly QueuedTrack[]>;
+  /** Fire-and-forget realtime event sink (Redis → dashboard SSE). */
+  readonly onEvent?: (type: PlayerEventType, state: PlayerSnapshot | null) => void;
 }
 
 export class GuildPlayer {
@@ -63,6 +70,7 @@ export class GuildPlayer {
   #autoplayActive = false;
   #activeFilter: FilterPresetName | 'speed' | 'pitch' | null = null;
   readonly #onAutoplayRequest: (guildId: string) => Promise<readonly QueuedTrack[]>;
+  readonly #onEvent: ((type: PlayerEventType, state: PlayerSnapshot | null) => void) | undefined;
 
   constructor(options: GuildPlayerOptions) {
     this.guildId = options.guildId;
@@ -78,6 +86,7 @@ export class GuildPlayer {
     this.#autoplayEnabled = options.autoplayEnabled;
     this.#onSelfDestruct = options.onSelfDestruct;
     this.#onAutoplayRequest = options.onAutoplayRequest;
+    this.#onEvent = options.onEvent;
     this.#logger = getLogger('guild-player').child({ guildId: options.guildId });
 
     this.#attachPlayerEvents();
@@ -90,7 +99,9 @@ export class GuildPlayer {
   }
 
   set voiceChannelId(channelId: string) {
+    const moved = this.#voiceChannelId !== channelId;
     this.#voiceChannelId = channelId;
+    if (moved) this.#emit('VOICE_MOVE');
   }
 
   get volume(): number {
@@ -121,6 +132,7 @@ export class GuildPlayer {
     } else if (!this.isPlaying) {
       this.#startIdleTimer();
     }
+    this.#emit('STAY_CONNECTED_CHANGE');
   }
 
   get autoplayEnabled(): boolean {
@@ -129,6 +141,7 @@ export class GuildPlayer {
 
   setAutoplayEnabled(enabled: boolean): void {
     this.#autoplayEnabled = enabled;
+    this.#emit('AUTOPLAY_CHANGE');
   }
 
   /** The filter preset currently applied, or null for clean playback. */
@@ -145,6 +158,7 @@ export class GuildPlayer {
   ): Promise<{ position: number; startedPlayback: boolean }> {
     const position = this.queue.add(tracks, options);
     this.#persist();
+    this.#emit('QUEUE_UPDATE');
 
     if (!this.isPlaying) {
       const first = this.queue.advance() ?? this.queue.jumpTo(position);
@@ -198,13 +212,19 @@ export class GuildPlayer {
 
   moveUpcoming(from: number, to: number): QueuedTrack | null {
     const moved = this.queue.moveUpcoming(from, to);
-    if (moved !== null) this.#persist();
+    if (moved !== null) {
+      this.#persist();
+      this.#emit('QUEUE_REORDER');
+    }
     return moved;
   }
 
   swapUpcoming(a: number, b: number): boolean {
     const swapped = this.queue.swapUpcoming(a, b);
-    if (swapped) this.#persist();
+    if (swapped) {
+      this.#persist();
+      this.#emit('QUEUE_REORDER');
+    }
     return swapped;
   }
 
@@ -221,47 +241,60 @@ export class GuildPlayer {
       await this.#player.setFilters(filters);
     }
     this.#activeFilter = name;
+    this.#emit('FILTER_CHANGE');
   }
 
   async pause(): Promise<void> {
     await this.#player.setPaused(true);
     this.#persist();
+    this.#emit('TRACK_PAUSE');
   }
 
   async resume(): Promise<void> {
     await this.#player.setPaused(false);
     this.#persist();
+    this.#emit('TRACK_RESUME');
   }
 
   async setVolume(volume: number): Promise<void> {
     this.#volume = volume;
     await this.#player.setGlobalVolume(volume);
     this.#persist();
+    this.#emit('VOLUME_CHANGE');
   }
 
   async seekTo(positionMs: number): Promise<void> {
     await this.#player.seekTo(positionMs);
+    this.#emit('SEEK');
   }
 
   setLoopMode(mode: LoopMode): void {
     this.queue.loopMode = mode;
     this.#persist();
+    this.#emit('LOOP_CHANGE');
   }
 
   shuffle(): void {
     this.queue.shuffle();
     this.#persist();
+    this.#emit('QUEUE_REORDER');
   }
 
   removeUpcoming(upcomingIndex: number): QueuedTrack | null {
     const removed = this.queue.removeUpcoming(upcomingIndex);
-    if (removed !== null) this.#persist();
+    if (removed !== null) {
+      this.#persist();
+      this.#emit('QUEUE_UPDATE');
+    }
     return removed;
   }
 
   clearUpcoming(): number {
     const removed = this.queue.clearUpcoming();
-    if (removed > 0) this.#persist();
+    if (removed > 0) {
+      this.#persist();
+      this.#emit('QUEUE_CLEAR');
+    }
     return removed;
   }
 
@@ -272,12 +305,14 @@ export class GuildPlayer {
     await this.#player.stopTrack();
     this.#persist();
     this.#startIdleTimer();
+    this.#emit('QUEUE_CLEAR');
   }
 
   /** Full teardown. Called by the manager on disconnect. */
   async destroy(): Promise<void> {
     if (this.#destroyed) return;
     this.#destroyed = true;
+    this.#emit('PLAYER_DISCONNECT');
 
     this.#clearIdleTimer();
     this.#player.removeAllListeners();
@@ -299,6 +334,7 @@ export class GuildPlayer {
     this.#player.on('start', () => {
       this.#trackStartedAt = Date.now();
       this.#clearIdleTimer();
+      this.#emit('TRACK_START');
       const track = this.queue.current;
       if (track !== null && this.#announce) {
         void this.#announceNowPlaying(track);
@@ -353,6 +389,7 @@ export class GuildPlayer {
 
     if (next === null) {
       this.#persist();
+      this.#emit('TRACK_END');
       if (await this.#tryAutoplay()) return;
       await this.#notify('✅ Queue finished. Add more with `/play`.');
       this.#startIdleTimer();
@@ -430,6 +467,44 @@ export class GuildPlayer {
       }
     } catch (error) {
       this.#logger.debug({ err: error }, 'Channel notification failed');
+    }
+  }
+
+  /** Full state snapshot for realtime consumers. */
+  snapshot(): PlayerSnapshot {
+    const toView = (track: QueuedTrack) => ({
+      identifier: track.identifier,
+      title: track.title,
+      author: track.author,
+      durationMs: track.durationMs,
+      uri: track.uri,
+      artworkUrl: track.artworkUrl,
+      isStream: track.isStream,
+      source: track.source,
+      requestedByName: track.requestedByName,
+    });
+    const upcoming = this.queue.upcoming;
+
+    return {
+      current: this.queue.current === null ? null : toView(this.queue.current),
+      positionMs: Math.max(0, Math.round(this.positionMs)),
+      paused: this.paused,
+      volume: this.#volume,
+      loopMode: this.queue.loopMode,
+      autoplayEnabled: this.#autoplayEnabled,
+      stayConnected: this.#stayConnected,
+      activeFilter: this.#activeFilter,
+      voiceChannelId: this.#voiceChannelId,
+      upcoming: upcoming.slice(0, 100).map(toView),
+      upcomingTotal: upcoming.length,
+    };
+  }
+
+  #emit(type: PlayerEventType): void {
+    try {
+      this.#onEvent?.(type, this.#destroyed ? null : this.snapshot());
+    } catch (error) {
+      this.#logger.debug({ err: error, type }, 'Player event sink failed');
     }
   }
 

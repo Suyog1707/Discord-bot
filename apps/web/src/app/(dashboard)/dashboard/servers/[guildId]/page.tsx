@@ -9,8 +9,7 @@ import { requireUserOrRedirect } from '@/lib/auth/session';
 import { formNumber, formString } from '@/lib/forms';
 import { guildIconUrl } from '@/lib/discord/cdn';
 import { getServerDetail, updateGuildSettings } from '@/lib/services/guilds';
-import { PlayerControls } from '@/components/dashboard/player-controls';
-import { QueueList } from '@/components/dashboard/queue-list';
+import { LivePlayer } from '@/components/dashboard/live-player';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -40,6 +39,42 @@ export default async function ServerDetailPage({
   }
 
   const icon = guildIconUrl({ id: detail.discordId, icon: detail.icon });
+
+  // Last persisted state seeds the live view; the SSE stream takes over from
+  // the first event. Position is unknown between persists, so it starts at 0.
+  const queueTracks = detail.queue?.tracks ?? [];
+  const currentIndex = detail.queue?.currentIndex ?? 0;
+  const currentTrack = queueTracks.find((track) => track.position === currentIndex) ?? null;
+  const toSnapshotTrack = (track: (typeof queueTracks)[number]) => ({
+    // The persisted view has no identifier/source; position + URI are enough
+    // to seed the display until the first live snapshot replaces everything.
+    identifier: `persisted-${String(track.position)}`,
+    title: track.title,
+    author: track.author,
+    durationMs: track.durationMs,
+    uri: track.uri,
+    artworkUrl: track.artworkUrl,
+    isStream: track.isStream,
+    source: 'queue',
+    requestedByName: 'queue',
+  });
+  const upcoming = queueTracks.filter((track) => track.position > currentIndex);
+  const initialSnapshot =
+    detail.queue === null || currentTrack === null
+      ? null
+      : {
+          current: toSnapshotTrack(currentTrack),
+          positionMs: 0,
+          paused: detail.queue.paused,
+          volume: detail.queue.volume,
+          loopMode: detail.queue.loopMode.toLowerCase() as 'off' | 'track' | 'queue',
+          autoplayEnabled: detail.settings.autoplayEnabled,
+          stayConnected: detail.settings.stayConnected,
+          activeFilter: null,
+          voiceChannelId: null,
+          upcoming: upcoming.slice(0, 100).map(toSnapshotTrack),
+          upcomingTotal: upcoming.length,
+        };
 
   async function saveSettings(formData: FormData) {
     'use server';
@@ -83,17 +118,7 @@ export default async function ServerDetailPage({
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
-            <PlayerControls
-              guildId={detail.discordId}
-              paused={detail.queue?.paused ?? false}
-              volume={detail.queue?.volume ?? detail.settings.defaultVolume}
-              loopMode={detail.queue?.loopMode ?? 'OFF'}
-            />
-            <QueueList
-              guildId={detail.discordId}
-              tracks={detail.queue?.tracks ?? []}
-              currentIndex={detail.queue?.currentIndex ?? 0}
-            />
+            <LivePlayer guildId={detail.discordId} initial={initialSnapshot} />
           </CardContent>
         </Card>
 
