@@ -31,6 +31,12 @@ import { getLogger } from '../lib/logger.js';
 import type { GuildService } from '../services/guild-service.js';
 import { ControllerMessage } from './controller.js';
 import { GuildPlayer } from './guild-player.js';
+import {
+  isSpotifyConfigured,
+  isSpotifyUrl,
+  resolveSpotifyUrl,
+  searchQueryFor,
+} from './spotify-resolver.js';
 import type { QueueStore } from './queue-store.js';
 import { buildSearchQuery, fromLavalinkTrack, type QueuedTrack } from './track.js';
 
@@ -293,6 +299,48 @@ export class MusicManager {
     return guildPlayer;
   }
 
+  /** Map each Spotify track to its best playable match via Lavalink search. */
+  async #resolveSpotify(
+    url: string,
+    requestedBy: { readonly id: string; readonly name: string },
+  ): Promise<ResolveResult> {
+    const node = this.shoukaku.getIdealNode();
+    if (node === undefined) {
+      throw new UpstreamError('The music server is not available right now. Try again shortly.');
+    }
+
+    const resolution = await resolveSpotifyUrl(url);
+    if (resolution.tracks.length === 0) {
+      throw new NotFoundError('That Spotify link contains no playable tracks.');
+    }
+
+    const matched: QueuedTrack[] = [];
+    for (const meta of resolution.tracks) {
+      try {
+        const response = await node.rest.resolve(`ytsearch:${searchQueryFor(meta)}`);
+        if (response?.loadType !== LoadType.SEARCH) continue;
+        const [best] = response.data;
+        if (best === undefined) continue;
+        const track = fromLavalinkTrack(best, requestedBy);
+        // Keep Spotify metadata for display; playback uses the matched source.
+        matched.push({
+          ...track,
+          title: meta.title,
+          author: meta.artist,
+          artworkUrl: meta.artworkUrl ?? track.artworkUrl,
+          source: 'spotify',
+        });
+      } catch (error) {
+        logger.debug({ err: error, title: meta.title }, 'Spotify track match failed');
+      }
+    }
+
+    if (matched.length === 0) {
+      throw new NotFoundError('No playable matches found for that Spotify link.');
+    }
+    return { tracks: matched, playlistName: resolution.collectionName };
+  }
+
   /**
    * Smart autoplay: pick tracks that continue the guild's listening session.
    *
@@ -445,6 +493,17 @@ export class MusicManager {
     const node = this.shoukaku.getIdealNode();
     if (node === undefined) {
       throw new UpstreamError('The music server is not available right now. Try again shortly.');
+    }
+
+    // Spotify links: metadata from the Web API, audio via search on the
+    // playback sources — Spotify audio itself is never streamed.
+    if (isSpotifyUrl(input)) {
+      if (!isSpotifyConfigured()) {
+        throw new UpstreamError(
+          'Spotify links are not enabled on this bot (missing SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET).',
+        );
+      }
+      return this.#resolveSpotify(input, requestedBy);
     }
 
     let response: LavalinkResponse | undefined;
