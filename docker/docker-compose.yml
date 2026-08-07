@@ -51,10 +51,32 @@ services:
       timeout: 5s
       retries: 5
 
+  # The Lavalink image ships no /opt/Lavalink/plugins directory, so Docker
+  # creates the named volume's mountpoint owned by root while the server runs as
+  # uid 322. Plugin downloads then fail with "Permission denied" and the server
+  # never starts. Claim the volume before the server boots; this also repairs a
+  # volume left root-owned by an earlier run.
+  lavalink-init:
+    image: ghcr.io/lavalink-devs/lavalink:4
+    container_name: dmp-lavalink-init
+    user: root
+    entrypoint:
+      [
+        'sh',
+        '-c',
+        'mkdir -p /opt/Lavalink/plugins && chown -R 322:322 /opt/Lavalink/plugins',
+      ]
+    volumes:
+      - lavalink-plugins:/opt/Lavalink/plugins
+    restart: 'no'
+
   lavalink:
     image: ghcr.io/lavalink-devs/lavalink:4
     container_name: dmp-lavalink
     restart: unless-stopped
+    depends_on:
+      lavalink-init:
+        condition: service_completed_successfully
     environment:
       _JAVA_OPTIONS: -Xmx1G
       SERVER_PORT: 2333
