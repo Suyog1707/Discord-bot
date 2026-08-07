@@ -83,6 +83,27 @@ export class PlayerCommandSubscriber {
       case 'shuffle':
         player.shuffle();
         return;
+      case 'previous':
+        await player.previous();
+        return;
+      case 'jump':
+        await player.jumpTo(player.queue.currentIndex + command.position);
+        return;
+      case 'remove':
+        player.removeUpcoming(command.position - 1);
+        return;
+      case 'move':
+        player.moveUpcoming(command.from - 1, command.to - 1);
+        return;
+      case 'loop':
+        player.setLoopMode(command.mode);
+        return;
+      case 'sync-settings':
+        if (command.stayConnected !== undefined) player.setStayConnected(command.stayConnected);
+        if (command.autoplayEnabled !== undefined) {
+          player.setAutoplayEnabled(command.autoplayEnabled);
+        }
+        return;
     }
   }
 }

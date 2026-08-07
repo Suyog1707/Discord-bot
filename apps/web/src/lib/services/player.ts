@@ -27,6 +27,15 @@ export const playerActionSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('stop') }),
   z.object({ action: z.literal('shuffle') }),
   z.object({ action: z.literal('volume'), volume: z.number().int().min(0).max(200) }),
+  z.object({ action: z.literal('previous') }),
+  z.object({ action: z.literal('jump'), position: z.number().int().min(1) }),
+  z.object({ action: z.literal('remove'), position: z.number().int().min(1) }),
+  z.object({
+    action: z.literal('move'),
+    from: z.number().int().min(1),
+    to: z.number().int().min(1),
+  }),
+  z.object({ action: z.literal('loop'), mode: z.enum(['off', 'track', 'queue']) }),
 ]);
 
 export type PlayerActionInput = z.infer<typeof playerActionSchema>;

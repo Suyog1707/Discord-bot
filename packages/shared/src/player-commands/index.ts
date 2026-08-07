@@ -47,6 +47,47 @@ export const playerCommandSchema = z.discriminatedUnion('action', [
     guildId: snowflakeSchema,
     issuedBy: snowflakeSchema,
   }),
+  z.object({
+    action: z.literal('previous'),
+    guildId: snowflakeSchema,
+    issuedBy: snowflakeSchema,
+  }),
+  z.object({
+    action: z.literal('jump'),
+    guildId: snowflakeSchema,
+    issuedBy: snowflakeSchema,
+    /** 1-based position within the upcoming tracks, as shown in queue views. */
+    position: z.number().int().min(1).max(LIMITS.QUEUE_MAX_TRACKS),
+  }),
+  z.object({
+    action: z.literal('remove'),
+    guildId: snowflakeSchema,
+    issuedBy: snowflakeSchema,
+    /** 1-based position within the upcoming tracks. */
+    position: z.number().int().min(1).max(LIMITS.QUEUE_MAX_TRACKS),
+  }),
+  z.object({
+    action: z.literal('move'),
+    guildId: snowflakeSchema,
+    issuedBy: snowflakeSchema,
+    /** 1-based positions within the upcoming tracks. */
+    from: z.number().int().min(1).max(LIMITS.QUEUE_MAX_TRACKS),
+    to: z.number().int().min(1).max(LIMITS.QUEUE_MAX_TRACKS),
+  }),
+  z.object({
+    action: z.literal('loop'),
+    guildId: snowflakeSchema,
+    issuedBy: snowflakeSchema,
+    mode: z.enum(['off', 'track', 'queue']),
+  }),
+  z.object({
+    /** Settings changed on the dashboard that a live player applies in place. */
+    action: z.literal('sync-settings'),
+    guildId: snowflakeSchema,
+    issuedBy: snowflakeSchema,
+    stayConnected: z.boolean().optional(),
+    autoplayEnabled: z.boolean().optional(),
+  }),
 ]);
 
 export type PlayerCommand = z.infer<typeof playerCommandSchema>;

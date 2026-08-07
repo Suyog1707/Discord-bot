@@ -1,3 +1,4 @@
+import { QueueRowActions } from '@/components/dashboard/queue-row-actions';
 import type { QueueTrackView } from '@/lib/services/guilds';
 import { cn, formatDuration } from '@/lib/utils';
 
@@ -6,9 +7,11 @@ import { cn, formatDuration } from '@/lib/utils';
  * database — the bot persists its in-memory queue with a short debounce.
  */
 export function QueueList({
+  guildId,
   tracks,
   currentIndex,
 }: {
+  guildId: string;
   tracks: readonly QueueTrackView[];
   currentIndex: number;
 }) {
@@ -25,11 +28,13 @@ export function QueueList({
       {tracks.map((track) => {
         const isCurrent = track.position === currentIndex;
         const isPast = track.position < currentIndex;
+        const upcomingPosition = track.position - currentIndex;
+        const lastPosition = tracks.length - 1 - currentIndex;
         return (
           <li
             key={`${String(track.position)}-${track.title}`}
             className={cn(
-              'flex items-center gap-3 rounded-md px-2 py-1.5 text-sm',
+              'group flex items-center gap-3 rounded-md px-2 py-1.5 text-sm',
               isCurrent && 'bg-primary/10 border-primary border-l-2',
               isPast && 'opacity-50',
             )}
@@ -57,6 +62,13 @@ export function QueueList({
             <span className="text-muted-foreground shrink-0 font-mono text-xs">
               {track.isStream ? 'LIVE' : formatDuration(track.durationMs)}
             </span>
+            {!isCurrent && !isPast && (
+              <QueueRowActions
+                guildId={guildId}
+                position={upcomingPosition}
+                isLast={upcomingPosition === lastPosition}
+              />
+            )}
           </li>
         );
       })}

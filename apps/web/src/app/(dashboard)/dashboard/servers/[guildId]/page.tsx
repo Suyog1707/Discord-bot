@@ -50,6 +50,8 @@ export default async function ServerDetailPage({
       defaultVolume: formNumber(formData, 'defaultVolume'),
       leaveOnEmptyAfter: formNumber(formData, 'leaveOnEmptyAfter'),
       announceNowPlaying: formData.get('announceNowPlaying') === 'on',
+      stayConnected: formData.get('stayConnected') === 'on',
+      autoplayEnabled: formData.get('autoplayEnabled') === 'on',
       djRoleId: djRoleRaw === '' ? null : djRoleRaw,
     });
 
@@ -85,8 +87,10 @@ export default async function ServerDetailPage({
               guildId={detail.discordId}
               paused={detail.queue?.paused ?? false}
               volume={detail.queue?.volume ?? detail.settings.defaultVolume}
+              loopMode={detail.queue?.loopMode ?? 'OFF'}
             />
             <QueueList
+              guildId={detail.discordId}
               tracks={detail.queue?.tracks ?? []}
               currentIndex={detail.queue?.currentIndex ?? 0}
             />
@@ -151,6 +155,26 @@ export default async function ServerDetailPage({
                   className="accent-primary size-4"
                 />
                 Announce now playing in the text channel
+              </Label>
+
+              <Label className="cursor-pointer">
+                <input
+                  type="checkbox"
+                  name="stayConnected"
+                  defaultChecked={detail.settings.stayConnected}
+                  className="accent-primary size-4"
+                />
+                24/7 mode — stay in voice and rejoin after restarts
+              </Label>
+
+              <Label className="cursor-pointer">
+                <input
+                  type="checkbox"
+                  name="autoplayEnabled"
+                  defaultChecked={detail.settings.autoplayEnabled}
+                  className="accent-primary size-4"
+                />
+                Smart autoplay — continue with similar tracks when the queue ends
               </Label>
 
               <Button type="submit" className="self-start">

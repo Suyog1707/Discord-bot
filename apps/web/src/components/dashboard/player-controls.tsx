@@ -7,7 +7,17 @@
  * here is optimistic-lite: the button reflects the *requested* state and the
  * page refresh (router.refresh) pulls the persisted truth.
  */
-import { Pause, Play, Shuffle, SkipForward, Square, Volume2 } from 'lucide-react';
+import {
+  Pause,
+  Play,
+  Repeat,
+  Repeat1,
+  Shuffle,
+  SkipBack,
+  SkipForward,
+  Square,
+  Volume2,
+} from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { useState, useTransition } from 'react';
 
@@ -17,17 +27,20 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 
 type PlayerAction =
-  | { action: 'pause' | 'resume' | 'skip' | 'stop' | 'shuffle' }
-  | { action: 'volume'; volume: number };
+  | { action: 'pause' | 'resume' | 'skip' | 'stop' | 'shuffle' | 'previous' }
+  | { action: 'volume'; volume: number }
+  | { action: 'loop'; mode: 'off' | 'track' | 'queue' };
 
 export function PlayerControls({
   guildId,
   paused,
   volume,
+  loopMode,
 }: {
   guildId: string;
   paused: boolean;
   volume: number;
+  loopMode: string;
 }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
@@ -61,6 +74,16 @@ export function PlayerControls({
   return (
     <div className="flex flex-col gap-2">
       <div className="flex flex-wrap items-center gap-2">
+        <Button
+          size="sm"
+          variant="secondary"
+          disabled={pending}
+          onClick={() => {
+            send({ action: 'previous' });
+          }}
+        >
+          <SkipBack aria-hidden /> Previous
+        </Button>
         {paused ? (
           <Button
             size="sm"
@@ -101,6 +124,23 @@ export function PlayerControls({
           }}
         >
           <Shuffle aria-hidden /> Shuffle
+        </Button>
+        <Button
+          size="sm"
+          variant={loopMode === 'TRACK' ? 'default' : 'secondary'}
+          disabled={pending}
+          title="Cycle loop: off → track → queue"
+          onClick={() => {
+            const next = loopMode === 'OFF' ? 'track' : loopMode === 'TRACK' ? 'queue' : 'off';
+            send({ action: 'loop', mode: next });
+          }}
+        >
+          {loopMode === 'TRACK' ? <Repeat1 aria-hidden /> : <Repeat aria-hidden />}
+          {loopMode === 'QUEUE'
+            ? 'Loop: queue'
+            : loopMode === 'TRACK'
+              ? 'Loop: track'
+              : 'Loop: off'}
         </Button>
         <Button
           size="sm"
