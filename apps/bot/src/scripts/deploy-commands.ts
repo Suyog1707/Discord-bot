@@ -10,6 +10,7 @@
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { ConfigurationError } from '@discord-music/shared';
 import { REST, Routes } from 'discord.js';
 
 import { getEnv, isDevelopment } from '../config/env.js';
@@ -18,6 +19,32 @@ import { getLogger } from '../lib/logger.js';
 
 const logger = getLogger('deploy-commands');
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Refuse to deploy to a guild the bot is not a member of.
+ *
+ * A mistyped `BOT_DEV_GUILD_ID` otherwise fails with a raw Discord 400 (or,
+ * for a plausible-looking id, silently registers commands where nobody will
+ * ever see them) — which presents as "slash commands do not appear" with no
+ * hint of the cause. Membership is the one check that catches both.
+ */
+async function assertBotIsMember(rest: REST, guildId: string): Promise<void> {
+  const guilds = (await rest.get(Routes.userGuilds())) as readonly { id: string; name: string }[];
+  const match = guilds.find((guild) => guild.id === guildId);
+  if (match !== undefined) {
+    logger.info({ guildId, guild: match.name }, 'Target guild verified');
+    return;
+  }
+
+  const memberOf =
+    guilds.length === 0
+      ? 'The bot is not a member of any server — invite it first.'
+      : `The bot is a member of: ${guilds.map((guild) => `${guild.name} (${guild.id})`).join(', ')}.`;
+  throw new ConfigurationError(
+    `BOT_DEV_GUILD_ID=${guildId} is not a server the bot belongs to. ${memberOf} ` +
+      'Check the value for typos, or invite the bot to that server and re-run.',
+  );
+}
 
 async function main(): Promise<void> {
   const env = getEnv();
@@ -35,6 +62,10 @@ async function main(): Promise<void> {
 
   const body = clear ? [] : registry.toDeploymentPayload({ includeDevOnly: isDevelopment() });
   const rest = new REST({ version: '10' }).setToken(env.BOT_TOKEN);
+
+  if (devGuildId !== undefined) {
+    await assertBotIsMember(rest, devGuildId);
+  }
 
   const route =
     devGuildId === undefined
