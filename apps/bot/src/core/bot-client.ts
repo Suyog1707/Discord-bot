@@ -26,6 +26,7 @@ import { QueueStore } from '../music/queue-store.js';
 import { FavoritesService } from '../services/favorites-service.js';
 import { GuildService } from '../services/guild-service.js';
 import { PlaylistsService } from '../services/playlists-service.js';
+import { SpotifyService } from '../services/spotify-service.js';
 import { CommandRegistry } from './command-registry.js';
 import { CooldownManager } from './cooldown.js';
 import { EventRegistry } from './event-registry.js';
@@ -67,6 +68,7 @@ export class BotClient extends Client {
     readonly queueStore: QueueStore;
     readonly favorites: FavoritesService;
     readonly playlists: PlaylistsService;
+    readonly spotify: SpotifyService;
   };
   /**
    * Music engine, or `undefined` when Lavalink is not configured (allowed in
@@ -122,6 +124,7 @@ export class BotClient extends Client {
       queueStore: new QueueStore(this.prisma),
       favorites: new FavoritesService(this.prisma),
       playlists: new PlaylistsService(this.prisma),
+      spotify: new SpotifyService(this.prisma),
     };
 
     const lavalinkNode = getLavalinkNode();

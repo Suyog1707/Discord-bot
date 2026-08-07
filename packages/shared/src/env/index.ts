@@ -161,6 +161,14 @@ export const botEnvSchema = requireInProduction(
       /** Spotify Web API (client credentials) for URL metadata. Optional. */
       SPOTIFY_CLIENT_ID: optional(z.string().min(1)),
       SPOTIFY_CLIENT_SECRET: optional(z.string().min(1)),
+      /**
+       * Same value as the web app's NEXTAUTH_SECRET. Lets the bot decrypt the
+       * Spotify tokens the dashboard stored, enabling `/spotify playlists`.
+       * Optional — without it those commands point at the dashboard instead.
+       */
+      NEXTAUTH_SECRET: optional(z.string().min(32)),
+      /** Public dashboard URL for links in bot replies (controller, /spotify connect). */
+      DASHBOARD_URL: optional(url),
     }),
   ['REDIS_URL', 'LAVALINK_HOST', 'LAVALINK_PASSWORD'],
 );
