@@ -118,7 +118,13 @@ export class GuildService {
     data: Partial<
       Pick<
         GuildSettings,
-        'defaultVolume' | 'djRoleId' | 'musicChannelId' | 'announceNowPlaying' | 'leaveOnEmptyAfter'
+        | 'defaultVolume'
+        | 'djRoleId'
+        | 'musicChannelId'
+        | 'announceNowPlaying'
+        | 'leaveOnEmptyAfter'
+        | 'stayConnected'
+        | 'autoplayEnabled'
       >
     >,
   ): Promise<GuildSettings> {

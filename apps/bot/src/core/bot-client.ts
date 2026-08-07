@@ -23,6 +23,7 @@ import { getLogger, logger, type Logger } from '../lib/logger.js';
 import { PlayerCommandSubscriber } from '../music/command-subscriber.js';
 import { MusicManager } from '../music/music-manager.js';
 import { QueueStore } from '../music/queue-store.js';
+import { FavoritesService } from '../services/favorites-service.js';
 import { GuildService } from '../services/guild-service.js';
 import { CommandRegistry } from './command-registry.js';
 import { CooldownManager } from './cooldown.js';
@@ -60,7 +61,11 @@ export class BotClient extends Client {
   /** Per-user command cooldowns (Redis-backed when available). */
   readonly cooldowns: CooldownManager;
   /** Domain services. Named container because discord.js already owns `client.guilds`. */
-  readonly services: { readonly guilds: GuildService; readonly queueStore: QueueStore };
+  readonly services: {
+    readonly guilds: GuildService;
+    readonly queueStore: QueueStore;
+    readonly favorites: FavoritesService;
+  };
   /**
    * Music engine, or `undefined` when Lavalink is not configured (allowed in
    * development). Commands go through `requireMusic()` for a friendly error.
@@ -113,6 +118,7 @@ export class BotClient extends Client {
     this.services = {
       guilds: new GuildService(this.prisma),
       queueStore: new QueueStore(this.prisma),
+      favorites: new FavoritesService(this.prisma),
     };
 
     const lavalinkNode = getLavalinkNode();
