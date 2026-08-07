@@ -87,11 +87,21 @@ services:
       - ./lavalink/application.yml:/opt/Lavalink/application.yml:ro
       - lavalink-plugins:/opt/Lavalink/plugins
     healthcheck:
-      test: ['CMD-SHELL', 'nc -z localhost 2333 || exit 1']
+      # The image ships curl but no nc, so the obvious `nc -z` check fails
+      # forever and reports a healthy server as unhealthy. 127.0.0.1 rather than
+      # localhost: the container resolves that to ::1 first, where Lavalink does
+      # not listen. `$$` passes the variable through to the container's shell
+      # instead of being interpolated by Compose.
+      test:
+        [
+          'CMD-SHELL',
+          'curl -fsS -o /dev/null -H "Authorization: $$LAVALINK_SERVER_PASSWORD" http://127.0.0.1:2333/version',
+        ]
       interval: 15s
       timeout: 5s
       retries: 5
-      start_period: 30s
+      # Cold starts download plugins before the port opens.
+      start_period: 90s
 
 volumes:
   postgres-data:
