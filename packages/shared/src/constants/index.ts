@@ -11,10 +11,8 @@ export const LIMITS = {
   QUEUE_MAX_TRACKS: 1000,
   /** Tracks a single playlist may hold. */
   PLAYLIST_MAX_TRACKS: 500,
-  /** Playlists a free-tier user may own. */
-  PLAYLIST_MAX_PER_USER: 25,
-  /** Playlists a premium user may own. */
-  PLAYLIST_MAX_PER_PREMIUM_USER: 250,
+  /** Playlists one user may own — an abuse guard, not a product tier. */
+  PLAYLIST_MAX_PER_USER: 250,
   PLAYLIST_NAME_MIN_LENGTH: 1,
   PLAYLIST_NAME_MAX_LENGTH: 100,
   PLAYLIST_DESCRIPTION_MAX_LENGTH: 500,

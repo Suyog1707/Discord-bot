@@ -30,7 +30,7 @@ export default async function DashboardOverviewPage() {
         </p>
       </div>
 
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+      <div className="grid gap-4 sm:grid-cols-2">
         <Card>
           <CardHeader>
             <CardDescription>Active servers</CardDescription>
@@ -51,18 +51,6 @@ export default async function DashboardOverviewPage() {
           <CardContent>
             <Button asChild size="sm" variant="outline">
               <Link href="/dashboard/playlists">Open playlists</Link>
-            </Button>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardDescription>Plan</CardDescription>
-            <CardTitle className="text-3xl">{profile.premium.tier}</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <Button asChild size="sm" variant="outline">
-              <Link href="/dashboard/premium">View plans</Link>
             </Button>
           </CardContent>
         </Card>

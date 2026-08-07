@@ -1,9 +1,8 @@
 import 'server-only';
 
 /**
- * Account self-service: profile summary, active sessions, revocation, premium
- * status. Everything is scoped to the requesting user — there is no admin
- * surface here.
+ * Account self-service: profile summary, active sessions, revocation.
+ * Everything is scoped to the requesting user — there is no admin surface here.
  */
 import { NotFoundError } from '@discord-music/shared';
 
@@ -11,7 +10,7 @@ import { getDb } from '@/lib/db';
 
 export async function getProfile(userId: string) {
   const db = getDb();
-  const [user, playlistCount, premium] = await Promise.all([
+  const [user, playlistCount] = await Promise.all([
     db.user.findUnique({
       where: { id: userId },
       select: {
@@ -26,19 +25,11 @@ export async function getProfile(userId: string) {
       },
     }),
     db.playlist.count({ where: { ownerId: userId } }),
-    db.premium.findUnique({
-      where: { userId },
-      select: { tier: true, expiresAt: true, cancelledAt: true },
-    }),
   ]);
 
   if (user === null) throw new NotFoundError('Account not found.');
 
-  return {
-    ...user,
-    playlistCount,
-    premium: premium ?? { tier: 'FREE' as const, expiresAt: null, cancelledAt: null },
-  };
+  return { ...user, playlistCount };
 }
 
 export interface SessionView {

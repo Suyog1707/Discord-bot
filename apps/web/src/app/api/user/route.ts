@@ -1,4 +1,4 @@
-/** GET /api/user — the signed-in user's profile, playlist count and premium tier. */
+/** GET /api/user — the signed-in user's profile and playlist count. */
 import { apiSuccess } from '@/lib/api';
 import { authedRoute } from '@/lib/api-route';
 import { getProfile } from '@/lib/services/account';
