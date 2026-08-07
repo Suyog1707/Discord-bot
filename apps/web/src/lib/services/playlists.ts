@@ -73,6 +73,8 @@ export async function listPlaylists(userId: string) {
       description: true,
       visibility: true,
       folder: true,
+      spotifyId: true,
+      syncedAt: true,
       trackCount: true,
       playCount: true,
       updatedAt: true,

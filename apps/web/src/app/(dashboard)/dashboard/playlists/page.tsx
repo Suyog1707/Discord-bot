@@ -12,6 +12,12 @@ import {
   importPlaylist,
   listPlaylists,
 } from '@/lib/services/playlists';
+import {
+  getSpotifyStatus,
+  importSpotifyItem,
+  listImportable,
+  syncSpotifyPlaylist,
+} from '@/lib/services/spotify';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -21,9 +27,52 @@ import { Label } from '@/components/ui/label';
 export const metadata: Metadata = { title: 'Playlists' };
 export const dynamic = 'force-dynamic';
 
-export default async function PlaylistsPage() {
+export default async function PlaylistsPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ q?: string; sort?: string }>;
+}) {
   const user = await requireUserOrRedirect('/dashboard/playlists');
-  const playlists = await listPlaylists(user.id);
+  const [allPlaylists, params, spotify] = await Promise.all([
+    listPlaylists(user.id),
+    searchParams,
+    getSpotifyStatus(user.id),
+  ]);
+
+  // Search + sort are URL state, so results are shareable and back-button safe.
+  const query = (params.q ?? '').trim().toLowerCase();
+  const sort = params.sort ?? 'updated';
+  const playlists = allPlaylists
+    .filter(
+      (playlist) =>
+        query === '' ||
+        playlist.name.toLowerCase().includes(query) ||
+        (playlist.description?.toLowerCase().includes(query) ?? false) ||
+        (playlist.folder?.toLowerCase().includes(query) ?? false),
+    )
+    .toSorted((a, b) =>
+      sort === 'name'
+        ? a.name.localeCompare(b.name)
+        : sort === 'tracks'
+          ? b.trackCount - a.trackCount
+          : b.updatedAt.getTime() - a.updatedAt.getTime(),
+    );
+
+  const importable = spotify.linked ? await listImportable(user.id).catch(() => null) : null;
+
+  async function importSpotify(formData: FormData) {
+    'use server';
+    const actor = await requireUserOrRedirect('/dashboard/playlists');
+    await importSpotifyItem(actor.id, formString(formData, 'spotifyId'));
+    revalidatePath('/dashboard/playlists');
+  }
+
+  async function syncSpotify(formData: FormData) {
+    'use server';
+    const actor = await requireUserOrRedirect('/dashboard/playlists');
+    await syncSpotifyPlaylist(actor.id, formString(formData, 'playlistId'));
+    revalidatePath('/dashboard/playlists');
+  }
 
   // Group by folder; unfiled playlists render first without a heading.
   const folders = [...new Set(playlists.map((playlist) => playlist.folder))]
@@ -116,6 +165,64 @@ export default async function PlaylistsPage() {
         </CardContent>
       </Card>
 
+      {importable !== null && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Import from Spotify</CardTitle>
+            <CardDescription>
+              Linked as {spotify.displayName ?? 'your Spotify account'} — imports land in the
+              “Spotify” folder and can be re-synced any time.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-1">
+            {importable.slice(0, 30).map((item) => (
+              <div
+                key={item.spotifyId}
+                className="hover:bg-accent/50 flex items-center gap-3 rounded-md px-2 py-1.5 text-sm"
+              >
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate font-medium">{item.name}</span>
+                  <span className="text-muted-foreground block truncate text-xs">
+                    {item.owner ?? 'Library'}
+                    {item.trackCount > 0 ? ` · ${String(item.trackCount)} tracks` : ''}
+                  </span>
+                </span>
+                <form action={importSpotify}>
+                  <input type="hidden" name="spotifyId" value={item.spotifyId} />
+                  <Button type="submit" size="sm" variant="outline">
+                    {item.importedPlaylistId === null ? 'Import' : 'Re-sync'}
+                  </Button>
+                </form>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+      )}
+
+      <form method="get" className="flex flex-wrap items-center gap-2">
+        <Input
+          type="search"
+          name="q"
+          defaultValue={params.q ?? ''}
+          placeholder="Search playlists…"
+          className="h-9 max-w-64"
+          aria-label="Search playlists"
+        />
+        <select
+          name="sort"
+          defaultValue={sort}
+          aria-label="Sort playlists"
+          className="border-input bg-background h-9 rounded-md border px-2 text-sm"
+        >
+          <option value="updated">Recently updated</option>
+          <option value="name">Name</option>
+          <option value="tracks">Track count</option>
+        </select>
+        <Button type="submit" size="sm" variant="secondary">
+          Apply
+        </Button>
+      </form>
+
       {playlists.length === 0 ? (
         <Card>
           <CardContent className="text-muted-foreground flex flex-col items-center gap-2 py-10 text-sm">
@@ -163,6 +270,19 @@ export default async function PlaylistsPage() {
                         Duplicate
                       </Button>
                     </form>
+                    {playlist.spotifyId !== null && (
+                      <form action={syncSpotify}>
+                        <input type="hidden" name="playlistId" value={playlist.id} />
+                        <Button
+                          type="submit"
+                          size="sm"
+                          variant="outline"
+                          title="Re-sync from Spotify"
+                        >
+                          Sync
+                        </Button>
+                      </form>
+                    )}
                     <form action={remove}>
                       <input type="hidden" name="playlistId" value={playlist.id} />
                       <Button type="submit" size="sm" variant="destructive">
