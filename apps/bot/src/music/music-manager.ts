@@ -252,14 +252,27 @@ export class MusicManager {
 
     const settings = await this.#guilds.getSettings(options.guildId);
 
-    // Persistent controller lives in the configured music channel; when set it
-    // replaces per-track announcements (one continuously edited message, never
-    // a new message per song).
-    if (settings.musicChannelId !== null && !this.#controllers.has(options.guildId)) {
-      this.#controllers.set(
-        options.guildId,
-        new ControllerMessage(this.#client, options.guildId, settings.musicChannelId),
-      );
+    // Persistent controller: the voice channel's own text chat when Discord
+    // exposes it to the bot, otherwise the configured music channel. When one
+    // exists it replaces per-track announcements (one continuously edited
+    // message, never a new message per song).
+    if (!this.#controllers.has(options.guildId)) {
+      const voiceChat = this.#client.channels.cache.get(options.voiceChannelId);
+      const botUserId = this.#client.user?.id;
+      const canUseVoiceChat =
+        voiceChat?.isVoiceBased() === true &&
+        voiceChat.isSendable() &&
+        botUserId !== undefined &&
+        (voiceChat.permissionsFor(botUserId)?.has(['ViewChannel', 'SendMessages']) ?? false);
+      const controllerChannelId = canUseVoiceChat
+        ? options.voiceChannelId
+        : settings.musicChannelId;
+      if (controllerChannelId !== null) {
+        this.#controllers.set(
+          options.guildId,
+          new ControllerMessage(this.#client, options.guildId, controllerChannelId),
+        );
+      }
     }
     const controllerActive = this.#controllers.has(options.guildId);
 
