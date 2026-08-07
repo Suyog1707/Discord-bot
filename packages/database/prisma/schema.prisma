@@ -1,7 +1,7 @@
 // Discord Music Platform — database schema
 //
 // Models follow docs/DATABASE.md: User, Guild, Playlist, Queue, SongHistory,
-// Premium, Verification, Session. Auth.js additionally requires Account and
+// Verification, Session. Auth.js additionally requires Account and
 // VerificationToken, which are included so Phase 2 can adopt the Prisma adapter
 // without a schema migration.
 //
@@ -44,7 +44,6 @@ model User {
   accounts      Account[]
   sessions      Session[]
   playlists     Playlist[]
-  premium       Premium?
   verifications Verification[]
   guildMembers  GuildMember[]
   queueTracks   QueueTrack[]
@@ -127,7 +126,6 @@ model Guild {
   members     GuildMember[]
   playlists   Playlist[]
   songHistory SongHistory[]
-  premium     Premium[]
 
   @@index([botJoinedAt])
   @@map("guilds")
@@ -325,44 +323,12 @@ model SongHistory {
 }
 
 // ---------------------------------------------------------------------------
-// Premium & verification
+// Verification
 // ---------------------------------------------------------------------------
-
-enum PremiumTier {
-  FREE
-  PLUS
-  PRO
-
-  @@map("premium_tier")
-}
-
-/// A premium entitlement, attached to a user and optionally scoped to a guild.
-model Premium {
-  id                     String      @id @default(cuid())
-  userId                 String      @unique
-  guildId                String?
-  tier                   PremiumTier @default(FREE)
-  /// Null means "no expiry" (lifetime grant).
-  expiresAt              DateTime?   @db.Timestamptz(3)
-  cancelledAt            DateTime?   @db.Timestamptz(3)
-  /// External billing reference; no card data is ever stored locally.
-  providerCustomerId     String?
-  providerSubscriptionId String?     @unique
-  createdAt              DateTime    @default(now()) @db.Timestamptz(3)
-  updatedAt              DateTime    @updatedAt @db.Timestamptz(3)
-
-  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
-  guild Guild? @relation(fields: [guildId], references: [id], onDelete: SetNull)
-
-  @@index([guildId])
-  @@index([expiresAt])
-  @@map("premium")
-}
 
 enum VerificationType {
   ACCOUNT_LINK
   GUILD_CLAIM
-  PREMIUM_REDEEM
 
   @@map("verification_type")
 }

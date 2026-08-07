@@ -26,7 +26,6 @@ export type {
   GuildSettings,
   Playlist,
   PlaylistTrack,
-  Premium,
   Queue,
   QueueTrack,
   Session,
@@ -36,10 +35,4 @@ export type {
   VerificationToken,
 } from '@prisma/client';
 
-export {
-  LoopMode,
-  MusicSource,
-  PlaylistVisibility,
-  PremiumTier,
-  VerificationType,
-} from '@prisma/client';
+export { LoopMode, MusicSource, PlaylistVisibility, VerificationType } from '@prisma/client';
