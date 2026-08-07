@@ -15,6 +15,8 @@ import { formatTrackDuration, trackLink } from './track.js';
 
 /** Button custom-id prefix routed by the interaction dispatcher. */
 export const MUSIC_BUTTON_PREFIX = 'music:';
+/** Custom id of the controller's filter/equalizer/speed select menu. */
+export const MUSIC_FILTER_SELECT_ID = 'music:filter-select';
 
 export type MusicButtonAction =
   | 'previous'
@@ -26,6 +28,7 @@ export type MusicButtonAction =
   | 'favorite'
   | 'queue'
   | 'lyrics'
+  | 'autoplay'
   | 'voldown'
   | 'volup';
 

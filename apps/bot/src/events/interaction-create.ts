@@ -11,9 +11,11 @@ import { EmbedBuilder, Events, GuildMember, MessageFlags, type Interaction } fro
 
 import { defineEvent } from '../core/event.js';
 import { runGuards } from '../core/guards.js';
+import { FILTER_PRESETS, speedFilter, type FilterPresetName } from '../music/filters.js';
 import { fetchLyrics } from '../music/lyrics.js';
 import {
   MUSIC_BUTTON_PREFIX,
+  MUSIC_FILTER_SELECT_ID,
   renderNowPlaying,
   type MusicButtonAction,
 } from '../music/now-playing-view.js';
@@ -57,6 +59,54 @@ export default defineEvent({
       } catch (error) {
         // Autocomplete has a 3s budget; never block, just record the failure.
         logger.error({ err: error, command: interaction.commandName }, 'Autocomplete failed');
+      }
+      return;
+    }
+
+    // The controller's filter/equalizer/speed menu.
+    if (interaction.isStringSelectMenu() && interaction.customId === MUSIC_FILTER_SELECT_ID) {
+      const selectLogger = logger.child({
+        select: interaction.customId,
+        guildId: interaction.guildId ?? undefined,
+        userId: interaction.user.id,
+      });
+      try {
+        const player =
+          interaction.guildId === null ? undefined : client.music?.getPlayer(interaction.guildId);
+        if (player === undefined) {
+          await interaction.reply({
+            content: 'Nothing is playing.',
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+        const member = interaction.member instanceof GuildMember ? interaction.member : null;
+        if (member?.voice.channelId !== player.voiceChannelId) {
+          await interaction.reply({
+            content: 'Join my voice channel to change filters.',
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        const [value] = interaction.values;
+        if (value === 'off' || value === undefined) {
+          await player.setFilter(null, {});
+        } else if (value.startsWith('preset:')) {
+          const name = value.slice('preset:'.length) as FilterPresetName;
+          await player.setFilter(name, FILTER_PRESETS[name]);
+        } else if (value.startsWith('speed:')) {
+          const speed = Number(value.slice('speed:'.length));
+          await player.setFilter('speed', speedFilter(speed));
+        }
+        // The controller re-renders itself from the FILTER_CHANGE event.
+        await interaction.deferUpdate();
+        selectLogger.info('Filter select applied');
+      } catch (error) {
+        selectLogger.error({ err: error }, 'Filter select failed');
+        await replyWithError(interaction, 'Changing the filter failed. Try again.').catch(
+          () => undefined,
+        );
       }
       return;
     }
@@ -163,6 +213,9 @@ export default defineEvent({
             player.setLoopMode(mode === 'off' ? 'track' : mode === 'track' ? 'queue' : 'off');
             break;
           }
+          case 'autoplay':
+            player.setAutoplayEnabled(!player.autoplayEnabled);
+            break;
           case 'voldown':
             await player.setVolume(Math.max(LIMITS.VOLUME_MIN, player.volume - 10));
             break;

@@ -14,14 +14,17 @@ import {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
+  StringSelectMenuBuilder,
   type Client,
   type Message,
   type MessageActionRowComponentBuilder,
   type MessageEditOptions,
 } from 'discord.js';
 
+import { getEnv } from '../config/env.js';
 import { getLogger, type Logger } from '../lib/logger.js';
-import { MUSIC_BUTTON_PREFIX } from './now-playing-view.js';
+import { FILTER_LABELS, FILTER_PRESET_NAMES } from './filters.js';
+import { MUSIC_BUTTON_PREFIX, MUSIC_FILTER_SELECT_ID } from './now-playing-view.js';
 
 /** Minimum gap between message edits; trailing edits are coalesced. */
 const EDIT_THROTTLE_MS = 4_000;
@@ -44,7 +47,8 @@ function formatMs(ms: number): string {
   return `${hours > 0 ? `${String(hours)}:` : ''}${mm}:${String(seconds).padStart(2, '0')}`;
 }
 
-function controls(paused: boolean, disabled: boolean) {
+function controls(state: PlayerSnapshot | null, disabled: boolean) {
+  const paused = state?.paused ?? false;
   const button = (id: string, emoji: string, style: ButtonStyle = ButtonStyle.Secondary) =>
     new ButtonBuilder()
       .setCustomId(`${MUSIC_BUTTON_PREFIX}${id}`)
@@ -52,21 +56,64 @@ function controls(paused: boolean, disabled: boolean) {
       .setStyle(style)
       .setDisabled(disabled);
 
+  const volumeRow = new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(
+    button('voldown', '🔉'),
+    button('volup', '🔊'),
+  );
+  const dashboardUrl = getEnv().DASHBOARD_URL;
+  if (dashboardUrl !== undefined) {
+    volumeRow.addComponents(
+      new ButtonBuilder()
+        .setLabel('Dashboard')
+        .setEmoji('🌐')
+        .setStyle(ButtonStyle.Link)
+        .setURL(`${dashboardUrl.replace(/\/$/u, '')}/dashboard`),
+    );
+  }
+
+  const activeFilter = state?.activeFilter ?? null;
+  const filterSelect = new StringSelectMenuBuilder()
+    .setCustomId(MUSIC_FILTER_SELECT_ID)
+    .setPlaceholder('🎚️ Filters, equalizer & speed')
+    .setDisabled(disabled)
+    .addOptions(
+      {
+        label: 'Normal (filters off)',
+        value: 'off',
+        default: activeFilter === null,
+        emoji: '🎵',
+      },
+      ...FILTER_PRESET_NAMES.map((name) => ({
+        label: FILTER_LABELS[name],
+        value: `preset:${name}`,
+        default: activeFilter === name,
+      })),
+      { label: 'Speed ×0.75', value: 'speed:0.75', default: false },
+      { label: 'Speed ×1.25', value: 'speed:1.25', default: false },
+      { label: 'Speed ×1.5', value: 'speed:1.5', default: false },
+    );
+
   return [
     new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(
       button('previous', '⏮️'),
       button('toggle', paused ? '▶️' : '⏸️', ButtonStyle.Primary),
       button('skip', '⏭️'),
+      button('stop', '⏹️', ButtonStyle.Danger),
       button('shuffle', '🔀'),
-      button('loop', '🔁'),
     ),
     new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(
+      button('loop', '🔁'),
       button('favorite', '❤️'),
       button('queue', '📜'),
       button('lyrics', '🎵'),
-      button('voldown', '🔉'),
-      button('volup', '🔊'),
+      button(
+        'autoplay',
+        '♾️',
+        state?.autoplayEnabled === true ? ButtonStyle.Success : ButtonStyle.Secondary,
+      ),
     ),
+    volumeRow,
+    new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(filterSelect),
   ];
 }
 
@@ -76,7 +123,7 @@ function render(state: PlayerSnapshot | null): MessageEditOptions {
       .setColor(0x2b2d31)
       .setAuthor({ name: 'Nothing playing' })
       .setDescription('Start something with `/play` — this controller updates by itself.');
-    return { embeds: [embed], components: controls(false, true) };
+    return { embeds: [embed], components: controls(state, true) };
   }
 
   const track = state.current;
@@ -100,21 +147,39 @@ function render(state: PlayerSnapshot | null): MessageEditOptions {
       { name: 'Artist', value: track.author, inline: true },
       { name: 'Requested by', value: track.requestedByName, inline: true },
       {
-        name: 'Queue',
-        value: `${String(state.upcomingTotal)} upcoming`,
+        name: 'Voice channel',
+        value: state.voiceChannelId === null ? '—' : `<#${state.voiceChannelId}>`,
         inline: true,
       },
       {
         name: 'Progress',
         value: track.isStream
           ? '🔴 LIVE'
-          : `${progressBar(state.positionMs, track.durationMs)}\n${formatMs(state.positionMs)} / ${formatMs(track.durationMs)}`,
+          : `${progressBar(state.positionMs, track.durationMs)}\n` +
+            `${formatMs(state.positionMs)} / ${formatMs(track.durationMs)} · ` +
+            `−${formatMs(Math.max(track.durationMs - state.positionMs, 0))} left`,
       },
     )
     .setFooter({ text: flags.join(' · ') });
   if (track.artworkUrl !== null) embed.setThumbnail(track.artworkUrl);
 
-  return { embeds: [embed], components: controls(state.paused, false) };
+  if (state.upcomingTotal > 0) {
+    const preview = state.upcoming
+      .slice(0, 5)
+      .map(
+        (next, index) =>
+          `\`${String(index + 1)}.\` ${next.uri === null ? next.title : `[${next.title}](${next.uri})`} — ${next.author}`,
+      );
+    if (state.upcomingTotal > 5) {
+      preview.push(`…and ${String(state.upcomingTotal - 5)} more`);
+    }
+    embed.addFields({
+      name: `Up next (${String(state.upcomingTotal)})`,
+      value: preview.join('\n'),
+    });
+  }
+
+  return { embeds: [embed], components: controls(state, false) };
 }
 
 export class ControllerMessage {
