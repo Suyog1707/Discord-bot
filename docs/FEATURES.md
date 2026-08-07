@@ -1,3 +1,3 @@
 # Features
 
-Authentication, Dashboard, Music, Queue, Playlists, Analytics, Premium.
+Authentication, Dashboard, Music, Queue, Playlists, Analytics.

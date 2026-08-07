@@ -23,7 +23,7 @@ Dashboard user ──POST /api/player──▶ Redis pub/sub ──▶ apps/bot 
 ```
 
 - PostgreSQL is the system of record (users, guilds, settings, queues,
-  playlists, history, premium, sessions).
+  playlists, history, sessions).
 - Redis carries ephemera: rate limits, cooldowns, caches, and the
   dashboard→bot command channel. Optional in development; required in
   production.

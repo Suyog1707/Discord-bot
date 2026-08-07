@@ -16,7 +16,7 @@ Every route is rate-limited per user; 429 responses include `Retry-After`.
 
 | Method           | Path                                | Description                                                                                         |
 | ---------------- | ----------------------------------- | --------------------------------------------------------------------------------------------------- |
-| GET              | `/api/user`                         | Profile, playlist count, premium tier                                                               |
+| GET              | `/api/user`                         | Profile and playlist count                                                                          |
 | GET              | `/api/server`                       | Manageable servers with bot presence                                                                |
 | GET              | `/api/server/:guildId`              | Settings + persisted queue snapshot                                                                 |
 | PATCH            | `/api/server/:guildId/settings`     | Update guild settings                                                                               |

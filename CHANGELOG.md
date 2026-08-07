@@ -6,6 +6,15 @@ everything lives under 0.1.0 until the first deploy.
 
 ## 0.1.0 (unreleased)
 
+### Removed
+
+- The entire premium system, before it ever gated anything: the `Premium`
+  model and `PremiumTier` enum (dropped by migration `remove_premium`), the
+  `PREMIUM_REDEEM` verification type, the dashboard Premium page and plan
+  card, and the tier field on `GET /api/user`. Every feature is available to
+  every user; the playlist cap is now a single abuse guard of 250 for
+  everyone (previously 25 free / 250 premium).
+
 ### Fixed
 
 - Lavalink never started: the image ships no `/opt/Lavalink/plugins`, so Docker
@@ -26,8 +35,8 @@ everything lives under 0.1.0 until the first deploy.
 
 - Full dashboard: servers grid with invite links, server detail with live
   queue view + player controls + settings form, playlists CRUD, analytics
-  (30-day plays, top tracks, skip rate), premium tier preview, account
-  settings with session revocation.
+  (30-day plays, top tracks, skip rate), account settings with session
+  revocation.
 - REST API under `/api` (user, server, player, playlist, music, settings)
   with a uniform response envelope, per-user rate limiting and Zod validation
   on every input.

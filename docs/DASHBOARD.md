@@ -1,3 +1,3 @@
 # Dashboard
 
-Overview, Servers, Player, Queue, Settings, Premium.
+Overview, Servers, Player, Queue, Analytics, Settings.
