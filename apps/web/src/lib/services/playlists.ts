@@ -14,7 +14,9 @@ import {
   NotFoundError,
   nonEmptyString,
   parseOrThrow,
+  playlistExportSchema,
   z,
+  type PlaylistExport,
 } from '@discord-music/shared';
 import { isUniqueConstraintError, MusicSource, type Playlist } from '@discord-music/database';
 
@@ -249,24 +251,9 @@ export async function removeTrackFromPlaylist(
 
 /* ------------------------------------------------- export / import / copy */
 
-/** Portable playlist document — version-tagged so future formats can evolve. */
-export const playlistExportSchema = z.object({
-  format: z.literal('discord-music-playlist/v1'),
-  name: nonEmptyString(LIMITS.PLAYLIST_NAME_MAX_LENGTH, 'Playlist name'),
-  description: z.string().trim().max(LIMITS.PLAYLIST_DESCRIPTION_MAX_LENGTH).nullable(),
-  folder: z.string().trim().min(1).max(LIMITS.PLAYLIST_NAME_MAX_LENGTH).nullable(),
-  tracks: z
-    .array(
-      addTrackSchema.extend({
-        // Lavalink's encoded blob is version-specific; imports may omit it and
-        // the bot re-resolves by URI at play time, exactly like favorites.
-        encoded: z.string().max(4096).optional(),
-      }),
-    )
-    .max(LIMITS.PLAYLIST_MAX_TRACKS),
-});
-
-export type PlaylistExport = z.infer<typeof playlistExportSchema>;
+// The portable document schema lives in @discord-music/shared so the bot's
+// `/playlist export` / `/playlist import` speak the exact same format.
+export { playlistExportSchema, type PlaylistExport } from '@discord-music/shared';
 
 const DB_TO_SOURCE = {
   [MusicSource.YOUTUBE]: 'youtube',
