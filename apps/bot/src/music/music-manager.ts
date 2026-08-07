@@ -29,6 +29,7 @@ import {
 import type { LavalinkNode } from '../config/env.js';
 import { getLogger } from '../lib/logger.js';
 import type { GuildService } from '../services/guild-service.js';
+import { ControllerMessage } from './controller.js';
 import { GuildPlayer } from './guild-player.js';
 import type { QueueStore } from './queue-store.js';
 import { buildSearchQuery, fromLavalinkTrack, type QueuedTrack } from './track.js';
@@ -65,6 +66,7 @@ export class MusicManager {
   #reconnectTimer: NodeJS.Timeout | undefined;
 
   readonly #publishEvent: ((payload: string) => void) | undefined;
+  readonly #controllers = new Map<string, ControllerMessage>();
 
   constructor(options: {
     readonly client: Client;
@@ -244,6 +246,17 @@ export class MusicManager {
 
     const settings = await this.#guilds.getSettings(options.guildId);
 
+    // Persistent controller lives in the configured music channel; when set it
+    // replaces per-track announcements (one continuously edited message, never
+    // a new message per song).
+    if (settings.musicChannelId !== null && !this.#controllers.has(options.guildId)) {
+      this.#controllers.set(
+        options.guildId,
+        new ControllerMessage(this.#client, options.guildId, settings.musicChannelId),
+      );
+    }
+    const controllerActive = this.#controllers.has(options.guildId);
+
     const player = await this.shoukaku.joinVoiceChannel({
       guildId: options.guildId,
       channelId: options.voiceChannelId,
@@ -258,7 +271,7 @@ export class MusicManager {
       player,
       client: this.#client,
       store: this.#store,
-      announce: settings.announceNowPlaying,
+      announce: settings.announceNowPlaying && !controllerActive,
       initialVolume: settings.defaultVolume,
       idleTimeoutSeconds: settings.leaveOnEmptyAfter,
       stayConnected: settings.stayConnected,
@@ -390,6 +403,7 @@ export class MusicManager {
 
   #emitEvent(guildId: string, type: PlayerEventType, state: PlayerSnapshot | null): void {
     this.#publishEvent?.(encodePlayerEvent({ type, guildId, sentAt: Date.now(), state }));
+    this.#controllers.get(guildId)?.onEvent(type, state);
   }
 
   /** Tear down a guild's player and leave its voice channel. */
@@ -398,6 +412,9 @@ export class MusicManager {
     if (player === undefined) return;
 
     this.#players.delete(guildId);
+    const controller = this.#controllers.get(guildId);
+    this.#controllers.delete(guildId);
+    if (controller !== undefined) await controller.destroy();
     await player.destroy();
     try {
       await this.shoukaku.leaveVoiceChannel(guildId);

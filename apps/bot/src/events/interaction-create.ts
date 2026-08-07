@@ -6,16 +6,18 @@
  * enforcement (guild-only, permissions, cooldowns, DJ role), unknown-command
  * handling and safe error replies.
  */
-import { AppError, toAppError } from '@discord-music/shared';
-import { Events, GuildMember, MessageFlags, type Interaction } from 'discord.js';
+import { AppError, LIMITS, toAppError } from '@discord-music/shared';
+import { EmbedBuilder, Events, GuildMember, MessageFlags, type Interaction } from 'discord.js';
 
 import { defineEvent } from '../core/event.js';
 import { runGuards } from '../core/guards.js';
+import { fetchLyrics } from '../music/lyrics.js';
 import {
   MUSIC_BUTTON_PREFIX,
   renderNowPlaying,
   type MusicButtonAction,
 } from '../music/now-playing-view.js';
+import { formatTrackDuration, trackLink } from '../music/track.js';
 
 /**
  * Reply with an error, choosing the correct method for the interaction's state.
@@ -86,6 +88,60 @@ export default defineEvent({
         }
 
         const action = interaction.customId.slice(MUSIC_BUTTON_PREFIX.length) as MusicButtonAction;
+
+        // Informational buttons reply ephemerally instead of touching the
+        // message they live on.
+        if (action === 'favorite' || action === 'queue' || action === 'lyrics') {
+          // Non-null by the guard above; narrowed once for the branches below.
+          const current = player.queue.current;
+          if (action === 'favorite') {
+            const added = await client.services.favorites.add(
+              interaction.user.id,
+              interaction.user.username,
+              current,
+            );
+            await interaction.reply({
+              content: added
+                ? `⭐ Saved **${current.title}** to your favorites.`
+                : `**${current.title}** is already in your favorites.`,
+              flags: MessageFlags.Ephemeral,
+            });
+          } else if (action === 'queue') {
+            const upcoming = player.queue.upcoming.slice(0, 10);
+            const lines = upcoming.map(
+              (track, index) =>
+                `\`${String(index + 1).padStart(2, ' ')}.\` ${trackLink(track)} \`${formatTrackDuration(track)}\``,
+            );
+            const embed = new EmbedBuilder()
+              .setColor(0x5865f2)
+              .setTitle('Queue')
+              .setDescription(
+                [`**Now:** ${trackLink(current)}`, lines.join('\n') || '*Nothing upcoming.*'].join(
+                  '\n\n',
+                ),
+              );
+            await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+          } else {
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+            const result = await fetchLyrics(current.title, current.author);
+            await interaction.editReply(
+              result === null
+                ? `No lyrics found for **${current.title}**.`
+                : {
+                    embeds: [
+                      new EmbedBuilder()
+                        .setColor(0x5865f2)
+                        .setTitle(`${current.title} — ${current.author}`)
+                        .setDescription(result.lyrics)
+                        .setFooter({ text: 'Lyrics from LRCLIB' }),
+                    ],
+                  },
+            );
+          }
+          buttonLogger.info('Music button applied');
+          return;
+        }
+
         switch (action) {
           case 'previous':
             await player.previous();
@@ -99,9 +155,29 @@ export default defineEvent({
           case 'stop':
             await player.stop();
             break;
+          case 'shuffle':
+            player.shuffle();
+            break;
+          case 'loop': {
+            const mode = player.queue.loopMode;
+            player.setLoopMode(mode === 'off' ? 'track' : mode === 'track' ? 'queue' : 'off');
+            break;
+          }
+          case 'voldown':
+            await player.setVolume(Math.max(LIMITS.VOLUME_MIN, player.volume - 10));
+            break;
+          case 'volup':
+            await player.setVolume(Math.min(LIMITS.VOLUME_MAX, player.volume + 10));
+            break;
         }
 
-        if (action === 'stop') {
+        // The persistent controller re-renders itself from player events, so a
+        // click on it only needs acknowledging. The ephemeral /nowplaying view
+        // has no event feed and re-renders here instead.
+        const isEphemeralView = interaction.message.flags.has(MessageFlags.Ephemeral);
+        if (!isEphemeralView) {
+          await interaction.deferUpdate();
+        } else if (action === 'stop') {
           await interaction.update({ content: '⏹️ Stopped.', embeds: [], components: [] });
         } else {
           // A skip that drained the queue renders as "Nothing is playing".

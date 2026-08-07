@@ -16,7 +16,18 @@ import { formatTrackDuration, trackLink } from './track.js';
 /** Button custom-id prefix routed by the interaction dispatcher. */
 export const MUSIC_BUTTON_PREFIX = 'music:';
 
-export type MusicButtonAction = 'previous' | 'toggle' | 'skip' | 'stop';
+export type MusicButtonAction =
+  | 'previous'
+  | 'toggle'
+  | 'skip'
+  | 'stop'
+  | 'shuffle'
+  | 'loop'
+  | 'favorite'
+  | 'queue'
+  | 'lyrics'
+  | 'voldown'
+  | 'volup';
 
 /** 12-slot progress bar: ▬▬▬🔘▬▬▬▬▬▬▬▬ */
 export function renderProgressBar(positionMs: number, durationMs: number): string {
