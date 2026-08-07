@@ -3,6 +3,8 @@ import { revalidatePath } from 'next/cache';
 import { cookies } from 'next/headers';
 
 import { requireUserOrRedirect } from '@/lib/auth/session';
+import { disconnectSpotify, getSpotifyStatus } from '@/lib/services/spotify';
+import { isSpotifyConfigured } from '@/lib/spotify/client';
 import { formString } from '@/lib/forms';
 import {
   getProfile,
@@ -26,12 +28,27 @@ async function sessionTokenFromCookies(): Promise<string | null> {
   );
 }
 
-export default async function AccountSettingsPage() {
+export default async function AccountSettingsPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ spotify?: string }>;
+}) {
   const user = await requireUserOrRedirect('/dashboard/settings');
-  const [profile, sessions] = await Promise.all([
+  const [profile, sessions, spotify, params] = await Promise.all([
     getProfile(user.id),
     sessionTokenFromCookies().then((token) => listSessions(user.id, token)),
+    getSpotifyStatus(user.id),
+    searchParams,
   ]);
+  const spotifyConfigured = isSpotifyConfigured();
+  const spotifyOutcome = params.spotify;
+
+  async function unlinkSpotify() {
+    'use server';
+    const actor = await requireUserOrRedirect('/dashboard/settings');
+    await disconnectSpotify(actor.id);
+    revalidatePath('/dashboard/settings');
+  }
 
   async function revokeOne(formData: FormData) {
     'use server';
@@ -76,6 +93,52 @@ export default async function AccountSettingsPage() {
             <p className="text-muted-foreground text-xs">Member since</p>
             <p className="font-medium">{profile.createdAt.toLocaleDateString()}</p>
           </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Spotify</CardTitle>
+          <CardDescription>
+            Link your Spotify account to import playlists, albums and Liked Songs.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3">
+          {spotifyOutcome === 'linked' && (
+            <p className="text-success text-sm">Spotify account linked.</p>
+          )}
+          {(spotifyOutcome === 'denied' ||
+            spotifyOutcome === 'invalid' ||
+            spotifyOutcome === 'failed') && (
+            <p role="alert" className="text-destructive text-sm">
+              Spotify linking did not complete — try again.
+            </p>
+          )}
+          {!spotifyConfigured ? (
+            <p className="text-muted-foreground text-sm">
+              Spotify integration is not configured on this deployment (SPOTIFY_CLIENT_ID /
+              SPOTIFY_CLIENT_SECRET).
+            </p>
+          ) : spotify.linked ? (
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="flex-1 text-sm">
+                <p className="font-medium">{spotify.displayName ?? spotify.spotifyId}</p>
+                <p className="text-muted-foreground text-xs">
+                  {spotify.country !== null ? `${spotify.country} · ` : ''}
+                  scopes: {spotify.scopes.join(', ')}
+                </p>
+              </div>
+              <form action={unlinkSpotify}>
+                <Button type="submit" variant="destructive" size="sm">
+                  Disconnect
+                </Button>
+              </form>
+            </div>
+          ) : (
+            <Button asChild size="sm" className="self-start">
+              <a href="/api/spotify/authorize">Connect Spotify</a>
+            </Button>
+          )}
         </CardContent>
       </Card>
 
