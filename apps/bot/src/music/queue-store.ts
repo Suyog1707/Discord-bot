@@ -34,6 +34,34 @@ const TO_DB_LOOP: Record<LoopMode, DbLoopMode> = {
   queue: DbLoopMode.QUEUE,
 };
 
+const FROM_DB_SOURCE: Record<DbMusicSource, MusicSource> = {
+  [DbMusicSource.YOUTUBE]: 'youtube',
+  [DbMusicSource.SPOTIFY]: 'spotify',
+  [DbMusicSource.SOUNDCLOUD]: 'soundcloud',
+  [DbMusicSource.DEEZER]: 'deezer',
+};
+
+const FROM_DB_LOOP: Record<DbLoopMode, LoopMode> = {
+  [DbLoopMode.OFF]: 'off',
+  [DbLoopMode.TRACK]: 'track',
+  [DbLoopMode.QUEUE]: 'queue',
+};
+
+export interface PersistedQueue {
+  readonly tracks: readonly QueuedTrack[];
+  readonly currentIndex: number;
+  readonly loopMode: LoopMode;
+  readonly volume: number;
+  readonly voiceChannelId: string;
+  readonly textChannelId: string;
+}
+
+export interface HistorySeed {
+  readonly identifier: string;
+  readonly author: string;
+  readonly title: string;
+}
+
 export class QueueStore {
   readonly #prisma: PrismaClient;
   readonly #pendingSaves = new Map<string, NodeJS.Timeout>();
@@ -153,6 +181,71 @@ export class QueueStore {
           ]
         : []),
     ]);
+  }
+
+  /**
+   * Recent plays for a guild — autoplay's seed and dedup source.
+   * Newest first; failures return an empty list (autoplay just parks).
+   */
+  async recentHistory(discordGuildId: string, limit: number): Promise<readonly HistorySeed[]> {
+    try {
+      const rows = await this.#prisma.songHistory.findMany({
+        where: { guild: { discordId: discordGuildId } },
+        orderBy: { playedAt: 'desc' },
+        take: limit,
+        select: { identifier: true, author: true, title: true },
+      });
+      return rows;
+    } catch (error) {
+      logger.warn({ err: error, guildId: discordGuildId }, 'History read failed');
+      return [];
+    }
+  }
+
+  /**
+   * Load the persisted queue for one guild, for restoring after a restart.
+   * Null when there is nothing worth restoring (no tracks or no channel).
+   */
+  async loadPersisted(discordGuildId: string): Promise<PersistedQueue | null> {
+    const queue = await this.#prisma.queue.findFirst({
+      where: { guild: { discordId: discordGuildId } },
+      include: { tracks: { orderBy: { position: 'asc' } } },
+    });
+    if (queue?.voiceChannelId == null || queue.tracks.length === 0) return null;
+
+    return {
+      tracks: queue.tracks.map((track) => ({
+        encoded: track.encoded,
+        identifier: track.identifier,
+        title: track.title,
+        author: track.author,
+        durationMs: track.durationMs,
+        uri: track.uri,
+        artworkUrl: track.artworkUrl,
+        isStream: track.isStream,
+        source: FROM_DB_SOURCE[track.source],
+        requestedById: '0',
+        requestedByName: 'Restored',
+      })),
+      currentIndex: Math.min(queue.currentIndex, queue.tracks.length - 1),
+      loopMode: FROM_DB_LOOP[queue.loopMode],
+      volume: queue.volume,
+      voiceChannelId: queue.voiceChannelId,
+      textChannelId: queue.textChannelId ?? '',
+    };
+  }
+
+  /** Discord guild ids configured for 24/7 that have a restorable queue. */
+  async stayConnectedGuildIds(): Promise<readonly string[]> {
+    const guilds = await this.#prisma.guild.findMany({
+      where: {
+        botLeftAt: null,
+        settings: { stayConnected: true },
+        queue: { voiceChannelId: { not: null } },
+      },
+      select: { discordId: true },
+    });
+    return guilds.map((guild) => guild.discordId);
   }
 
   /** Append one play to the analytics history. Best-effort. */

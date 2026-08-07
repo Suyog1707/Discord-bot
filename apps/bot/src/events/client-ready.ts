@@ -21,5 +21,12 @@ export default defineEvent({
       status: 'online',
       activities: [{ name: '/play', type: ActivityType.Listening }],
     });
+
+    // 24/7 mode: rejoin voice channels and restore queues left by the last run.
+    if (client.music !== undefined) {
+      client.music.restoreStayConnectedPlayers().catch((error: unknown) => {
+        logger.warn({ err: error }, '24/7 restore failed');
+      });
+    }
   },
 });

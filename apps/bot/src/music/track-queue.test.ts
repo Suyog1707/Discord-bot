@@ -183,6 +183,58 @@ describe('TrackQueue', () => {
     });
   });
 
+  describe('previous / move / swap', () => {
+    it('previous steps back through history and stops at the start', () => {
+      const queue = new TrackQueue();
+      queue.add([makeTrack('a'), makeTrack('b'), makeTrack('c')]);
+      queue.advance(); // a
+      queue.advance(); // b
+      queue.advance(); // c
+
+      expect(queue.previous()?.identifier).toBe('b');
+      expect(queue.previous()?.identifier).toBe('a');
+      expect(queue.previous()).toBeNull();
+      expect(queue.current?.identifier).toBe('a');
+    });
+
+    it('previous returns null before anything has played', () => {
+      const queue = new TrackQueue();
+      queue.add([makeTrack('a')]);
+      expect(queue.previous()).toBeNull();
+    });
+
+    it('moveUpcoming reorders only upcoming tracks', () => {
+      const queue = new TrackQueue();
+      queue.add([makeTrack('a'), makeTrack('b'), makeTrack('c'), makeTrack('d')]);
+      queue.advance(); // playing a; upcoming b,c,d
+
+      const moved = queue.moveUpcoming(2, 0); // d to the front
+      expect(moved?.identifier).toBe('d');
+      expect(queue.upcoming.map((track) => track.identifier)).toEqual(['d', 'b', 'c']);
+      expect(queue.current?.identifier).toBe('a');
+    });
+
+    it('moveUpcoming rejects out-of-range positions', () => {
+      const queue = new TrackQueue();
+      queue.add([makeTrack('a'), makeTrack('b')]);
+      queue.advance(); // upcoming: b
+
+      expect(queue.moveUpcoming(0, 5)).toBeNull();
+      expect(queue.moveUpcoming(-1, 0)).toBeNull();
+      expect(queue.moveUpcoming(0, 0)?.identifier).toBe('b');
+    });
+
+    it('swapUpcoming exchanges two upcoming tracks', () => {
+      const queue = new TrackQueue();
+      queue.add([makeTrack('a'), makeTrack('b'), makeTrack('c'), makeTrack('d')]);
+      queue.advance(); // upcoming b,c,d
+
+      expect(queue.swapUpcoming(0, 2)).toBe(true);
+      expect(queue.upcoming.map((track) => track.identifier)).toEqual(['d', 'c', 'b']);
+      expect(queue.swapUpcoming(0, 9)).toBe(false);
+    });
+  });
+
   describe('restore', () => {
     it('rehydrates tracks, cursor and loop mode', () => {
       const queue = new TrackQueue();

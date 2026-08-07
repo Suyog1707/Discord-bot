@@ -126,6 +126,43 @@ export class TrackQueue {
     return this.current;
   }
 
+  /** Step back to the previously played track; null at the start of history. */
+  previous(): QueuedTrack | null {
+    if (this.#currentIndex <= 0) return null;
+    this.#currentIndex -= 1;
+    return this.current;
+  }
+
+  /**
+   * Move an upcoming track to another upcoming position (both 0-based within
+   * `upcoming`). History and the current track never move.
+   */
+  moveUpcoming(from: number, to: number): QueuedTrack | null {
+    const upcomingCount = this.#tracks.length - (this.#currentIndex + 1);
+    if (from < 0 || from >= upcomingCount || to < 0 || to >= upcomingCount) return null;
+    if (from === to) return this.upcoming[from] ?? null;
+
+    const base = this.#currentIndex + 1;
+    const [moved] = this.#tracks.splice(base + from, 1);
+    if (moved === undefined) return null;
+    this.#tracks.splice(base + to, 0, moved);
+    return moved;
+  }
+
+  /** Swap two upcoming tracks (0-based within `upcoming`). */
+  swapUpcoming(a: number, b: number): boolean {
+    const upcomingCount = this.#tracks.length - (this.#currentIndex + 1);
+    if (a < 0 || a >= upcomingCount || b < 0 || b >= upcomingCount) return false;
+
+    const base = this.#currentIndex + 1;
+    const trackA = this.#tracks[base + a];
+    const trackB = this.#tracks[base + b];
+    if (trackA === undefined || trackB === undefined) return false;
+    this.#tracks[base + a] = trackB;
+    this.#tracks[base + b] = trackA;
+    return true;
+  }
+
   #moveNext(): QueuedTrack | null {
     const nextIndex = this.#currentIndex + 1;
 

@@ -253,15 +253,126 @@ export class MusicManager {
       announce: settings.announceNowPlaying,
       initialVolume: settings.defaultVolume,
       idleTimeoutSeconds: settings.leaveOnEmptyAfter,
+      stayConnected: settings.stayConnected,
+      autoplayEnabled: settings.autoplayEnabled,
       onSelfDestruct: async (guildId, reason) => {
         logger.info({ guildId, reason }, 'Player self-destructing');
         await this.destroyPlayer(guildId);
       },
+      onAutoplayRequest: (guildId) => this.pickAutoplayTracks(guildId),
     });
 
     this.#players.set(options.guildId, guildPlayer);
     logger.info({ guildId: options.guildId, channelId: options.voiceChannelId }, 'Player created');
     return guildPlayer;
+  }
+
+  /**
+   * Smart autoplay: pick tracks that continue the guild's listening session.
+   *
+   * Seeds Lavalink searches with the artists heard most recently, then
+   * filters the results for freshness — nothing already in the recent
+   * history, no live streams, sane durations, and at most two picks per
+   * artist so the radio does not collapse into one act's discography.
+   */
+  async pickAutoplayTracks(guildId: string): Promise<readonly QueuedTrack[]> {
+    const node = this.shoukaku.getIdealNode();
+    if (node === undefined) return [];
+
+    const history = await this.#store.recentHistory(guildId, 40);
+    if (history.length === 0) return [];
+
+    const playedIdentifiers = new Set(history.map((entry) => entry.identifier));
+    // "Artist - Topic" / "ArtistVEVO" are YouTube channel artifacts, not names.
+    const cleanAuthor = (author: string): string =>
+      author.replace(/\s*-\s*Topic$/iu, '').replace(/VEVO$/iu, '');
+
+    const seedAuthors = [...new Set(history.slice(0, 8).map((entry) => cleanAuthor(entry.author)))]
+      .filter((author) => author.length > 0)
+      .slice(0, 3);
+
+    const picks: QueuedTrack[] = [];
+    const perAuthorCount = new Map<string, number>();
+    const requester = { id: this.#client.user?.id ?? '0', name: 'Autoplay' };
+
+    for (const seed of seedAuthors) {
+      if (picks.length >= 5) break;
+
+      let response: LavalinkResponse | undefined;
+      try {
+        response = await node.rest.resolve(`ytsearch:${seed}`);
+      } catch (error) {
+        logger.debug({ err: error, seed }, 'Autoplay seed search failed');
+        continue;
+      }
+      if (response?.loadType !== LoadType.SEARCH) continue;
+
+      for (const raw of response.data) {
+        if (picks.length >= 5) break;
+        const track = fromLavalinkTrack(raw, requester);
+
+        if (playedIdentifiers.has(track.identifier)) continue;
+        if (picks.some((pick) => pick.identifier === track.identifier)) continue;
+        if (track.isStream) continue;
+        if (track.durationMs < 60_000 || track.durationMs > 600_000) continue;
+        const author = cleanAuthor(track.author);
+        if ((perAuthorCount.get(author) ?? 0) >= 2) continue;
+
+        perAuthorCount.set(author, (perAuthorCount.get(author) ?? 0) + 1);
+        picks.push(track);
+      }
+    }
+
+    logger.info({ guildId, seeds: seedAuthors, picked: picks.length }, 'Autoplay selection');
+    return picks;
+  }
+
+  /**
+   * Rejoin voice and restore queues for guilds configured for 24/7 mode.
+   * Called once after the gateway is ready; every failure is per-guild and
+   * non-fatal — a missing channel simply skips that guild.
+   */
+  async restoreStayConnectedPlayers(): Promise<void> {
+    let guildIds: readonly string[];
+    try {
+      guildIds = await this.#store.stayConnectedGuildIds();
+    } catch (error) {
+      logger.warn({ err: error }, '24/7 restore query failed');
+      return;
+    }
+
+    for (const guildId of guildIds) {
+      try {
+        const persisted = await this.#store.loadPersisted(guildId);
+        if (persisted === null) continue;
+
+        const guild = this.#client.guilds.cache.get(guildId);
+        if (guild === undefined) continue;
+        const channel = guild.channels.cache.get(persisted.voiceChannelId);
+        if (channel?.isVoiceBased() !== true) continue;
+
+        const player = await this.getOrCreatePlayer({
+          guildId,
+          voiceChannelId: persisted.voiceChannelId,
+          textChannelId: persisted.textChannelId,
+          shardId: guild.shardId,
+        });
+        player.queue.restore(persisted.tracks, persisted.currentIndex, persisted.loopMode);
+        await player.setVolume(persisted.volume);
+
+        // Resume from the track after the last known one — the position within
+        // the old track is stale by now, and skipping forward beats replaying.
+        const next = player.queue.skip();
+        if (next !== null) await player.jumpTo(player.queue.currentIndex);
+
+        logger.info(
+          { guildId, tracks: persisted.tracks.length },
+          '24/7: rejoined voice and restored the queue',
+        );
+      } catch (error) {
+        logger.warn({ err: error, guildId }, '24/7 restore failed for this guild');
+      }
+    }
   }
 
   /** Tear down a guild's player and leave its voice channel. */

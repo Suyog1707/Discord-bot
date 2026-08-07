@@ -7,9 +7,10 @@
  */
 import { LIMITS, type LoopMode } from '@discord-music/shared';
 import { EmbedBuilder, type Client } from 'discord.js';
-import type { Player } from 'shoukaku';
+import type { FilterOptions, Player } from 'shoukaku';
 
 import { getLogger, type Logger } from '../lib/logger.js';
+import type { FilterPresetName } from './filters.js';
 import type { QueueStore } from './queue-store.js';
 import { formatTrackDuration, trackLink, type QueuedTrack } from './track.js';
 import { TrackQueue } from './track-queue.js';
@@ -25,8 +26,17 @@ export interface GuildPlayerOptions {
   readonly initialVolume: number;
   /** Seconds of inactivity before the player disconnects itself. */
   readonly idleTimeoutSeconds: number;
+  /** 24/7 mode: never self-destruct on inactivity. */
+  readonly stayConnected: boolean;
+  /** Smart autoplay: ask for more tracks when the queue drains. */
+  readonly autoplayEnabled: boolean;
   /** Called when the player wants to be torn down (idle timeout, fatal error). */
   readonly onSelfDestruct: (guildId: string, reason: string) => Promise<void>;
+  /**
+   * Called when the queue drains with autoplay enabled. Returns tracks to
+   * continue with (may be empty — the player then parks as usual).
+   */
+  readonly onAutoplayRequest: (guildId: string) => Promise<readonly QueuedTrack[]>;
 }
 
 export class GuildPlayer {
@@ -48,6 +58,11 @@ export class GuildPlayer {
   #trackStartedAt = 0;
   #skipRequested = false;
   #destroyed = false;
+  #stayConnected: boolean;
+  #autoplayEnabled: boolean;
+  #autoplayActive = false;
+  #activeFilter: FilterPresetName | 'speed' | 'pitch' | null = null;
+  readonly #onAutoplayRequest: (guildId: string) => Promise<readonly QueuedTrack[]>;
 
   constructor(options: GuildPlayerOptions) {
     this.guildId = options.guildId;
@@ -59,7 +74,10 @@ export class GuildPlayer {
     this.#announce = options.announce;
     this.#volume = options.initialVolume;
     this.#idleTimeoutSeconds = options.idleTimeoutSeconds;
+    this.#stayConnected = options.stayConnected;
+    this.#autoplayEnabled = options.autoplayEnabled;
     this.#onSelfDestruct = options.onSelfDestruct;
+    this.#onAutoplayRequest = options.onAutoplayRequest;
     this.#logger = getLogger('guild-player').child({ guildId: options.guildId });
 
     this.#attachPlayerEvents();
@@ -89,6 +107,33 @@ export class GuildPlayer {
 
   get isPlaying(): boolean {
     return this.#player.track !== null;
+  }
+
+  get stayConnected(): boolean {
+    return this.#stayConnected;
+  }
+
+  /** 24/7 mode. Enabling cancels any pending idle disconnect immediately. */
+  setStayConnected(enabled: boolean): void {
+    this.#stayConnected = enabled;
+    if (enabled) {
+      this.#clearIdleTimer();
+    } else if (!this.isPlaying) {
+      this.#startIdleTimer();
+    }
+  }
+
+  get autoplayEnabled(): boolean {
+    return this.#autoplayEnabled;
+  }
+
+  setAutoplayEnabled(enabled: boolean): void {
+    this.#autoplayEnabled = enabled;
+  }
+
+  /** The filter preset currently applied, or null for clean playback. */
+  get activeFilter(): FilterPresetName | 'speed' | 'pitch' | null {
+    return this.#activeFilter;
   }
 
   /* ---------------------------------------------------------------- control */
@@ -127,6 +172,55 @@ export class GuildPlayer {
     await this.#playTrack(target);
     this.#persist();
     return target;
+  }
+
+  /** Go back to the previously played track. Null when at the start. */
+  async previous(): Promise<QueuedTrack | null> {
+    const target = this.queue.previous();
+    if (target === null) return null;
+    this.#skipRequested = true;
+    await this.#playTrack(target);
+    this.#persist();
+    return target;
+  }
+
+  /** Restart the current track from the beginning. */
+  async restart(): Promise<QueuedTrack | null> {
+    const track = this.queue.current;
+    if (track === null) return null;
+    if (this.isPlaying) {
+      await this.#player.seekTo(0);
+    } else {
+      await this.#playTrack(track);
+    }
+    return track;
+  }
+
+  moveUpcoming(from: number, to: number): QueuedTrack | null {
+    const moved = this.queue.moveUpcoming(from, to);
+    if (moved !== null) this.#persist();
+    return moved;
+  }
+
+  swapUpcoming(a: number, b: number): boolean {
+    const swapped = this.queue.swapUpcoming(a, b);
+    if (swapped) this.#persist();
+    return swapped;
+  }
+
+  /** Apply a filter preset (replacing any active one), or clear with null. */
+  async setFilter(
+    name: FilterPresetName | 'speed' | 'pitch' | null,
+    filters: FilterOptions,
+  ): Promise<void> {
+    if (name === null) {
+      await this.#player.clearFilters();
+    } else {
+      // clearFilters first so presets replace instead of stack.
+      await this.#player.clearFilters();
+      await this.#player.setFilters(filters);
+    }
+    this.#activeFilter = name;
   }
 
   async pause(): Promise<void> {
@@ -259,6 +353,7 @@ export class GuildPlayer {
 
     if (next === null) {
       this.#persist();
+      if (await this.#tryAutoplay()) return;
       await this.#notify('✅ Queue finished. Add more with `/play`.');
       this.#startIdleTimer();
       return;
@@ -266,6 +361,30 @@ export class GuildPlayer {
 
     await this.#playTrack(next);
     this.#persist();
+  }
+
+  /** Continue with similar tracks when the queue drains. True if it did. */
+  async #tryAutoplay(): Promise<boolean> {
+    if (!this.#autoplayEnabled || this.#autoplayActive) return false;
+
+    this.#autoplayActive = true;
+    try {
+      const picks = await this.#onAutoplayRequest(this.guildId);
+      if (picks.length === 0) return false;
+
+      const { startedPlayback } = await this.enqueue(picks);
+      if (startedPlayback && this.#announce) {
+        await this.#notify(
+          `📻 Autoplay: queue finished, continuing with **${picks[0]?.title ?? 'similar tracks'}**. Disable with \`/autoplay\`.`,
+        );
+      }
+      return startedPlayback;
+    } catch (error) {
+      this.#logger.warn({ err: error }, 'Autoplay failed; parking the player');
+      return false;
+    } finally {
+      this.#autoplayActive = false;
+    }
   }
 
   async #playTrack(track: QueuedTrack): Promise<void> {
@@ -324,6 +443,9 @@ export class GuildPlayer {
   }
 
   #startIdleTimer(): void {
+    // 24/7 mode: the whole point is to stay in the channel while idle.
+    if (this.#stayConnected) return;
+
     this.#clearIdleTimer();
     const timer = setTimeout(() => {
       void this.#onSelfDestruct(this.guildId, 'idle-timeout');

@@ -22,17 +22,19 @@ lavalink:
       vimeo: false
       http: true
       local: false
+    # All native Lavalink filters are enabled — the /filter command exposes
+    # them as presets (bass boost, nightcore, vaporwave, karaoke, 8D, …).
     filters:
       volume: true
       equalizer: true
-      karaoke: false
+      karaoke: true
       timescale: true
-      tremolo: false
-      vibrato: false
-      distortion: false
-      rotation: false
-      channelMix: false
-      lowPass: false
+      tremolo: true
+      vibrato: true
+      distortion: true
+      rotation: true
+      channelMix: true
+      lowPass: true
     bufferDurationMs: 400
     frameBufferDurationMs: 5000
     opusEncodingQuality: 10
