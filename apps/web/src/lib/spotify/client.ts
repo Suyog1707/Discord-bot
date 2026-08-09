@@ -139,10 +139,29 @@ async function apiGet<T>(accessToken: string, path: string): Promise<T> {
     headers: { Authorization: `Bearer ${accessToken}` },
     signal: AbortSignal.timeout(10_000),
   });
+  const responseText = await response.text();
+
   if (!response.ok) {
-    throw new UpstreamError(`Spotify API request failed (${String(response.status)}).`);
+    let spotifyError: unknown = responseText;
+
+    try {
+      spotifyError = JSON.parse(responseText);
+    } catch {
+      // Keep the raw response text.
+    }
+
+    console.error('Spotify API request failed:', {
+      status: response.status,
+      response: spotifyError,
+      path,
+    });
+
+    throw new UpstreamError(
+      `Spotify API request failed (${String(response.status)}).`,
+    );
   }
-  return (await response.json()) as T;
+
+  return JSON.parse(responseText) as T;
 }
 
 export interface SpotifyProfile {
