@@ -25,7 +25,7 @@ export default async function PlaylistDetailPage({
   const { playlistId } = await params;
   const user = await requireUserOrRedirect(`/dashboard/playlists/${playlistId}`);
 
-  let playlist;
+  let playlist: Awaited<ReturnType<typeof getPlaylist>>;
   try {
     playlist = await getPlaylist(user.id, playlistId);
   } catch (error) {
