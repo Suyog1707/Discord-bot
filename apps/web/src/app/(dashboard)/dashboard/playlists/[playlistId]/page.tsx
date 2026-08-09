@@ -33,7 +33,10 @@ export default async function PlaylistDetailPage({
     throw error;
   }
 
-  const totalMs = playlist.tracks.reduce((total, track) => total + track.durationMs, 0);
+  const totalMs = playlist.tracks.reduce(
+    (total: number, track) => total + track.durationMs,
+    0,
+  );
 
   async function rename(formData: FormData) {
     'use server';
