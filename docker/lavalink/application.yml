@@ -59,14 +59,14 @@ plugins:
     sources:
       # Spotify and Deezer resolve metadata, then stream via YouTube/SoundCloud.
       # Spotify requires client credentials — see docs/MUSIC_SYSTEM.md (Phase 4).
-      spotify: false
-      applemusic: false
+      spotify: true
+      applemusic: true
       deezer: false
       yandexmusic: false
     spotify:
-      clientId: ''
-      clientSecret: ''
-      countryCode: 'US'
+      clientId: '${SPOTIFY_CLIENT_ID}'
+      clientSecret: '${SPOTIFY_CLIENT_SECRET}'
+      countryCode: 'IN'
       playlistLoadLimit: 6
       albumLoadLimit: 6
     deezer:

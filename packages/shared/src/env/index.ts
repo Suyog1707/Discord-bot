@@ -133,6 +133,7 @@ export const webEnvSchema = requireInProduction(
       /** Spotify integration — optional; linking/import stay hidden without it. */
       SPOTIFY_CLIENT_ID: optional(z.string().min(1)),
       SPOTIFY_CLIENT_SECRET: optional(z.string().min(1)),
+      SPOTIFY_REDIRECT_URI: optional(z.url()),
     }),
   ['REDIS_URL'],
 );

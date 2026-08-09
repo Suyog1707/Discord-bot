@@ -32,7 +32,15 @@ function credentials(): { id: string; secret: string } {
 }
 
 export function redirectUri(): string {
-  return `${getEnv().NEXTAUTH_URL}/api/spotify/callback`;
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const redirectUri = getEnv().SPOTIFY_REDIRECT_URI;
+
+  if (redirectUri === undefined) {
+    throw new UpstreamError('SPOTIFY_REDIRECT_URI is not configured.');
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-return
+  return redirectUri;
 }
 
 export function authorizeUrl(state: string): string {
