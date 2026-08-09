@@ -8,6 +8,7 @@ import 'server-only';
  * user's playlist. Track counts are denormalised and updated in the same
  * transaction as the track mutation.
  */
+import type { Prisma } from '@prisma/client';
 import {
   ConflictError,
   LIMITS,
@@ -18,7 +19,11 @@ import {
   z,
   type PlaylistExport,
 } from '@discord-music/shared';
-import { isUniqueConstraintError, MusicSource, type Playlist } from '@discord-music/database';
+import {
+  isUniqueConstraintError,
+  MusicSource,
+  type Playlist,
+} from '@discord-music/database';
 
 import { getDb } from '@/lib/db';
 import { omitUndefined } from '@/lib/object';
@@ -84,14 +89,23 @@ export async function listPlaylists(userId: string) {
   });
 }
 
-export async function getPlaylist(userId: string, playlistId: string) {
+export async function getPlaylist(
+  userId: string,
+  playlistId: string,
+): Promise<Prisma.PlaylistGetPayload<{ include: { tracks: true } }>> {
   const playlist = await getDb().playlist.findFirst({
     where: { id: playlistId, ownerId: userId },
-    include: { tracks: { orderBy: { position: 'asc' } } },
+    include: {
+      tracks: {
+        orderBy: { position: 'asc' },
+      },
+    },
   });
+
   if (playlist === null) {
     throw new NotFoundError('Playlist not found.');
   }
+
   return playlist;
 }
 

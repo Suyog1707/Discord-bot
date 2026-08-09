@@ -25,7 +25,8 @@ export default async function PlaylistDetailPage({
   const { playlistId } = await params;
   const user = await requireUserOrRedirect(`/dashboard/playlists/${playlistId}`);
 
-  let playlist: Awaited<ReturnType<typeof getPlaylist>>;
+  let playlist;
+
   try {
     playlist = await getPlaylist(user.id, playlistId);
   } catch (error) {
@@ -34,7 +35,7 @@ export default async function PlaylistDetailPage({
   }
 
   const totalMs = playlist.tracks.reduce(
-    (total: number, track) => total + track.durationMs,
+    (total, track) => total + track.durationMs,
     0,
   );
 
