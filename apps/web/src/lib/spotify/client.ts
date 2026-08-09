@@ -32,14 +32,12 @@ function credentials(): { id: string; secret: string } {
 }
 
 export function redirectUri(): string {
-  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
   const redirectUri = getEnv().SPOTIFY_REDIRECT_URI;
 
   if (redirectUri === undefined) {
     throw new UpstreamError('SPOTIFY_REDIRECT_URI is not configured.');
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-unsafe-return
   return redirectUri;
 }
 
@@ -77,10 +75,28 @@ async function tokenRequest(body: URLSearchParams): Promise<{
     body,
     signal: AbortSignal.timeout(10_000),
   });
+  const responseText = await response.text();
+
   if (!response.ok) {
-    throw new UpstreamError(`Spotify token request failed (${String(response.status)}).`);
+    let spotifyError: unknown = responseText;
+
+    try {
+      spotifyError = JSON.parse(responseText);
+    } catch {
+      // Keep the raw response text.
+    }
+
+    console.error('Spotify token request failed:', {
+      status: response.status,
+      response: spotifyError,
+    });
+
+    throw new UpstreamError(
+      `Spotify token request failed (${String(response.status)}).`,
+    );
   }
-  return (await response.json()) as {
+
+  return JSON.parse(responseText) as {
     access_token: string;
     refresh_token?: string;
     expires_in: number;

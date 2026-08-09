@@ -8,14 +8,14 @@ import { STATE_COOKIE } from '../authorize/route';
 
 export const dynamic = 'force-dynamic';
 
-const LOCALHOST_CALLBACK =
-  'http://localhost:3000/api/spotify/callback';
+function settingsRedirect(
+  request: NextRequest,
+  outcome: string,
+): NextResponse {
+  const redirectUrl = new URL('/dashboard/settings', request.url);
+  redirectUrl.searchParams.set('spotify', outcome);
 
-function settingsRedirect(outcome: string): NextResponse {
-  const response = NextResponse.redirect(
-    `http://localhost:3000/dashboard/settings?spotify=${outcome}`,
-  );
-
+  const response = NextResponse.redirect(redirectUrl);
   response.cookies.delete(STATE_COOKIE);
 
   return response;
@@ -24,42 +24,11 @@ function settingsRedirect(outcome: string): NextResponse {
 export const GET = withErrorHandling(
   'GET /api/spotify/callback',
   async (request: NextRequest) => {
-    /*
-     * Spotify requires the registered OAuth callback to use 127.0.0.1.
-     *
-     * Our application authentication cookie belongs to localhost.
-     *
-     * Therefore the first request is:
-     *
-     * 127.0.0.1:3000/api/spotify/callback
-     *
-     * and we immediately move it to:
-     *
-     * localhost:3000/api/spotify/callback
-     *
-     * while preserving code/state/error query parameters.
-     */
-
-    if (request.nextUrl.hostname === '127.0.0.1') {
-      const redirectUrl = new URL(LOCALHOST_CALLBACK);
-
-      request.nextUrl.searchParams.forEach((value, key) => {
-        redirectUrl.searchParams.set(key, value);
-      });
-
-      return NextResponse.redirect(redirectUrl);
-    }
-
-    /*
-     * From this point onward we should be on localhost,
-     * where the user's authentication cookie exists.
-     */
     const user = await requireUser();
-
     const params = request.nextUrl.searchParams;
 
     if (params.get('error') !== null) {
-      return settingsRedirect('denied');
+      return settingsRedirect(request, 'denied');
     }
 
     const code = params.get('code');
@@ -72,7 +41,7 @@ export const GET = withErrorHandling(
       expectedState === undefined ||
       state !== expectedState
     ) {
-      return settingsRedirect('invalid');
+      return settingsRedirect(request, 'invalid');
     }
 
     try {
@@ -83,9 +52,9 @@ export const GET = withErrorHandling(
         'Spotify link failed',
       );
 
-      return settingsRedirect('failed');
+      return settingsRedirect(request, 'failed');
     }
 
-    return settingsRedirect('linked');
+    return settingsRedirect(request, 'linked');
   },
 );
