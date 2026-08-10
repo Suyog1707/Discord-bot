@@ -142,6 +142,16 @@ export class SpotifyService {
     return this.#prisma.spotifyAccount.findFirst({ where: { user: { discordId } } });
   }
 
+  /**
+   * Playback-only token lookup. An absent link is normal for `/play` and must
+   * not turn a public Spotify URL into an account-linking requirement.
+   */
+  async accessTokenForPlayback(discordId: string): Promise<string | null> {
+    if (!this.canReadTokens()) return null;
+    const account = await this.status(discordId);
+    return account === null ? null : this.#validAccessToken(discordId);
+  }
+
   /** Unlink. Returns false when nothing was linked. */
   async disconnect(discordId: string): Promise<boolean> {
     const { count } = await this.#prisma.spotifyAccount.deleteMany({
@@ -174,20 +184,29 @@ export class SpotifyService {
     if (env.SPOTIFY_CLIENT_ID === undefined || env.SPOTIFY_CLIENT_SECRET === undefined) {
       throw new UpstreamError('Spotify is not configured on the bot.');
     }
-    const response = await fetch(`${ACCOUNTS_BASE}/api/token`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Basic ${Buffer.from(
-          `${env.SPOTIFY_CLIENT_ID}:${env.SPOTIFY_CLIENT_SECRET}`,
-        ).toString('base64')}`,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken }),
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    });
-    if (!response.ok) {
-      throw new UpstreamError(`Spotify token refresh failed (${String(response.status)}).`);
+    let response: Response;
+    try {
+      response = await fetch(`${ACCOUNTS_BASE}/api/token`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Basic ${Buffer.from(
+            `${env.SPOTIFY_CLIENT_ID}:${env.SPOTIFY_CLIENT_SECRET}`,
+          ).toString('base64')}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken }),
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
+    } catch (error) {
+      throw new UpstreamError('Spotify did not respond in time. Try again shortly.', { cause: error });
     }
+    if (response.status === 401 || response.status === 403) {
+      throw new UpstreamError('Your Spotify connection expired. Reconnect it on the dashboard and try again.');
+    }
+    if (response.status === 429) {
+      throw new UpstreamError('Spotify is rate limiting requests. Try again shortly.');
+    }
+    if (!response.ok) throw new UpstreamError('Spotify token refresh failed. Try again shortly.');
     const data = (await response.json()) as {
       access_token: string;
       refresh_token?: string;
@@ -208,13 +227,23 @@ export class SpotifyService {
 
   async #apiGet<T>(discordId: string, path: string): Promise<T> {
     const token = await this.#validAccessToken(discordId);
-    const response = await fetch(path.startsWith('https://') ? path : `${API_BASE}${path}`, {
-      headers: { Authorization: `Bearer ${token}` },
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    });
-    if (!response.ok) {
-      throw new UpstreamError(`Spotify request failed (${String(response.status)}).`);
+    let response: Response;
+    try {
+      response = await fetch(path.startsWith('https://') ? path : `${API_BASE}${path}`, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
+    } catch (error) {
+      throw new UpstreamError('Spotify did not respond in time. Try again shortly.', { cause: error });
     }
+    if (response.status === 401 || response.status === 403) {
+      throw new UpstreamError('Spotify denied that request. Reconnect your account and try again.');
+    }
+    if (response.status === 404) throw new NotFoundError('That Spotify item no longer exists.');
+    if (response.status === 429) {
+      throw new UpstreamError('Spotify is rate limiting requests. Try again shortly.');
+    }
+    if (!response.ok) throw new UpstreamError('Spotify request failed. Try again shortly.');
     return (await response.json()) as T;
   }
 
@@ -225,7 +254,7 @@ export class SpotifyService {
         id: string;
         name: string;
         snapshot_id: string;
-        tracks: { total: number };
+        items: { total: number };
         owner: { display_name: string | null };
         images?: { url: string }[] | null;
         public: boolean | null;
@@ -251,7 +280,7 @@ export class SpotifyService {
         ...page.items.map((item) => ({
           spotifyId: item.id,
           name: item.name,
-          trackCount: item.tracks.total,
+          trackCount: item.items.total,
           owner: item.owner.display_name,
           artworkUrl: item.images?.[0]?.url ?? null,
           isPublic: item.public,
@@ -269,16 +298,16 @@ export class SpotifyService {
     let url: string | null =
       spotifyId === LIKED_SONGS_ID
         ? '/me/tracks?limit=50'
-        : `/playlists/${spotifyId}/tracks?limit=100`;
+        : `/playlists/${spotifyId}/items?limit=100`;
 
     while (url !== null && collected.length < limit) {
-      const page: { items: { track: RawTrack | null }[]; next: string | null } = await this.#apiGet(
+      const page: { items: { item: RawTrack | null }[]; next: string | null } = await this.#apiGet(
         discordId,
         url,
       );
       for (const item of page.items) {
-        if (item.track !== null && item.track.is_local !== true) {
-          collected.push(toUserTrack(item.track));
+        if (item.item !== null && item.item.is_local !== true) {
+          collected.push(toUserTrack(item.item));
         }
       }
       url = page.next;

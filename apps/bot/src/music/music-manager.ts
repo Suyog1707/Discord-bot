@@ -29,11 +29,12 @@ import {
 import type { LavalinkNode } from '../config/env.js';
 import { getLogger } from '../lib/logger.js';
 import type { GuildService } from '../services/guild-service.js';
+import type { SpotifyService } from '../services/spotify-service.js';
 import { ControllerMessage } from './controller.js';
 import { GuildPlayer } from './guild-player.js';
 import {
-  isSpotifyConfigured,
   isSpotifyUrl,
+  isSpotifyWebUrl,
   resolveSpotifyUrl,
   searchQueryFor,
 } from './spotify-resolver.js';
@@ -66,6 +67,7 @@ export class MusicManager {
   readonly #client: Client;
   readonly #store: QueueStore;
   readonly #guilds: GuildService;
+  readonly #spotify: SpotifyService;
   readonly #node: LavalinkNode;
   /** Nodes already carrying a give-up listener, so retries never double-log. */
   readonly #watchedNodes = new WeakSet<Node>();
@@ -79,12 +81,14 @@ export class MusicManager {
     readonly node: LavalinkNode;
     readonly store: QueueStore;
     readonly guilds: GuildService;
+    readonly spotify: SpotifyService;
     /** Serialised event sink; absent when Redis is not configured. */
     readonly publishEvent?: (payload: string) => void;
   }) {
     this.#client = options.client;
     this.#store = options.store;
     this.#guilds = options.guilds;
+    this.#spotify = options.spotify;
     this.#node = options.node;
     this.#publishEvent = options.publishEvent;
 
@@ -322,7 +326,7 @@ export class MusicManager {
       throw new UpstreamError('The music server is not available right now. Try again shortly.');
     }
 
-    const resolution = await resolveSpotifyUrl(url);
+    const resolution = await resolveSpotifyUrl(url, requestedBy.id, this.#spotify);
     if (resolution.tracks.length === 0) {
       throw new NotFoundError('That Spotify link contains no playable tracks.');
     }
@@ -511,12 +515,10 @@ export class MusicManager {
     // Spotify links: metadata from the Web API, audio via search on the
     // playback sources — Spotify audio itself is never streamed.
     if (isSpotifyUrl(input)) {
-      if (!isSpotifyConfigured()) {
-        throw new UpstreamError(
-          'Spotify links are not enabled on this bot (missing SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET).',
-        );
-      }
       return this.#resolveSpotify(input, requestedBy);
+    }
+    if (isSpotifyWebUrl(input)) {
+      throw new ValidationError('Unsupported or invalid Spotify link.');
     }
 
     let response: LavalinkResponse | undefined;

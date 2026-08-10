@@ -4,13 +4,17 @@
  * artist URL resolves to metadata, and each track then finds its best
  * playable match through Lavalink search (`title artist`).
  *
- * Uses the client-credentials flow (app token, no user context), cached until
- * shortly before expiry. Inert unless SPOTIFY_CLIENT_ID/SECRET are set.
+ * Linked users resolve through their existing Spotify OAuth token. App tokens
+ * are used only for public catalogue objects (tracks, albums and artists),
+ * never as a way to read a user's playlist. Public playlists for unlinked
+ * users use the data exposed by Spotify's public playlist page as a best-
+ * effort fallback.
  */
 import { UpstreamError, ValidationError } from '@discord-music/shared';
 
 import { getEnv } from '../config/env.js';
 import { getLogger } from '../lib/logger.js';
+import type { SpotifyService } from '../services/spotify-service.js';
 
 const logger = getLogger('spotify');
 
@@ -39,6 +43,18 @@ export interface SpotifyResolution {
 
 export function isSpotifyUrl(input: string): boolean {
   return URL_PATTERN.test(input);
+}
+
+/** True for an open.spotify.com URL, including malformed/unsupported ones. */
+export function isSpotifyWebUrl(input: string): boolean {
+  try {
+    const parsed = new URL(input);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:'
+      ? parsed.hostname === 'open.spotify.com'
+      : false;
+  } catch {
+    return false;
+  }
 }
 
 export function isSpotifyConfigured(): boolean {
@@ -79,19 +95,36 @@ async function appToken(): Promise<string> {
   return cachedToken.value;
 }
 
-async function apiGet<T>(path: string): Promise<T> {
-  const token = await appToken();
-  const response = await fetch(`${API_BASE}${path}`, {
+async function apiGet<T>(path: string, token: string): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(path.startsWith('https://') ? path : `${API_BASE}${path}`, {
     headers: { Authorization: `Bearer ${token}` },
     signal: AbortSignal.timeout(TIMEOUT_MS),
-  });
+    });
+  } catch (error) {
+    throw new UpstreamError('Spotify did not respond in time. Try again shortly.', { cause: error });
+  }
   if (response.status === 404) {
     throw new ValidationError('That Spotify link points at nothing (deleted or private?).');
+  }
+  if (response.status === 401) {
+    throw new UpstreamError('Spotify authorization expired. Reconnect your Spotify account and try again.');
+  }
+  if (response.status === 403) {
+    throw new ValidationError('Spotify does not allow access to that item.');
+  }
+  if (response.status === 429) {
+    throw new UpstreamError('Spotify is rate limiting requests. Try again shortly.');
   }
   if (!response.ok) {
     throw new UpstreamError(`Spotify lookup failed (${String(response.status)}).`);
   }
   return (await response.json()) as T;
+}
+
+async function catalogueGet<T>(path: string): Promise<T> {
+  return apiGet<T>(path, await appToken());
 }
 
 interface RawTrack {
@@ -113,23 +146,126 @@ function toMeta(track: RawTrack, artworkFallback: string | null = null): Spotify
   };
 }
 
+interface PlaylistPage {
+  readonly items: readonly { readonly item: RawTrack | null }[];
+  readonly next: string | null;
+}
+
+async function linkedPlaylist(
+  id: string,
+  token: string,
+): Promise<SpotifyResolution> {
+  const playlist = await apiGet<{ readonly name: string }>(`/playlists/${id}?fields=name`, token);
+  const tracks: RawTrack[] = [];
+  let path: string | null =
+    `/playlists/${id}/items?limit=50&fields=items(item(name,duration_ms,artists(name),album(images),external_ids,is_local)),next`;
+
+  while (path !== null && tracks.length < MAX_TRACKS) {
+    const page: PlaylistPage = await apiGet<PlaylistPage>(path, token);
+    for (const entry of page.items) {
+      if (entry.item !== null && entry.item.is_local !== true) tracks.push(entry.item);
+      if (tracks.length >= MAX_TRACKS) break;
+    }
+    path = page.next;
+  }
+  return { tracks: tracks.map((track) => toMeta(track)), collectionName: playlist.name };
+}
+
+function objectTracks(value: unknown, output: RawTrack[]): void {
+  if (output.length >= MAX_TRACKS || value === null || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    for (const entry of value) objectTracks(entry, output);
+    return;
+  }
+  const object = value as Record<string, unknown>;
+  const candidate = object.item ?? object.track;
+  if (candidate !== undefined) objectTracks(candidate, output);
+  const name = object.name;
+  const artists = object.artists;
+  const duration = object.duration_ms;
+  if (
+    typeof name === 'string' &&
+    typeof duration === 'number' &&
+    Array.isArray(artists) &&
+    artists.every((artist) => artist !== null && typeof artist === 'object' && typeof (artist as { name?: unknown }).name === 'string')
+  ) {
+    output.push(object as unknown as RawTrack);
+    return;
+  }
+  for (const child of Object.values(object)) objectTracks(child, output);
+}
+
+/**
+ * Best-effort public-playlist fallback. Spotify exposes JSON state in some
+ * public playlist pages; its precise wrapper is deliberately not depended on.
+ * Private/deleted pages and markup changes yield the same actionable error.
+ */
+async function publicPlaylist(id: string): Promise<SpotifyResolution> {
+  let html: string;
+  try {
+    const response = await fetch(`https://open.spotify.com/embed/playlist/${id}`, {
+      headers: { Accept: 'text/html', 'User-Agent': 'discord-music-platform/0.1' },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    if (!response.ok) throw new Error(`HTTP ${String(response.status)}`);
+    html = await response.text();
+  } catch (error) {
+    logger.debug({ err: error, id }, 'Public Spotify playlist fallback failed');
+    throw new ValidationError(
+      "I couldn't read that Spotify playlist. If it's private, connect your Spotify account and try again.",
+    );
+  }
+
+  const tracks: RawTrack[] = [];
+  const scriptPattern = /<script[^>]*type=["']application\/json["'][^>]*>([\s\S]*?)<\/script>/giu;
+  for (const match of html.matchAll(scriptPattern)) {
+    try {
+      objectTracks(JSON.parse(match[1] ?? ''), tracks);
+    } catch {
+      // A non-state JSON script is expected on the page.
+    }
+    if (tracks.length >= MAX_TRACKS) break;
+  }
+  if (tracks.length === 0) {
+    throw new ValidationError(
+      "I couldn't read that Spotify playlist. If it's private, connect your Spotify account and try again.",
+    );
+  }
+  const title = /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)/iu.exec(html)?.[1];
+  return { tracks: tracks.slice(0, MAX_TRACKS).map((track) => toMeta(track)), collectionName: title ?? null };
+}
+
 /** Resolve any supported Spotify URL into track metadata. */
-export async function resolveSpotifyUrl(url: string): Promise<SpotifyResolution> {
+export async function resolveSpotifyUrl(
+  url: string,
+  discordId: string,
+  spotify: SpotifyService,
+): Promise<SpotifyResolution> {
   const match = URL_PATTERN.exec(url);
   if (match === null) throw new ValidationError('Unsupported Spotify link.');
   const [, kind, id] = match as unknown as [string, string, string];
 
   switch (kind) {
     case 'track': {
-      const track = await apiGet<RawTrack>(`/tracks/${id}`);
+      const token = await spotify.accessTokenForPlayback(discordId);
+      const track = await (token === null
+        ? catalogueGet<RawTrack>(`/tracks/${id}`)
+        : apiGet<RawTrack>(`/tracks/${id}`, token));
       return { tracks: [toMeta(track)], collectionName: null };
     }
     case 'album': {
-      const album = await apiGet<{
+      const token = await spotify.accessTokenForPlayback(discordId);
+      const album = await (token === null
+        ? catalogueGet<{
+            name: string;
+            images?: { url: string }[];
+            tracks: { items: RawTrack[] };
+          }>(`/albums/${id}`)
+        : apiGet<{
         name: string;
         images?: { url: string }[];
         tracks: { items: RawTrack[] };
-      }>(`/albums/${id}`);
+          }>(`/albums/${id}`, token));
       const artwork = album.images?.[0]?.url ?? null;
       return {
         tracks: album.tracks.items.slice(0, MAX_TRACKS).map((track) => toMeta(track, artwork)),
@@ -137,25 +273,30 @@ export async function resolveSpotifyUrl(url: string): Promise<SpotifyResolution>
       };
     }
     case 'playlist': {
-      const playlist = await apiGet<{
-        name: string;
-        tracks: { items: { track: RawTrack | null }[] };
-      }>(
-        `/playlists/${id}?fields=name,tracks.items(track(name,duration_ms,artists(name),album(images),external_ids,is_local))`,
-      );
-      const tracks = playlist.tracks.items
-        .flatMap((item) =>
-          item.track === null || item.track.is_local === true ? [] : [item.track],
-        )
-        .slice(0, MAX_TRACKS)
-        .map((track) => toMeta(track));
-      return { tracks, collectionName: playlist.name };
+      const token = await spotify.accessTokenForPlayback(discordId);
+      if (token === null) return publicPlaylist(id);
+      try {
+        return await linkedPlaylist(id, token);
+      } catch (error) {
+        // Since February 2026 Spotify only returns playlist items to an owner
+        // or collaborator. A linked listener can still play a public playlist
+        // through the same no-login public metadata fallback as anyone else.
+        if (error instanceof ValidationError) return publicPlaylist(id);
+        throw error;
+      }
     }
     case 'artist': {
-      const top = await apiGet<{ tracks: RawTrack[] }>(`/artists/${id}/top-tracks?market=US`);
-      const artist = await apiGet<{ name: string }>(`/artists/${id}`);
+      const token = await spotify.accessTokenForPlayback(discordId);
+      const get = <T>(path: string): Promise<T> =>
+        token === null ? catalogueGet<T>(path) : apiGet<T>(path, token);
+      const artist = await get<{ name: string }>(`/artists/${id}`);
+      // `/artists/{id}/top-tracks` was removed in February 2026. Search is
+      // capped at ten results, which is exactly the size we present here.
+      const top = await get<{ tracks: { items: RawTrack[] } }>(
+        `/search?type=track&limit=10&q=${encodeURIComponent(`artist:${artist.name}`)}`,
+      );
       return {
-        tracks: top.tracks.slice(0, 10).map((track) => toMeta(track)),
+        tracks: top.tracks.items.slice(0, 10).map((track) => toMeta(track)),
         collectionName: `${artist.name} — top tracks`,
       };
     }

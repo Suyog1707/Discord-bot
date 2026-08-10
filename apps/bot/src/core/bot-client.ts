@@ -136,6 +136,7 @@ export class BotClient extends Client {
             node: lavalinkNode,
             store: this.services.queueStore,
             guilds: this.services.guilds,
+            spotify: this.services.spotify,
             // Realtime events ride the shared Redis connection; without Redis
             // the dashboard simply has no live stream (allowed in development).
             publishEvent: (payload) => {
