@@ -27,6 +27,7 @@ import {
 } from 'shoukaku';
 
 import type { LavalinkNode } from '../config/env.js';
+import { getEnv } from '../config/env.js';
 import { getLogger } from '../lib/logger.js';
 import type { GuildService } from '../services/guild-service.js';
 import type { SpotifyService } from '../services/spotify-service.js';
@@ -38,6 +39,7 @@ import {
   resolveSpotifyUrl,
   searchQueryFor,
 } from './spotify-resolver.js';
+import type { SpotifyTrackMeta } from './spotify-resolver.js';
 import type { QueueStore } from './queue-store.js';
 import { buildSearchQuery, fromLavalinkTrack, type QueuedTrack } from './track.js';
 
@@ -52,6 +54,14 @@ export interface ResolveResult {
   readonly tracks: readonly QueuedTrack[];
   /** Set when the identifier resolved to a whole playlist. */
   readonly playlistName: string | null;
+  /** Remaining collection tracks, resolved in the background after playback starts. */
+  readonly background?: Promise<SpotifyBackgroundResolution>;
+}
+
+export interface SpotifyBackgroundResolution {
+  readonly tracks: readonly QueuedTrack[];
+  readonly sourceTrackCount: number;
+  readonly failedTrackCount: number;
 }
 
 export interface JoinOptions {
@@ -317,6 +327,67 @@ export class MusicManager {
   }
 
   /** Map each Spotify track to its best playable match via Lavalink search. */
+  async #matchSpotifyTracks(
+    metadata: readonly SpotifyTrackMeta[],
+    requestedBy: { readonly id: string; readonly name: string },
+  ): Promise<SpotifyBackgroundResolution> {
+    const node = this.shoukaku.getIdealNode();
+    if (node === undefined) {
+      throw new UpstreamError('The music server is not available right now. Try again shortly.');
+    }
+
+    const startedAt = Date.now();
+    const matches: (QueuedTrack | null)[] = Array.from({ length: metadata.length }, () => null);
+    const concurrency = Math.min(getEnv().SPOTIFY_RESOLVE_CONCURRENCY, metadata.length);
+    let nextIndex = 0;
+
+    const worker = async (): Promise<void> => {
+      while (nextIndex < metadata.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= metadata.length) return;
+        const meta = metadata.at(index);
+        if (meta === undefined) return;
+        try {
+          const response = await node.rest.resolve(`ytsearch:${searchQueryFor(meta)}`);
+          if (response?.loadType !== LoadType.SEARCH) continue;
+          const [best] = response.data;
+          if (best === undefined) continue;
+          const track = fromLavalinkTrack(best, requestedBy);
+          // Spotify is metadata-only: keep it for queue/display, play Lavalink's match.
+          matches[index] = {
+            ...track,
+            title: meta.title,
+            author: meta.artist,
+            artworkUrl: meta.artworkUrl ?? track.artworkUrl,
+            source: 'spotify',
+          };
+        } catch (error) {
+          logger.debug({ err: error, title: meta.title }, 'Spotify track match failed');
+        }
+      }
+    };
+
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    const tracks = matches.flatMap((track) => (track === null ? [] : [track]));
+    logger.info(
+      {
+        sourceTracks: metadata.length,
+        resolved: tracks.length,
+        failed: metadata.length - tracks.length,
+        durationMs: Date.now() - startedAt,
+        concurrency,
+      },
+      'Spotify Lavalink resolution complete',
+    );
+    return {
+      tracks,
+      sourceTrackCount: metadata.length,
+      failedTrackCount: metadata.length - tracks.length,
+    };
+  }
+
+  /** Map each Spotify track to its best playable match via Lavalink search. */
   async #resolveSpotify(
     url: string,
     requestedBy: { readonly id: string; readonly name: string },
@@ -326,36 +397,41 @@ export class MusicManager {
       throw new UpstreamError('The music server is not available right now. Try again shortly.');
     }
 
+    const metadataStartedAt = Date.now();
     const resolution = await resolveSpotifyUrl(url, requestedBy.id, this.#spotify);
+    logger.info(
+      { tracks: resolution.tracks.length, durationMs: Date.now() - metadataStartedAt },
+      'Spotify metadata fetch complete',
+    );
     if (resolution.tracks.length === 0) {
       throw new NotFoundError('That Spotify link contains no playable tracks.');
     }
 
-    const matched: QueuedTrack[] = [];
-    for (const meta of resolution.tracks) {
-      try {
-        const response = await node.rest.resolve(`ytsearch:${searchQueryFor(meta)}`);
-        if (response?.loadType !== LoadType.SEARCH) continue;
-        const [best] = response.data;
-        if (best === undefined) continue;
-        const track = fromLavalinkTrack(best, requestedBy);
-        // Keep Spotify metadata for display; playback uses the matched source.
-        matched.push({
-          ...track,
-          title: meta.title,
-          author: meta.artist,
-          artworkUrl: meta.artworkUrl ?? track.artworkUrl,
-          source: 'spotify',
-        });
-      } catch (error) {
-        logger.debug({ err: error, title: meta.title }, 'Spotify track match failed');
-      }
-    }
+    // Resolve a small ordered prefix first so /play can start immediately;
+    // the rest is safely bounded and queued in order after the reply.
+    const initialSize = Math.min(getEnv().SPOTIFY_RESOLVE_CONCURRENCY, resolution.tracks.length);
+    const initial = await this.#matchSpotifyTracks(
+      resolution.tracks.slice(0, initialSize),
+      requestedBy,
+    );
+    const remaining = resolution.tracks.slice(initialSize);
+    const background =
+      remaining.length === 0
+        ? undefined
+        : this.#matchSpotifyTracks(remaining, requestedBy);
 
-    if (matched.length === 0) {
+    if (initial.tracks.length === 0) {
+      if (background !== undefined) {
+        const completed = await background;
+        if (completed.tracks.length > 0) {
+          return { tracks: completed.tracks, playlistName: resolution.collectionName };
+        }
+      }
       throw new NotFoundError('No playable matches found for that Spotify link.');
     }
-    return { tracks: matched, playlistName: resolution.collectionName };
+    return background === undefined
+      ? { tracks: initial.tracks, playlistName: resolution.collectionName }
+      : { tracks: initial.tracks, playlistName: resolution.collectionName, background };
   }
 
   /**

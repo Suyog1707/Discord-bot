@@ -117,6 +117,25 @@ export default defineCommand({
 
     const { startedPlayback } = await player.enqueue(result.tracks, { next: insertNext });
 
+    if (result.background !== undefined) {
+      void result.background
+        .then(async (completed) => {
+          if (completed.tracks.length > 0) await player.enqueue(completed.tracks);
+          const queued = result.tracks.length + completed.tracks.length;
+          const failed = completed.failedTrackCount;
+          await interaction.followUp({
+            content:
+              `Spotify playlist loading complete: queued ${String(queued)} of ` +
+              `${String(result.tracks.length + completed.sourceTrackCount)} tracks.` +
+              (failed === 0 ? '' : ` ${String(failed)} could not be resolved.`),
+            ephemeral: true,
+          });
+        })
+        .catch((error: unknown) => {
+          client.logger.warn({ err: error }, 'Background Spotify playlist expansion failed');
+        });
+    }
+
     const [first] = result.tracks;
     if (first === undefined) return; // resolve() already threw on empty results
 
@@ -126,7 +145,8 @@ export default defineCommand({
       embed
         .setAuthor({ name: startedPlayback ? 'Now playing playlist' : 'Queued playlist' })
         .setDescription(
-          `**${result.playlistName}** — ${String(result.tracks.length)} tracks` +
+          `**${result.playlistName}** — ${String(result.tracks.length)} track(s)` +
+            (result.background === undefined ? '' : ' (loading remaining tracks…)') +
             (insertNext ? ' (up next)' : ''),
         );
     } else {

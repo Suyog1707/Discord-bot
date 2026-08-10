@@ -10,7 +10,7 @@
  */
 import { z } from 'zod';
 
-import { SNOWFLAKE_PATTERN } from '../constants/index.js';
+import { LIMITS, SNOWFLAKE_PATTERN } from '../constants/index.js';
 import { ConfigurationError } from '../errors/index.js';
 
 /* -------------------------------------------------------------------------- */
@@ -162,6 +162,15 @@ export const botEnvSchema = requireInProduction(
       /** Spotify Web API (client credentials) for URL metadata. Optional. */
       SPOTIFY_CLIENT_ID: optional(z.string().min(1)),
       SPOTIFY_CLIENT_SECRET: optional(z.string().min(1)),
+      /** Runtime playlist expansion is capped by the guild queue capacity. */
+      SPOTIFY_PLAYLIST_MAX_TRACKS: z.coerce
+        .number()
+        .int()
+        .min(1)
+        .max(LIMITS.QUEUE_MAX_TRACKS)
+        .default(LIMITS.QUEUE_MAX_TRACKS),
+      /** Bounded parallel Lavalink searches for Spotify collection playback. */
+      SPOTIFY_RESOLVE_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(8),
       /**
        * Same value as the web app's NEXTAUTH_SECRET. Lets the bot decrypt the
        * Spotify tokens the dashboard stored, enabling `/spotify playlists`.
