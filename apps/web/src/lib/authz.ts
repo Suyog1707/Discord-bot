@@ -41,7 +41,7 @@ export async function requireManagedGuild(
   }
 
   const guild = await getDb().guild.findUnique({ where: { discordId: discordGuildId } });
-  if (guild?.botLeftAt !== null) {
+  if (guild?.isActive !== true) {
     throw new NotFoundError('The bot is not in that server. Invite it first.');
   }
 

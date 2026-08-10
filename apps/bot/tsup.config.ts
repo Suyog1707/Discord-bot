@@ -1,7 +1,12 @@
 import { defineConfig } from 'tsup';
 
 export default defineConfig({
-  entry: ['src/index.ts', 'src/scripts/deploy-commands.ts'],
+  entry: [
+    'src/index.ts',
+    'src/scripts/deploy-commands.ts',
+    'src/commands/**/*.ts',
+    'src/events/**/*.ts',
+  ],
   format: ['esm'],
   target: 'node20',
   outDir: 'dist',

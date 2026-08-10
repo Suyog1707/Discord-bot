@@ -35,7 +35,7 @@ export async function listServers(userId: string): Promise<readonly ServerListEn
   if (manageable.length === 0) return [];
 
   const present = await getDb().guild.findMany({
-    where: { discordId: { in: manageable.map((guild) => guild.id) }, botLeftAt: null },
+    where: { discordId: { in: manageable.map((guild) => guild.id) }, isActive: true },
     select: { discordId: true },
   });
   const presentIds = new Set(present.map((row) => row.discordId));

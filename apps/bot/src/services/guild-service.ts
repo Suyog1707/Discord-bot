@@ -34,6 +34,7 @@ export class GuildService {
         ownerId: guild.ownerId,
         botJoinedAt: new Date(),
         botLeftAt: null,
+        isActive: true,
       },
       create: {
         discordId: guild.id,
@@ -41,6 +42,7 @@ export class GuildService {
         icon: guild.icon,
         ownerId: guild.ownerId,
         botJoinedAt: new Date(),
+        isActive: true,
         settings: { create: {} },
         queue: { create: {} },
       },
@@ -69,12 +71,21 @@ export class GuildService {
     try {
       await this.#prisma.guild.update({
         where: { discordId: discordGuildId },
-        data: { botLeftAt: new Date() },
+        data: {
+          isActive: false,
+          botLeftAt: new Date(),
+        },
       });
-      logger.info({ guildId: discordGuildId }, 'Guild marked left');
+
+      logger.info(
+        { guildId: discordGuildId },
+        'Guild marked inactive',
+      );
     } catch {
-      // Row may not exist if the bot was kicked before ever registering.
-      logger.warn({ guildId: discordGuildId }, 'Guild left but no row existed');
+      logger.warn(
+        { guildId: discordGuildId },
+        'Guild left but no row existed',
+      );
     }
   }
 

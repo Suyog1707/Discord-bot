@@ -117,6 +117,8 @@ model Guild {
   name        String
   icon        String?
   ownerId     String?
+  /// Whether the bot is currently installed in this guild.
+  isActive    Boolean   @default(false)
   /// Cleared when the bot is removed; the row is retained for settings restore.
   botJoinedAt DateTime? @db.Timestamptz(3)
   botLeftAt   DateTime? @db.Timestamptz(3)

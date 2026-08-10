@@ -153,15 +153,26 @@ export class BotClient extends Client {
   async start(): Promise<void> {
     const startedAt = Date.now();
 
-    await this.commands.loadFrom(join(moduleDirectory, '..', 'commands'));
-    await this.events.loadFrom(join(moduleDirectory, '..', 'events'));
+    const commandsDirectory = isDevelopment()
+      ? join(moduleDirectory, '..', 'commands')
+      : join(moduleDirectory, 'commands');
+
+    const eventsDirectory = isDevelopment()
+      ? join(moduleDirectory, '..', 'events')
+      : join(moduleDirectory, 'events');
+
+    await this.commands.loadFrom(commandsDirectory);
+    await this.events.loadFrom(eventsDirectory);
     this.events.attach(this);
 
     await this.#verifyDependencies();
     await this.#connect();
     await this.#startCommandSubscriber();
 
-    this.logger.info({ durationMs: Date.now() - startedAt }, 'Bot startup complete');
+    this.logger.info(
+      { durationMs: Date.now() - startedAt },
+      'Bot startup complete',
+    );
   }
 
   /**
