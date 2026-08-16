@@ -608,18 +608,6 @@ export class MusicManager {
     return track;
   }
 
-  /**
-   * Warm the autoplay buffer for a guild while a track is still playing.
-   *
-   * Fire-and-forget by design: nothing on the playback path may wait for it.
-   */
-  prefetchAutoplay(guildId: string, history: readonly { title: string; author: string }[]): void {
-    this.#autoplay?.prefetch(
-      guildId,
-      history.slice(0, 4).map((entry) => ({ title: entry.title, artist: entry.author })),
-    );
-  }
-
   /** Drop a guild's prefetched autoplay buffer — on stop or disconnect. */
   clearAutoplayBuffer(guildId: string): void {
     this.#autoplay?.clear(guildId);

@@ -67,6 +67,12 @@ export function createAiStack(options: {
     new ShortlistReranker(llm),
   );
 
+  // The session store is constructed BEFORE the orchestrator on purpose: the
+  // orchestrator needs it so /ask runs under the same exclusions and
+  // reservations as autoplay. Without it, the two paths race each other for
+  // the same guild and can select the same song.
+  const session = new AutoplaySessionStore(redis === undefined ? {} : { redis });
+
   const orchestrator = new MusicOrchestrator({
     intent: new IntentService(llm),
     taste,
@@ -74,9 +80,9 @@ export function createAiStack(options: {
     lastfm,
     musicbrainz,
     cache,
+    session,
   });
 
-  const session = new AutoplaySessionStore(redis === undefined ? {} : { redis });
   const autoplay = new AutoplayEngine(orchestrator, session, {
     prefetchSize: env.AUTOPLAY_PREFETCH_SIZE,
   });

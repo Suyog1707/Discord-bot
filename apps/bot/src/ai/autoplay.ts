@@ -103,6 +103,11 @@ export class AutoplayEngine {
       seedWindowOf(seeds).has(existing.seedKey) &&
       Date.now() - existing.generatedAt < BUFFER_TTL_MS
     ) {
+      // Roll the seed identity forward so the buffer travels with the session
+      // instead of "drifting" out of a 4-track window while still perfectly
+      // relevant. Staleness stays bounded by the TTL, whose clock is anchored
+      // at generation and never reset.
+      this.#buffers.set(guildId, { ...existing, seedKey: seedKeyOf(seeds) });
       return;
     }
 
@@ -230,15 +235,28 @@ export class AutoplayEngine {
 
   async #refill(guildId: string, seeds: readonly TrackSeed[]): Promise<void> {
     return this.#gated(guildId, async () => {
-      // A drifted buffer must go through clear() so its reservations are
-      // RELEASED — silently dropping it kept every discarded pick locked out
-      // for the full reservation TTL, starving the pool's head.
+      // A drifted buffer must go through a release so its reservations are
+      // handed back — silently dropping it kept every discarded pick locked
+      // out for the full reservation TTL, starving the pool's head. The
+      // release is AWAITED (we are inside the per-guild gate): fired and
+      // forgotten, the Redis DEL could land after the SET NX of the very next
+      // generation pass and delete a live reservation.
       const existing = this.#buffers.get(guildId);
       const survivors =
         existing !== undefined && seedWindowOf(seeds).has(existing.seedKey)
           ? existing.tracks
           : [];
-      if (existing !== undefined && survivors.length === 0) this.clear(guildId);
+      if (existing !== undefined && survivors.length === 0) {
+        this.#buffers.delete(guildId);
+        if (existing.tracks.length > 0) {
+          await this.#session
+            .release(
+              guildId,
+              existing.tracks.map((entry) => entry.reservedKey),
+            )
+            .catch(() => undefined);
+        }
+      }
 
       // Only generate the shortfall: survivors keep their reservations and
       // their place at the front of the buffer.
@@ -249,7 +267,14 @@ export class AutoplayEngine {
       if (survivors.length + entries.length > 0) {
         this.#buffers.set(guildId, {
           tracks: [...survivors, ...entries],
-          generatedAt: Date.now(),
+          // Anchored to the ORIGINAL generation when entries survive a merge:
+          // a survivor's reservation (20 min from reserve) must always outlive
+          // the buffer's validity (15 min), and resetting this clock on every
+          // merge would let a survivor sit past its reservation, protected by
+          // nothing.
+          generatedAt: survivors.length > 0 && existing !== undefined
+            ? existing.generatedAt
+            : Date.now(),
           seedKey: seedKeyOf(seeds),
         });
       }

@@ -167,5 +167,17 @@ intends by "Redis fast / DB durable".
 
 ### Final review
 - [x] Full lint/typecheck/test/build
-- [ ] Final Opus review
-- [ ] Verify main branch only, no secrets
+- [x] Final Opus review — adversarial pass found 3 blockers + 4 claim-breaking
+      gaps in the first integration; all fixed, re-verified by a second Opus
+      pass (B1 FIXED, B2 FIXED, B3's two gating follow-ups fixed in the same
+      pass). Accepted residuals, documented deliberately:
+      * `sourceKey` (the Last.fm↔YouTube key bridge) is not persisted by the
+        queue store, so a queue restored after a restart is un-bridged until
+        tracks play — adding it needs a Prisma column/migration, deferred.
+      * a bracket group that merely contains "with" ("(With Love)") is
+        stripped as a feature credit — low-probability over-merge, safe
+        direction for anti-repeat.
+      * mix-fallback picks are not reserved (fallback only runs when the
+        recommender returned nothing, so there is no concurrent pass to race).
+- [x] Verify main branch only, no secrets (single local branch `main`; 0 secret
+      patterns in the diff; `.env` untracked)
