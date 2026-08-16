@@ -48,6 +48,12 @@ export interface SpotifyResolution {
    * way. Absent when the first page already held the entire collection.
    */
   readonly more?: (() => Promise<readonly SpotifyTrackMeta[]>) | undefined;
+  /**
+   * The source could not hand over the whole playlist. Only the public embed
+   * sets this: it returns one 100-track page and ignores `offset` entirely, so
+   * the rest of a longer playlist is unreachable without user authorisation.
+   */
+  readonly truncated?: boolean;
 }
 
 /** First-page size for paged collections; also Spotify's own page maximum. */
@@ -176,7 +182,8 @@ async function catalogueGet<T>(path: string): Promise<T> {
 interface RawTrack {
   readonly name: string;
   readonly duration_ms: number;
-  readonly artists: readonly { readonly name: string }[];
+  /** Absent on podcast episodes, which a playlist is allowed to contain. */
+  readonly artists?: readonly { readonly name: string }[];
   readonly album?: { readonly images?: readonly { readonly url: string }[] };
   readonly external_ids?: { readonly isrc?: string };
   readonly is_local?: boolean;
@@ -185,7 +192,7 @@ interface RawTrack {
 function toMeta(track: RawTrack, artworkFallback: string | null = null): SpotifyTrackMeta {
   return {
     title: track.name,
-    artist: track.artists.map((artist) => artist.name).join(', '),
+    artist: (track.artists ?? []).map((artist) => artist.name).join(', '),
     durationMs: track.duration_ms,
     artworkUrl: track.album?.images?.[0]?.url ?? artworkFallback,
     isrc: track.external_ids?.isrc ?? null,
@@ -193,13 +200,21 @@ function toMeta(track: RawTrack, artworkFallback: string | null = null): Spotify
 }
 
 interface PlaylistPage {
-  readonly items?: readonly { readonly item: RawTrack | null }[];
+  /**
+   * Spotify names the entry's payload `track`. `item` is tolerated because an
+   * earlier revision of this file asked for that key and it costs nothing to
+   * accept both rather than silently drop every row if it ever comes back.
+   */
+  readonly items?: readonly {
+    readonly track?: RawTrack | null;
+    readonly item?: RawTrack | null;
+  }[];
   readonly next: string | null;
   readonly total?: number;
 }
 
 const PLAYLIST_ITEM_FIELDS =
-  'items(item(name,duration_ms,artists(name),album(images),external_ids,is_local)),next,total';
+  'items(track(name,duration_ms,artists(name),album(images),external_ids,is_local)),next,total';
 
 function playablePlaylistTracks(page: PlaylistPage): RawTrack[] {
   if (page.items === undefined) {
@@ -207,15 +222,22 @@ function playablePlaylistTracks(page: PlaylistPage): RawTrack[] {
     // playlists that the token holder does not own/collaborate on.
     throw new ValidationError('Spotify did not provide items for that playlist.');
   }
-  return page.items.flatMap((entry) =>
-    entry.item === null || entry.item.is_local === true ? [] : [entry.item],
-  );
+  return page.items.flatMap((entry) => {
+    const track = entry.track ?? entry.item;
+    // A playlist may hold podcast episodes and local files. Neither carries the
+    // artist list `toMeta` needs, and neither is playable from a search.
+    if (track == null || track.is_local === true || track.artists === undefined) return [];
+    return [track];
+  });
 }
 
 async function linkedPlaylist(id: string, token: string): Promise<SpotifyResolution> {
   const limit = playlistTrackLimit();
+  // `/tracks` is the documented "Get Playlist Items" route. It was `/items`,
+  // which is not an endpoint Spotify publishes — the linked path had never run
+  // (no account had been connected), so nothing caught it.
   const itemsPath = (offset: number): string =>
-    `/playlists/${id}/items?limit=${String(PLAYLIST_PAGE_SIZE)}&offset=${String(offset)}` +
+    `/playlists/${id}/tracks?limit=${String(PLAYLIST_PAGE_SIZE)}&offset=${String(offset)}` +
     `&fields=${PLAYLIST_ITEM_FIELDS}`;
 
   // Name and first page are independent lookups — no reason to serialise them.
@@ -392,17 +414,26 @@ async function publicPlaylist(id: string): Promise<SpotifyResolution> {
     return {
       tracks: stateTracks.slice(0, limit).map((track) => toMeta(track, artwork)),
       collectionName,
+      truncated: stateTracks.length >= PLAYLIST_PAGE_SIZE && stateTracks.length < limit,
     };
   }
 
   // A short first page means the embed rendered the whole public track list.
   if (firstPage.length < 50 || firstPage.length >= limit) {
-    return { tracks: firstPage, collectionName };
+    return {
+      tracks: firstPage,
+      collectionName,
+      truncated: firstPage.length >= PLAYLIST_PAGE_SIZE && firstPage.length < limit,
+    };
   }
 
   return {
     tracks: firstPage,
     collectionName,
+    // A full page means Spotify capped the embed rather than reaching the end.
+    // The walk below is kept in case `offset` starts working again, but as of
+    // now it returns the same page every time and stops on the first repeat.
+    truncated: firstPage.length >= PLAYLIST_PAGE_SIZE,
     // Offsets must still be walked one at a time: the embed exposes no total,
     // so a short or repeated page is the only stop condition. This now runs
     // after playback has started, so the walk is off the critical path.

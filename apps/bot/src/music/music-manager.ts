@@ -64,6 +64,11 @@ export interface ResolveResult {
   readonly playlistName: string | null;
   /** Present when the collection has more tracks than were returned above. */
   readonly background?: SpotifyExpansion;
+  /**
+   * The source withheld part of the collection and no amount of paging will
+   * retrieve it — currently only Spotify's public embed, which caps at 100.
+   */
+  readonly truncated?: boolean;
 }
 
 export interface SpotifyBackgroundResolution {
@@ -617,9 +622,10 @@ export class MusicManager {
       throw new NotFoundError('No playable matches found for that Spotify link.');
     }
 
+    const truncated = resolution.truncated ?? false;
     return background === undefined
-      ? { tracks: headTracks, playlistName: resolution.collectionName }
-      : { tracks: headTracks, playlistName: resolution.collectionName, background };
+      ? { tracks: headTracks, playlistName: resolution.collectionName, truncated }
+      : { tracks: headTracks, playlistName: resolution.collectionName, background, truncated };
   }
 
   /**

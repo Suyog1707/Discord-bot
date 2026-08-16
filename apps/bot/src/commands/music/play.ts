@@ -230,6 +230,21 @@ export default defineCommand({
               : 'starting now, the rest is being queued…') +
             (insertNext ? ' (up next)' : ''),
         );
+
+      // Without this the playlist just arrives short and looks like tracks were
+      // dropped. Spotify hands an unauthorised client one 100-track page and
+      // ignores every request for the next one, so the shortfall is not
+      // something the bot can page around — only the user's own Spotify
+      // authorisation lifts it.
+      if (result.truncated === true) {
+        embed.addFields({
+          name: 'Only part of this playlist',
+          value:
+            'Spotify only shares the first 100 tracks of a playlist with apps that ' +
+            'are not connected to your account. Run `/spotify connect` and queue it ' +
+            'again to get the whole thing.',
+        });
+      }
     } else {
       embed
         .setAuthor({ name: startedPlayback ? 'Now playing' : 'Added to queue' })
