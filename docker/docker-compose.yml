@@ -4,6 +4,13 @@
 #   pnpm run docker:logs   # follow logs
 #   pnpm run docker:down   # stop
 #
+# Those scripts pin DOCKER_CONTEXT=default. A machine running Docker Desktop
+# alongside the system daemon has two independent daemons, and Desktop makes
+# itself the active context every time it starts — so a bare `docker compose up`
+# would build a *second* copy of this stack on the other daemon and fail on the
+# published ports, which are already held by the first. Export DOCKER_CONTEXT
+# yourself to override the pin.
+#
 # The apps themselves run on the host via `pnpm dev` so hot-reload stays fast.
 # Production deployment is Vercel (web) + VPS (bot/Lavalink) per docs/DEPLOYMENT.md.
 
