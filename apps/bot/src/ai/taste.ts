@@ -28,6 +28,9 @@ import type { CacheService } from './cache.js';
 import { languageFromTag } from './language.js';
 import type { LastFmService, LastFmTag } from './lastfm.js';
 import { type MusicBrainzService, normaliseArtist, primaryArtist } from './musicbrainz.js';
+// Value import from scoring is safe: scoring imports only *types* from here,
+// so the cycle is erased at compile time.
+import { trackKeyOf } from './scoring.js';
 
 const logger = getLogger('taste');
 
@@ -82,16 +85,30 @@ export const EMPTY_TASTE_PROFILE: TasteProfile = {
 export interface RecentContext {
   /** Identifiers played recently, newest first. Drives the repeat penalty. */
   readonly identifiers: readonly string[];
+  /**
+   * Canonical track keys played recently, newest first. This is the key the
+   * anti-repeat logic actually fires on: Last.fm candidates carry no Lavalink
+   * identifier, so matching on identifiers alone silently disabled every
+   * repeat-suppression signal for the recommender path.
+   */
+  readonly trackKeys: readonly string[];
+  /** Titles played recently, newest first. Context for the LLM reranker. */
+  readonly titles: readonly string[];
   /** Normalised artists played recently, newest first. Drives the artist penalty. */
   readonly artists: readonly string[];
   /** Identifiers the listener skipped early. Weighted more heavily against. */
   readonly skipped: readonly string[];
+  /** Canonical track keys of early skips, for candidates with no identifier. */
+  readonly skippedKeys: readonly string[];
 }
 
 export const EMPTY_RECENT_CONTEXT: RecentContext = {
   identifiers: [],
+  trackKeys: [],
+  titles: [],
   artists: [],
   skipped: [],
+  skippedKeys: [],
 };
 
 export type TasteScope = { readonly guildId: string } | { readonly userId: string };
@@ -282,17 +299,27 @@ export class UserTasteService {
         where: { guild: { discordId: guildId } },
         orderBy: { playedAt: 'desc' },
         take: limit,
-        select: { identifier: true, author: true, skipped: true, playedMs: true, durationMs: true },
+        select: {
+          identifier: true,
+          author: true,
+          title: true,
+          skipped: true,
+          playedMs: true,
+          durationMs: true,
+        },
       });
+
+      // Only an *early* skip is a rejection. Skipping the last ten seconds of
+      // a track is how people move on from something they enjoyed.
+      const earlySkips = rows.filter((row) => row.skipped && completionOf(row) < 0.5);
 
       return {
         identifiers: rows.map((row) => row.identifier),
+        trackKeys: rows.map((row) => trackKeyOf(row.author, row.title)),
+        titles: rows.map((row) => row.title),
         artists: rows.map((row) => normaliseArtist(primaryArtist(row.author))),
-        // Only an *early* skip is a rejection. Skipping the last ten seconds of
-        // a track is how people move on from something they enjoyed.
-        skipped: rows
-          .filter((row) => row.skipped && completionOf(row) < 0.5)
-          .map((row) => row.identifier),
+        skipped: earlySkips.map((row) => row.identifier),
+        skippedKeys: earlySkips.map((row) => trackKeyOf(row.author, row.title)),
       };
     } catch (error) {
       logger.warn({ err: error, guildId }, 'Recent context read failed');

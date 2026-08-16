@@ -2,11 +2,14 @@ import { describe, expect, it } from 'vitest';
 
 import {
   type Candidate,
+  type ScoredCandidate,
   type ScoringContext,
   dominantLanguage,
   languageOf,
   scoreCandidate,
   selectDiverse,
+  selectSequence,
+  trackKeyOf,
 } from './scoring.js';
 import { EMPTY_RECENT_CONTEXT, EMPTY_TASTE_PROFILE, type TasteProfile } from './taste.js';
 
@@ -183,15 +186,178 @@ describe('scoreCandidate — penalties', () => {
     expect(notSkipped.breakdown.skipPenalty).toBe(0);
   });
 
+  // THE repeated-song bug: every anti-repeat signal used to key on the
+  // Lavalink identifier, which Last.fm candidates never carry — so a song the
+  // guild heard minutes ago scored as fully novel. These pin the fix: matching
+  // must work on canonical track keys alone.
+  it('penalises a recently played track that has no identifier', () => {
+    const recent = {
+      ...EMPTY_RECENT_CONTEXT,
+      // History rows carry YouTube vocabulary; the candidate carries Last.fm's.
+      trackKeys: [trackKeyOf('The Weeknd - Topic', 'Blinding Lights (Official Video)')],
+    };
+    const repeat = scoreCandidate(
+      candidate({ artist: 'The Weeknd', title: 'Blinding Lights' }),
+      context({ recent }),
+    );
+
+    expect(repeat.breakdown.recencyPenalty).toBeGreaterThan(0.5);
+    expect(repeat.breakdown.novelty).toBe(0);
+  });
+
+  it('penalises an early-skipped track that has no identifier', () => {
+    const recent = {
+      ...EMPTY_RECENT_CONTEXT,
+      skippedKeys: [trackKeyOf('Artist', 'Rejected Song')],
+    };
+    const skipped = scoreCandidate(
+      candidate({ artist: 'Artist', title: 'Rejected Song [Lyrics]' }),
+      context({ recent }),
+    );
+
+    expect(skipped.breakdown.skipPenalty).toBe(0.5);
+  });
+
+  it('applies session artist fatigue over the history-position fallback', () => {
+    const tired = scoreCandidate(
+      candidate({ artist: 'Tired Act' }),
+      context({ artistFatigue: new Map([['tired act', 1]]) }),
+    );
+    const fresh = scoreCandidate(
+      candidate({ artist: 'Fresh Act' }),
+      context({ artistFatigue: new Map([['tired act', 1]]) }),
+    );
+
+    expect(tired.breakdown.artistPenalty).toBeCloseTo(0.3);
+    expect(fresh.breakdown.artistPenalty).toBe(0);
+  });
+
   it('never produces a score outside [0, 1]', () => {
     const punishing = context({
-      recent: { identifiers: ['x'], artists: ['some artist'], skipped: ['x'] },
+      recent: { ...EMPTY_RECENT_CONTEXT, identifiers: ['x'], artists: ['some artist'], skipped: ['x'] },
       profile: profile({ artistAffinity: { 'some artist': -1 } }),
     });
     const scored = scoreCandidate(candidate({ identifier: 'x', match: 0 }), punishing);
 
     expect(scored.breakdown.final).toBeGreaterThanOrEqual(0);
     expect(scored.breakdown.final).toBeLessThanOrEqual(1);
+  });
+});
+
+describe('selectSequence', () => {
+  function scoredPool(
+    entries: readonly { artist: string; title: string; match?: number; tags?: string[] }[],
+  ): ScoredCandidate[] {
+    return entries.map((entry) =>
+      scoreCandidate(
+        candidate({
+          artist: entry.artist,
+          title: entry.title,
+          match: entry.match ?? 0.8,
+          ...(entry.tags === undefined ? {} : { tags: entry.tags }),
+        }),
+        context(),
+      ),
+    );
+  }
+
+  // The smart-shuffle property: the best QUEUE is not the top-N best SONGS.
+  it('avoids back-to-back picks from one artist when alternatives exist', () => {
+    const pool = scoredPool([
+      { artist: 'Weeknd', title: 'One', match: 0.95 },
+      { artist: 'Weeknd', title: 'Two', match: 0.94 },
+      { artist: 'Drake', title: 'Three', match: 0.7 },
+      { artist: 'Dua Lipa', title: 'Four', match: 0.7 },
+      { artist: 'Weeknd', title: 'Five', match: 0.93 },
+    ]);
+
+    const picked = selectSequence(pool, 4, {});
+    for (let index = 1; index < picked.length; index += 1) {
+      expect(picked[index]?.artistKey).not.toBe(picked[index - 1]?.artistKey);
+    }
+  });
+
+  it('lets a favourite return once fatigue has decayed, without a fixed rule', () => {
+    // Ten artists, favourite scores highest. It should appear more than once
+    // across a long sequence — diversity must not erase taste — but never
+    // consecutively.
+    const pool = scoredPool([
+      ...Array.from({ length: 4 }, (_, i) => ({
+        artist: 'Favourite',
+        title: `Fav ${String(i)}`,
+        match: 0.95,
+      })),
+      ...Array.from({ length: 20 }, (_, i) => ({
+        artist: `Other ${String(i % 10)}`,
+        title: `Song ${String(i)}`,
+        match: 0.75,
+      })),
+    ]);
+
+    const picked = selectSequence(pool, 12, {});
+    const favouriteCount = picked.filter((p) => p.artistKey === 'favourite').length;
+    expect(favouriteCount).toBeGreaterThanOrEqual(2);
+    for (let index = 1; index < picked.length; index += 1) {
+      const both = picked[index]?.artistKey === 'favourite' &&
+        picked[index - 1]?.artistKey === 'favourite';
+      expect(both).toBe(false);
+    }
+  });
+
+  it('suppresses an artist carrying session fatigue at the first slot', () => {
+    const pool = scoredPool([
+      { artist: 'Just Played', title: 'A', match: 0.9 },
+      { artist: 'Alternative', title: 'B', match: 0.8 },
+    ]);
+
+    const picked = selectSequence(pool, 1, {
+      artistFatigue: new Map([['just played', 1]]),
+    });
+    expect(picked[0]?.artistKey).toBe('alternative');
+  });
+
+  it('spends discovery slots on artists the listener has never played', () => {
+    const known = new Set(['known a', 'known b']);
+    const pool = scoredPool([
+      { artist: 'Known A', title: 'One', match: 0.9 },
+      { artist: 'Known B', title: 'Two', match: 0.9 },
+      { artist: 'Known A', title: 'Three', match: 0.88 },
+      { artist: 'Known B', title: 'Four', match: 0.88 },
+      { artist: 'New Face', title: 'Five', match: 0.7 },
+      { artist: 'Other New', title: 'Six', match: 0.69 },
+    ]);
+
+    const withDiscovery = selectSequence(pool, 6, { discoveryLevel: 0.34, knownArtists: known });
+    const discovered = withDiscovery.filter((p) => !known.has(p.artistKey)).length;
+    expect(discovered).toBeGreaterThanOrEqual(1);
+
+    const without = selectSequence(pool, 4, { discoveryLevel: 0, knownArtists: known });
+    expect(without.every((p) => known.has(p.artistKey) || p.breakdown.final > 0)).toBe(true);
+  });
+
+  it('is deterministic for identical inputs', () => {
+    const pool = scoredPool(
+      Array.from({ length: 30 }, (_, i) => ({
+        artist: `Artist ${String(i % 7)}`,
+        title: `Song ${String(i)}`,
+        match: 0.9 - i * 0.01,
+      })),
+    );
+    const a = selectSequence(pool, 10, {}).map((p) => p.trackKey);
+    const b = selectSequence(pool, 10, {}).map((p) => p.trackKey);
+    expect(a).toEqual(b);
+  });
+
+  it('never picks the same canonical track twice', () => {
+    const pool = scoredPool([
+      { artist: 'A', title: 'Song (Official Video)' },
+      { artist: 'A', title: 'Song' },
+      { artist: 'B', title: 'Other' },
+    ]);
+    const picked = selectSequence(pool, 3, {});
+    const keys = picked.map((p) => p.trackKey);
+    expect(new Set(keys).size).toBe(keys.length);
+    expect(keys.filter((k) => k === trackKeyOf('A', 'Song')).length).toBeLessThanOrEqual(1);
   });
 });
 

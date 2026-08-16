@@ -14,8 +14,8 @@
  * so a guild, an experiment, or a future learned model can replace them without
  * touching the arithmetic.
  */
+import { trackKeyOf as canonicalTrackKey, identityOf } from './identity.js';
 import { languageFromTags } from './language.js';
-import { normaliseArtist, normaliseTrackTitle, primaryArtist } from './musicbrainz.js';
 import type { RecentContext, TasteProfile } from './taste.js';
 
 /** Where a candidate came from. Affects how much its raw match score is trusted. */
@@ -68,6 +68,12 @@ export interface ScoringContext {
   readonly excludedArtists?: readonly string[];
   /** Push novelty and the recency penalty up ("something I haven't heard"). */
   readonly avoidRecent?: boolean;
+  /**
+   * Session artist fatigue, 0..1 per artist key — 1 means "just played,
+   * repeatedly". Adaptive: it decays as other artists play, so a favourite
+   * comes back naturally instead of on a fixed every-N-songs rule.
+   */
+  readonly artistFatigue?: ReadonlyMap<string, number>;
   readonly weights?: ScoringWeights;
 }
 
@@ -108,8 +114,14 @@ const ORIGIN_TRUST: Readonly<Record<CandidateOrigin, number>> = {
 /** How far back a repeat still counts as a repeat. */
 const RECENCY_WINDOW = 50;
 
+/**
+ * Canonical identity, delegated to the identity module so every stage of the
+ * pipeline — candidate dedup, history exclusion, session state, resolved-track
+ * dedup — agrees on what "the same song" means. Three different keys in three
+ * different stages is exactly how the repeated-song bug survived scoring.
+ */
 export function trackKeyOf(artist: string, title: string): string {
-  return `${normaliseArtist(primaryArtist(artist))}::${normaliseTrackTitle(title)}`;
+  return canonicalTrackKey(artist, title);
 }
 
 /**
@@ -123,9 +135,23 @@ export function scoreCandidate(candidate: Candidate, context: ScoringContext): S
   const weights = context.weights ?? DEFAULT_WEIGHTS;
   const { profile, recent } = context;
 
-  const artistKey = normaliseArtist(primaryArtist(candidate.artist));
-  const trackKey = trackKeyOf(candidate.artist, candidate.title);
+  const identity = identityOf(candidate.artist, candidate.title);
+  const artistKey = identity.artistKey;
+  const trackKey = identity.key;
   const tags = candidate.tags ?? [];
+
+  // Where this candidate sits in recent play history. Matched by Lavalink
+  // identifier when the candidate has one, and ALWAYS by canonical track key —
+  // Last.fm candidates never carry an identifier, and matching only on
+  // identifiers silently disabled every repeat-suppression signal below for
+  // the entire recommender path. That was the repeated-song bug.
+  const playedIndex = (() => {
+    if (candidate.identifier !== undefined) {
+      const byIdentifier = recent.identifiers.indexOf(candidate.identifier);
+      if (byIdentifier !== -1) return byIdentifier;
+    }
+    return recent.trackKeys.indexOf(trackKey);
+  })();
 
   /* --- Positive signals ------------------------------------------------- */
 
@@ -150,12 +176,8 @@ export function scoreCandidate(candidate: Candidate, context: ScoringContext): S
 
   const moodFit = scoreMoodFit(tags, context, artistKey);
 
-  // Novelty rewards what this guild has not played. A candidate with no
-  // identifier has not been matched to a playable track yet, so nothing is
-  // known about whether it was played — treat it as novel, not as a repeat.
-  const isKnown =
-    candidate.identifier !== undefined && recent.identifiers.includes(candidate.identifier);
-  const novelty = isKnown ? 0 : context.avoidRecent === true ? 1 : 0.7;
+  // Novelty rewards what this guild has not played recently.
+  const novelty = playedIndex !== -1 ? 0 : context.avoidRecent === true ? 1 : 0.7;
 
   // Recent behaviour: the artists of the last few tracks are what the session
   // currently sounds like, and staying adjacent to them is the point of a radio.
@@ -175,19 +197,27 @@ export function scoreCandidate(candidate: Candidate, context: ScoringContext): S
 
   // A track played recently is heavily penalised, tapering with distance: the
   // song that just finished is far worse to repeat than one from an hour ago.
-  const playedIndex =
-    candidate.identifier === undefined ? -1 : recent.identifiers.indexOf(candidate.identifier);
+  // (Hard exclusion upstream should already have removed in-cooldown repeats;
+  // this is defence in depth for anything that slipped past it.)
   const recencyPenalty =
     playedIndex === -1 ? 0 : 0.6 * (1 - Math.min(playedIndex, RECENCY_WINDOW) / RECENCY_WINDOW);
 
-  // Consecutive plays by one artist are what makes autoplay feel broken, so the
-  // penalty is steepest for the artist that just played.
+  // Consecutive plays by one artist are what makes autoplay feel broken.
+  // Session fatigue is the primary signal when available (it decays as other
+  // artists play); the history-position fallback covers callers without one.
+  const fatigue = context.artistFatigue?.get(artistKey);
   const artistIndex = recent.artists.indexOf(artistKey);
-  const artistPenalty = artistIndex === -1 ? 0 : 0.25 * (1 - Math.min(artistIndex, 10) / 10);
+  const positionPenalty =
+    artistIndex === -1 ? 0 : 0.25 * (1 - Math.min(artistIndex, 10) / 10);
+  const artistPenalty =
+    fatigue === undefined ? positionPenalty : Math.max(positionPenalty, 0.3 * clamp01(fatigue));
 
   // An early skip is an explicit rejection. Nothing outweighs it.
   const skipPenalty =
-    candidate.identifier !== undefined && recent.skipped.includes(candidate.identifier) ? 0.5 : 0;
+    (candidate.identifier !== undefined && recent.skipped.includes(candidate.identifier)) ||
+    recent.skippedKeys.includes(trackKey)
+      ? 0.5
+      : 0;
 
   const final = clamp01(positive - recencyPenalty - artistPenalty - skipPenalty);
 
@@ -336,6 +366,118 @@ export function selectDiverse(
     perArtist.set(entry.artistKey, used + 1);
     seenTracks.add(entry.trackKey);
     picked.push(entry);
+  }
+
+  return picked;
+}
+
+/** How a session's artist fatigue decays with each further track played. */
+const SEQUENCE_FATIGUE_DECAY = Math.exp(-1 / 6);
+
+export interface SequenceOptions {
+  /** Session artist fatigue at the start of the sequence (0..1 per artist). */
+  readonly artistFatigue?: ReadonlyMap<string, number>;
+  /**
+   * Share of picks that should be discoveries — artists the listener has no
+   * history with. 0 disables; 0.15 means roughly one pick in seven.
+   */
+  readonly discoveryLevel?: number;
+  /** Artist keys the listener already knows, for classifying discoveries. */
+  readonly knownArtists?: ReadonlySet<string>;
+}
+
+/**
+ * Sequence-aware selection: the smart-shuffle heart.
+ *
+ * `selectDiverse` ranks tracks independently, which quietly assumes the best
+ * QUEUE is the top-N best SONGS. It is not: after two Weeknd tracks, a third is
+ * a worse next song than a slightly lower-scoring Dua Lipa track. So this
+ * selector simulates the session as it picks — each choice raises that artist's
+ * fatigue, records its tags, and the NEXT choice is scored against that evolved
+ * state. Same inputs, same output: deterministic and pure, like everything else
+ * in this module. Variety comes from the state evolving, not from dice.
+ *
+ * Signals per slot, applied on top of the candidate's base score:
+ *  - artist fatigue (start state + simulated picks, decaying as slots pass)
+ *  - tag saturation (three chill-lofi tracks in a row is a rut, not a mood)
+ *  - tag continuity (smooth transitions beat whiplash jumps — but only a
+ *    confident mismatch is penalised, tagless candidates are not)
+ *  - discovery slots (periodically prefer an artist the listener has never
+ *    played, so the radio explores the taste neighbourhood instead of
+ *    circling inside it)
+ */
+export function selectSequence(
+  scored: readonly ScoredCandidate[],
+  count: number,
+  options: SequenceOptions = {},
+): readonly ScoredCandidate[] {
+  const ranked = [...scored].sort((a, b) => b.breakdown.final - a.breakdown.final);
+  const discoveryLevel = clamp01(options.discoveryLevel ?? 0.15);
+  const discoveryEvery = discoveryLevel > 0 ? Math.max(2, Math.round(1 / discoveryLevel)) : 0;
+  const known = options.knownArtists ?? new Set<string>();
+
+  // Hard backstop: even a thin pool may not hand one artist most of a batch.
+  const perArtistCap = Math.max(2, Math.ceil(count / 8));
+
+  const fatigue = new Map<string, number>(options.artistFatigue ?? []);
+  const tagRecency: string[][] = []; // tags of the last few picks, newest last
+  const perArtist = new Map<string, number>();
+  const pickedKeys = new Set<string>();
+  const picked: ScoredCandidate[] = [];
+
+  while (picked.length < count) {
+    const slot = picked.length;
+    const isDiscoverySlot = discoveryEvery > 0 && slot > 0 && slot % discoveryEvery === 0;
+    const previousTags = tagRecency.at(-1) ?? [];
+    const recentTagWindow = tagRecency.slice(-3).flat();
+
+    let best: ScoredCandidate | null = null;
+    let bestValue = -Infinity;
+
+    for (const entry of ranked) {
+      if (pickedKeys.has(entry.trackKey)) continue;
+      if ((perArtist.get(entry.artistKey) ?? 0) >= perArtistCap) continue;
+
+      let value = entry.breakdown.final;
+
+      value -= 0.35 * clamp01(fatigue.get(entry.artistKey) ?? 0);
+
+      const tags = entry.candidate.tags ?? [];
+      if (tags.length > 0 && recentTagWindow.length > 0) {
+        // Saturation: how many of the last picks' tags this candidate repeats.
+        const repeats = tags.filter((tag) => recentTagWindow.includes(tag)).length;
+        const saturation = repeats / tags.length;
+        if (saturation > 0.6) value -= 0.1 * saturation;
+
+        // Continuity with the immediately previous pick. Small on purpose: a
+        // gentle preference for coherent transitions, not a genre lock.
+        if (previousTags.length > 0) {
+          const overlap = tags.filter((tag) => previousTags.includes(tag)).length;
+          value += overlap > 0 ? 0.06 * Math.min(1, overlap / 2) : -0.04;
+        }
+      }
+
+      if (isDiscoverySlot && !known.has(entry.artistKey) && !fatigue.has(entry.artistKey)) {
+        value += 0.15;
+      }
+
+      if (value > bestValue) {
+        bestValue = value;
+        best = entry;
+      }
+    }
+
+    if (best === null) break; // pool exhausted
+
+    picked.push(best);
+    pickedKeys.add(best.trackKey);
+    perArtist.set(best.artistKey, (perArtist.get(best.artistKey) ?? 0) + 1);
+    tagRecency.push([...(best.candidate.tags ?? [])]);
+
+    // The session moves on one track: everyone's fatigue fades a step, and the
+    // artist just picked takes a full fresh dose.
+    for (const [artist, value] of fatigue) fatigue.set(artist, value * SEQUENCE_FATIGUE_DECAY);
+    fatigue.set(best.artistKey, Math.min(1.5, (fatigue.get(best.artistKey) ?? 0) + 1));
   }
 
   return picked;
