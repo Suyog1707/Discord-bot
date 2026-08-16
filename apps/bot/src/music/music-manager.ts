@@ -57,6 +57,8 @@ const logger = getLogger('music');
 const RECONNECT_PROBE_INTERVAL_MS = 30_000;
 /** A reachability probe should answer immediately or not at all. */
 const PROBE_TIMEOUT_MS = 2_000;
+/** How many tracks one autoplay top-up adds. */
+const AUTOPLAY_PICK_TARGET = 5;
 
 export interface ResolveResult {
   readonly tracks: readonly QueuedTrack[];
@@ -673,10 +675,16 @@ export class MusicManager {
   /**
    * Smart autoplay: pick tracks that continue the guild's listening session.
    *
-   * Seeds Lavalink searches with the artists heard most recently, then
-   * filters the results for freshness — nothing already in the recent
-   * history, no live streams, sane durations, and at most two picks per
-   * artist so the radio does not collapse into one act's discography.
+   * Seeded from YouTube's own mix for the track just played, because that is
+   * the only source here that understands taste. Searching an artist's name —
+   * what this used to do — returns whatever YouTube ranks globally for that
+   * string, so a Hindi set could wander into unrelated English pop by the
+   * second or third pick. A mix for a Hindi track stays Hindi.
+   *
+   * Falls back to the artist search when no mix is available, then filters both
+   * for freshness — nothing already in the recent history, no live streams,
+   * sane durations, and at most two picks per artist so the radio does not
+   * collapse into one act's discography.
    */
   async pickAutoplayTracks(guildId: string): Promise<readonly QueuedTrack[]> {
     const node = this.shoukaku.getIdealNode();
@@ -698,8 +706,58 @@ export class MusicManager {
     const perAuthorCount = new Map<string, number>();
     const requester = { id: this.#client.user?.id ?? '0', name: 'Autoplay' };
 
+    /** Keep a candidate only if it is fresh, playable and not over-represented. */
+    const consider = (raw: LavalinkTrack): void => {
+      if (picks.length >= AUTOPLAY_PICK_TARGET) return;
+      const track = fromLavalinkTrack(raw, requester);
+
+      if (playedIdentifiers.has(track.identifier)) return;
+      if (picks.some((pick) => pick.identifier === track.identifier)) return;
+      if (track.isStream) return;
+      if (track.durationMs < 60_000 || track.durationMs > 600_000) return;
+      const author = cleanAuthor(track.author);
+      if ((perAuthorCount.get(author) ?? 0) >= 2) return;
+
+      perAuthorCount.set(author, (perAuthorCount.get(author) ?? 0) + 1);
+      picks.push(track);
+    };
+
+    // YouTube mixes are keyed by video id, so only sources whose identifier is
+    // one can seed them. Spotify qualifies: its queue entries carry the id of
+    // the YouTube match that actually played.
+    const mixSeeds = history
+      .filter((entry) => entry.source === 'youtube' || entry.source === 'spotify')
+      .slice(0, 2);
+
+    for (const seed of mixSeeds) {
+      if (picks.length >= AUTOPLAY_PICK_TARGET) break;
+      try {
+        const mix = await node.rest.resolve(
+          `https://www.youtube.com/watch?v=${seed.identifier}&list=RD${seed.identifier}`,
+        );
+        if (mix?.loadType !== LoadType.PLAYLIST) continue;
+        // The mix opens with the seed itself; it is already in the history.
+        for (const raw of mix.data.tracks) consider(raw);
+      } catch (error) {
+        logger.debug({ err: error, seed: seed.identifier }, 'Autoplay mix lookup failed');
+      }
+    }
+
+    if (picks.length > 0) {
+      logger.info(
+        {
+          guildId,
+          strategy: 'mix',
+          seeds: mixSeeds.map((s) => s.identifier),
+          picked: picks.length,
+        },
+        'Autoplay selection',
+      );
+      return picks;
+    }
+
     for (const seed of seedAuthors) {
-      if (picks.length >= 5) break;
+      if (picks.length >= AUTOPLAY_PICK_TARGET) break;
 
       let response: LavalinkResponse | undefined;
       try {
@@ -710,23 +768,13 @@ export class MusicManager {
       }
       if (response?.loadType !== LoadType.SEARCH) continue;
 
-      for (const raw of response.data) {
-        if (picks.length >= 5) break;
-        const track = fromLavalinkTrack(raw, requester);
-
-        if (playedIdentifiers.has(track.identifier)) continue;
-        if (picks.some((pick) => pick.identifier === track.identifier)) continue;
-        if (track.isStream) continue;
-        if (track.durationMs < 60_000 || track.durationMs > 600_000) continue;
-        const author = cleanAuthor(track.author);
-        if ((perAuthorCount.get(author) ?? 0) >= 2) continue;
-
-        perAuthorCount.set(author, (perAuthorCount.get(author) ?? 0) + 1);
-        picks.push(track);
-      }
+      for (const raw of response.data) consider(raw);
     }
 
-    logger.info({ guildId, seeds: seedAuthors, picked: picks.length }, 'Autoplay selection');
+    logger.info(
+      { guildId, strategy: 'artist-search', seeds: seedAuthors, picked: picks.length },
+      'Autoplay selection',
+    );
     return picks;
   }
 

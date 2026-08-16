@@ -60,6 +60,11 @@ export interface HistorySeed {
   readonly identifier: string;
   readonly author: string;
   readonly title: string;
+  /**
+   * Where the audio came from. Autoplay needs it to know whether `identifier`
+   * is a YouTube video id it can seed a mix with — SoundCloud ids are not.
+   */
+  readonly source: MusicSource;
 }
 
 export class QueueStore {
@@ -193,9 +198,14 @@ export class QueueStore {
         where: { guild: { discordId: discordGuildId } },
         orderBy: { playedAt: 'desc' },
         take: limit,
-        select: { identifier: true, author: true, title: true },
+        select: { identifier: true, author: true, title: true, source: true },
       });
-      return rows;
+      return rows.map((row) => ({
+        identifier: row.identifier,
+        author: row.author,
+        title: row.title,
+        source: FROM_DB_SOURCE[row.source],
+      }));
     } catch (error) {
       logger.warn({ err: error, guildId: discordGuildId }, 'History read failed');
       return [];

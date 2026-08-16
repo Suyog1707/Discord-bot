@@ -127,6 +127,14 @@ export class GuildPlayer {
   readonly #reSourced = new Set<string>();
   /** Set by the exception handler so the following `end` can recover instead of skipping. */
   #recoverCurrent = false;
+  /**
+   * Set by `stop()` so the `end` it provokes does not start autoplay.
+   *
+   * Stopping empties the queue, and an empty queue is exactly the condition
+   * autoplay exists to answer — so without this, `/stop` handed straight over
+   * to the radio and the music never actually stopped.
+   */
+  #stopRequested = false;
   readonly #onEvent: ((type: PlayerEventType, state: PlayerSnapshot | null) => void) | undefined;
 
   constructor(options: GuildPlayerOptions) {
@@ -361,6 +369,7 @@ export class GuildPlayer {
   async stop(): Promise<void> {
     this.queue.reset();
     this.#skipRequested = true;
+    this.#stopRequested = true;
     await this.#player.stopTrack();
     this.#persist();
     this.#startIdleTimer();
@@ -488,6 +497,16 @@ export class GuildPlayer {
     if (next === null) {
       this.#persist();
       this.#emit('TRACK_END');
+
+      // An explicit stop means stop. Autoplay only continues a session that
+      // ran out on its own.
+      const stopped = this.#stopRequested;
+      this.#stopRequested = false;
+      if (stopped) {
+        this.#startIdleTimer();
+        return;
+      }
+
       if (await this.#tryAutoplay()) return;
       await this.#notify('✅ Queue finished. Add more with `/play`.');
       this.#startIdleTimer();
