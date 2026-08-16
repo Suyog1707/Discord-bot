@@ -66,6 +66,7 @@ model User {
   songHistory   SongHistory[]
   favorites     FavoriteTrack[]
   spotify       SpotifyAccount?
+  tasteProfile  TasteProfile?
 
   @@index([createdAt])
   @@map("users")
@@ -141,11 +142,12 @@ model Guild {
   createdAt   DateTime  @default(now()) @db.Timestamptz(3)
   updatedAt   DateTime  @updatedAt @db.Timestamptz(3)
 
-  settings    GuildSettings?
-  queue       Queue?
-  members     GuildMember[]
-  playlists   Playlist[]
-  songHistory SongHistory[]
+  settings     GuildSettings?
+  queue        Queue?
+  members      GuildMember[]
+  playlists    Playlist[]
+  songHistory  SongHistory[]
+  tasteProfile TasteProfile?
 
   @@index([botJoinedAt])
   @@map("guilds")
@@ -399,6 +401,52 @@ model SongHistory {
   @@index([userId, playedAt])
   @@index([identifier])
   @@map("song_history")
+}
+
+/// Aggregated listening preferences, derived from `SongHistory`.
+///
+/// This exists so a recommendation never has to read thousands of history rows.
+/// Autoplay runs every time a track ends, and scoring a 400-candidate pool
+/// against a raw history scan would put a heavy query on the critical path of
+/// every song change. Instead the aggregate is recomputed on a cooldown and read
+/// as a single row.
+///
+/// Exactly one of `userId` / `guildId` is set. Both scopes are needed and they
+/// answer different questions: the guild profile is what autoplay continues,
+/// because a voice channel is a room full of people rather than one listener,
+/// while the user profile is what personalises a request someone typed
+/// themselves. Postgres treats NULLs as distinct in a unique index, so the two
+/// nullable uniques coexist without a composite key.
+///
+/// The affinity maps are JSON rather than child tables on purpose: they are read
+/// whole, written whole, and never queried by key. A row per artist would turn
+/// one read into a join over hundreds of rows to reconstruct the same object.
+model TasteProfile {
+  id      String  @id @default(cuid())
+  userId  String? @unique
+  guildId String? @unique
+
+  /// Normalised artist name -> affinity in [-1, 1]. Negative means "keeps skipping".
+  artistAffinity   Json @default("{}")
+  /// Last.fm/MusicBrainz tag -> affinity in [-1, 1]. Carries genre and mood.
+  tagAffinity      Json @default("{}")
+  /// Language name -> share of listening. Keeps a Hindi session Hindi.
+  languageAffinity Json @default("{}")
+
+  /// Mean fraction of a track actually played. The baseline every score compares to.
+  completionRate Float @default(0)
+  /// History rows behind the aggregate. A small sample means weak signal, so the
+  /// scorer blends toward neutral rather than trusting an accident.
+  sampleSize     Int   @default(0)
+
+  computedAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt  DateTime @updatedAt @db.Timestamptz(3)
+
+  user  User?  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  guild Guild? @relation(fields: [guildId], references: [id], onDelete: Cascade)
+
+  @@index([computedAt])
+  @@map("taste_profile")
 }
 
 // ---------------------------------------------------------------------------
