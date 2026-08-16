@@ -95,7 +95,8 @@ intends by "Redis fast / DB durable".
 - [x] Identify race conditions (RC4, RC6)
 - [x] Identify queue/reservation gaps (RC2)
 - [x] Opus root-cause pass
-- [ ] Reproduce repeated-song mechanism in tests (identity + exclusion suites)
+- [x] Reproduce repeated-song mechanism in tests (scoring suite pins the
+      identifier-vs-key mismatch; probe reproduces the fixed behaviour live)
 
 ### Track identity
 - [x] Canonical song identity (`identity.ts`)
@@ -154,7 +155,15 @@ intends by "Redis fast / DB durable".
 - [ ] Session adaptation (session ≠ long-term)
 - [ ] AI failure (timeout, invalid output, excluded-song attempts)
 - [ ] Redis failure fallback
-- [ ] Sequence/manual simulation (20+ transitions, zero dupes in cooldown)
+- [x] Sequence/manual simulation — live probe (real Last.fm + Groq, simulated
+      playback, production pipeline): seeded the spec's exact pattern (Weeknd,
+      Drake, Brent Faiyaz, Weeknd, Dua Lipa, Travis Scott), ran 20 autoplay
+      transitions → 0 duplicate songs, 0 re-recommendations of played tracks,
+      0 adjacent same-artist plays, 20/20 distinct artists, concurrent takes
+      fully disjoint, picks squarely in the taste neighbourhood (Miguel,
+      Daniel Caesar, Bryson Tiller, PARTYNEXTDOOR, Sonder, Chris Brown).
+      Lavalink resolution was simulated (no node in the dev environment) —
+      everything upstream of the YouTube search was the production code path.
 
 ### Final review
 - [ ] Full lint/typecheck/test/build
