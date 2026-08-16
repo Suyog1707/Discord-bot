@@ -1,11 +1,12 @@
 /**
  * The seam between this bot and whichever LLM is behind it.
  *
- * Only one thing in the whole recommendation stack calls an LLM — intent
- * parsing — and it goes through this interface. That is deliberate: song
- * selection is a ranking problem over hundreds of candidates, and routing it
- * through a language model would cost one network round trip per track. The LLM
- * reads the sentence; the engine picks the music.
+ * Only two things in the whole recommendation stack call an LLM — intent
+ * parsing and shortlist reranking — and both go through this interface. That
+ * is deliberate: song selection is a ranking problem over hundreds of
+ * candidates, and routing it through a language model would cost one network
+ * round trip per track. The LLM reads the sentence and reorders the
+ * shortlist; the engine picks the music.
  *
  * Keeping the surface this small is what makes the provider swappable. A new
  * backend needs one file implementing `complete`, and nothing above it changes.

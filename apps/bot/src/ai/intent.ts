@@ -241,7 +241,7 @@ export class IntentService {
  * markdown fence or a sentence of preamble, and losing an otherwise-good parse
  * to a stray backtick is not worth it.
  */
-function extractJson(text: string): unknown {
+export function extractJson(text: string): unknown {
   const trimmed = text.trim();
   const start = trimmed.indexOf('{');
   const end = trimmed.lastIndexOf('}');
