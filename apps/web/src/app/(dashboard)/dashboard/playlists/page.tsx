@@ -1,6 +1,6 @@
 import { FolderOpen, ListMusic } from 'lucide-react';
 import type { Metadata } from 'next';
-import Link from 'next/link';
+import { AppLink } from '@/components/navigation/app-link';
 import { revalidatePath } from 'next/cache';
 
 import { requireUserOrRedirect } from '@/lib/auth/session';
@@ -257,7 +257,7 @@ export default async function PlaylistsPage({
                   </CardHeader>
                   <CardContent className="flex flex-wrap gap-2">
                     <Button asChild size="sm" className="flex-1">
-                      <Link href={`/dashboard/playlists/${playlist.id}`}>Open</Link>
+                      <AppLink href={`/dashboard/playlists/${playlist.id}`}>Open</AppLink>
                     </Button>
                     <Button asChild size="sm" variant="outline">
                       <a href={`/api/playlist/${playlist.id}/export`} download>

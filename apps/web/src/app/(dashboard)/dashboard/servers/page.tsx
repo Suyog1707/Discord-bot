@@ -1,7 +1,7 @@
 import { ExternalLink, Server } from 'lucide-react';
 import type { Metadata } from 'next';
 import Image from 'next/image';
-import Link from 'next/link';
+import { AppLink } from '@/components/navigation/app-link';
 
 import { requireUserOrRedirect } from '@/lib/auth/session';
 import { guildIconUrl } from '@/lib/discord/cdn';
@@ -77,7 +77,7 @@ export default async function ServersPage() {
                 <CardContent>
                   {server.botPresent ? (
                     <Button asChild className="w-full">
-                      <Link href={`/dashboard/servers/${server.discordId}`}>Manage</Link>
+                      <AppLink href={`/dashboard/servers/${server.discordId}`}>Manage</AppLink>
                     </Button>
                   ) : (
                     <Button asChild variant="outline" className="w-full">

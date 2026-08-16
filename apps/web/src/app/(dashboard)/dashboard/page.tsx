@@ -1,5 +1,5 @@
 import type { Metadata } from 'next';
-import Link from 'next/link';
+import { AppLink } from '@/components/navigation/app-link';
 
 import { requireUserOrRedirect } from '@/lib/auth/session';
 import { getProfile } from '@/lib/services/account';
@@ -38,7 +38,7 @@ export default async function DashboardOverviewPage() {
           </CardHeader>
           <CardContent>
             <Button asChild size="sm" variant="outline">
-              <Link href="/dashboard/servers">Manage servers</Link>
+              <AppLink href="/dashboard/servers">Manage servers</AppLink>
             </Button>
           </CardContent>
         </Card>
@@ -50,7 +50,7 @@ export default async function DashboardOverviewPage() {
           </CardHeader>
           <CardContent>
             <Button asChild size="sm" variant="outline">
-              <Link href="/dashboard/playlists">Open playlists</Link>
+              <AppLink href="/dashboard/playlists">Open playlists</AppLink>
             </Button>
           </CardContent>
         </Card>
@@ -65,7 +65,7 @@ export default async function DashboardOverviewPage() {
           <CardContent className="flex flex-wrap gap-2">
             {activeServers.slice(0, 6).map((server) => (
               <Button key={server.discordId} asChild size="sm" variant="secondary">
-                <Link href={`/dashboard/servers/${server.discordId}`}>{server.name}</Link>
+                <AppLink href={`/dashboard/servers/${server.discordId}`}>{server.name}</AppLink>
               </Button>
             ))}
           </CardContent>

@@ -1,6 +1,6 @@
 import { isAppError } from '@discord-music/shared';
 import type { Metadata } from 'next';
-import Link from 'next/link';
+import { AppLink } from '@/components/navigation/app-link';
 
 import { requireUserOrRedirect } from '@/lib/auth/session';
 import { getGuildAnalytics } from '@/lib/services/analytics';
@@ -56,7 +56,7 @@ export default async function AnalyticsPage({
                 variant={server.discordId === selected?.discordId ? 'default' : 'outline'}
                 asChild
               >
-                <Link href={`/dashboard/analytics?guild=${server.discordId}`}>{server.name}</Link>
+                <AppLink href={`/dashboard/analytics?guild=${server.discordId}`}>{server.name}</AppLink>
               </Button>
             ))}
           </div>
