@@ -28,7 +28,7 @@
     "db:push": "pnpm --filter @discord-music/database run push",
     "db:studio": "pnpm --filter @discord-music/database run studio",
     "db:seed": "pnpm --filter @discord-music/database run seed",
-    "docker:up": "docker compose --env-file .env -f docker/docker-compose.yml up -d",
+    "docker:up": "docker compose --env-file .env -f docker/docker-compose.yml up -d --build",
     "docker:down": "docker compose --env-file .env -f docker/docker-compose.yml down",
     "docker:logs": "docker compose --env-file .env -f docker/docker-compose.yml logs -f",
     "clean": "turbo run clean && rm -rf node_modules .turbo",

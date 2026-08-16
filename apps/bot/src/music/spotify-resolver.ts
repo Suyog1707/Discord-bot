@@ -141,17 +141,21 @@ async function apiGet<T>(path: string, token: string): Promise<T> {
   let response: Response;
   try {
     response = await fetch(path.startsWith('https://') ? path : `${API_BASE}${path}`, {
-    headers: { Authorization: `Bearer ${token}` },
-    signal: AbortSignal.timeout(TIMEOUT_MS),
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
     });
   } catch (error) {
-    throw new UpstreamError('Spotify did not respond in time. Try again shortly.', { cause: error });
+    throw new UpstreamError('Spotify did not respond in time. Try again shortly.', {
+      cause: error,
+    });
   }
   if (response.status === 404) {
     throw new ValidationError('That Spotify link points at nothing (deleted or private?).');
   }
   if (response.status === 401) {
-    throw new UpstreamError('Spotify authorization expired. Reconnect your Spotify account and try again.');
+    throw new UpstreamError(
+      'Spotify authorization expired. Reconnect your Spotify account and try again.',
+    );
   }
   if (response.status === 403) {
     throw new ValidationError('Spotify does not allow access to that item.');
@@ -263,7 +267,12 @@ function objectTracks(value: unknown, output: RawTrack[], limit: number): void {
     typeof name === 'string' &&
     typeof duration === 'number' &&
     Array.isArray(artists) &&
-    artists.every((artist) => artist !== null && typeof artist === 'object' && typeof (artist as { name?: unknown }).name === 'string')
+    artists.every(
+      (artist) =>
+        artist !== null &&
+        typeof artist === 'object' &&
+        typeof (artist as { name?: unknown }).name === 'string',
+    )
   ) {
     output.push(object as unknown as RawTrack);
     return;
@@ -277,8 +286,10 @@ function htmlText(value: string): string {
     .replace(/&nbsp;/giu, ' ')
     .replace(/&amp;/giu, '&')
     .replace(/&quot;/giu, '"')
-    .replace(/&#(?:x([0-9a-f]+)|([0-9]+));/giu, (_match, hex: string | undefined, decimal: string | undefined) =>
-      String.fromCodePoint(Number.parseInt(hex ?? decimal ?? '0', hex === undefined ? 10 : 16)),
+    .replace(
+      /&#(?:x([0-9a-f]+)|([0-9]+));/giu,
+      (_match, hex: string | undefined, decimal: string | undefined) =>
+        String.fromCodePoint(Number.parseInt(hex ?? decimal ?? '0', hex === undefined ? 10 : 16)),
     )
     .trim();
 }
@@ -294,7 +305,8 @@ function durationMs(value: string): number | null {
 /** Spotify's public embed is server-rendered as a numbered h3/h4 track list. */
 function embedTracks(html: string, limit: number, artworkUrl: string | null): SpotifyTrackMeta[] {
   const tracks: SpotifyTrackMeta[] = [];
-  const pattern = /<h3[^>]*>([\s\S]*?)<\/h3>[\s\S]{0,2000}?<h4[^>]*>([\s\S]*?)<\/h4>[\s\S]{0,2000}?\b(\d{1,2}:\d{2})\b/giu;
+  const pattern =
+    /<h3[^>]*>([\s\S]*?)<\/h3>[\s\S]{0,2000}?<h4[^>]*>([\s\S]*?)<\/h4>[\s\S]{0,2000}?\b(\d{1,2}:\d{2})\b/giu;
   for (const match of html.matchAll(pattern)) {
     const title = htmlText(match[1] ?? '');
     const artist = htmlText(match[2] ?? '');
@@ -441,7 +453,7 @@ export async function resolveSpotifyUrl(
   const token = await spotify.accessTokenForPlayback(discordId);
   // A linked user reads through their own token; everyone else gets the app
   // token, which covers the public catalogue but not playlist items.
-  const get = async <T,>(path: string): Promise<T> =>
+  const get = async <T>(path: string): Promise<T> =>
     token === null ? catalogueGet<T>(path) : apiGet<T>(path, token);
 
   switch (kind) {
@@ -515,6 +527,30 @@ export async function resolveSpotifyUrl(
     }
     default:
       throw new ValidationError('Unsupported Spotify link.');
+  }
+}
+
+/**
+ * The Spotify page for a recording we are playing from somewhere else.
+ *
+ * Purely for the "listen on" links — this never feeds playback, because Spotify
+ * audio cannot be streamed. Returns null when Spotify is unconfigured or has
+ * nothing matching, so a missing link is never an error.
+ */
+export async function searchSpotifyTrack(title: string, artist: string): Promise<string | null> {
+  if (!isSpotifyConfigured()) return null;
+
+  const query = encodeURIComponent(`${title} ${artist}`.trim());
+  try {
+    const page = await catalogueGet<{
+      readonly tracks?: {
+        readonly items?: readonly { readonly external_urls?: { readonly spotify?: string } }[];
+      };
+    }>(`/search?q=${query}&type=track&limit=1`);
+    return page.tracks?.items?.[0]?.external_urls?.spotify ?? null;
+  } catch (error) {
+    logger.debug({ err: error, title }, 'Spotify link lookup failed');
+    return null;
   }
 }
 

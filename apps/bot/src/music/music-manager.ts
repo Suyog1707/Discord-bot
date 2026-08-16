@@ -13,6 +13,7 @@ import {
   summarizeSocketError,
   UpstreamError,
   ValidationError,
+  type MusicSource,
   type PlayerEventType,
   type PlayerSnapshot,
 } from '@discord-music/shared';
@@ -42,7 +43,13 @@ import {
 } from './spotify-resolver.js';
 import type { SpotifyTrackMeta } from './spotify-resolver.js';
 import type { QueueStore } from './queue-store.js';
-import { buildSearchQuery, fromLavalinkTrack, type QueuedTrack } from './track.js';
+import { resolvePlatformLinks, type PlatformLinks } from './platform-links.js';
+import {
+  buildSearchQuery,
+  fromLavalinkTrack,
+  isPlausibleAlternative,
+  type QueuedTrack,
+} from './track.js';
 
 const logger = getLogger('music');
 
@@ -338,6 +345,8 @@ export class MusicManager {
         await this.destroyPlayer(guildId);
       },
       onAutoplayRequest: (guildId) => this.pickAutoplayTracks(guildId),
+      onFindAlternative: (track, failedSource) => this.findAlternativeSource(track, failedSource),
+      onResolveLinks: (track) => this.platformLinksFor(track),
       onEvent: (type, state) => {
         this.#emitEvent(options.guildId, type, state);
       },
@@ -348,6 +357,68 @@ export class MusicManager {
     this.#players.set(options.guildId, guildPlayer);
     logger.info({ guildId: options.guildId, channelId: options.voiceChannelId }, 'Player created');
     return guildPlayer;
+  }
+
+  /**
+   * The same recording from a source other than the one that just failed.
+   *
+   * YouTube refuses to stream some videos to anonymous clients — label-owned
+   * music especially — and until now that turned into "skipping" even when the
+   * song was sitting on SoundCloud. Metadata sources (Spotify, Apple Music)
+   * cannot supply audio, so they are never a target: for those the *display*
+   * source stays put and only the underlying stream is swapped.
+   */
+  async findAlternativeSource(
+    track: QueuedTrack,
+    failedSource: MusicSource,
+  ): Promise<QueuedTrack | null> {
+    const node = this.shoukaku.getIdealNode();
+    if (node === undefined) return null;
+
+    // Whatever just failed, try the other streaming source. A Spotify-sourced
+    // track failed on YouTube (that is where its audio came from), so it too
+    // falls through to SoundCloud.
+    const alternative: 'youtube' | 'soundcloud' =
+      failedSource === 'soundcloud' ? 'youtube' : 'soundcloud';
+
+    const query = `${track.title} ${track.author}`.trim();
+    const match = await this.#searchOne(node, query, alternative).catch(() => null);
+    if (match === null) return null;
+
+    const replacement = fromLavalinkTrack(match, {
+      id: track.requestedById,
+      name: track.requestedByName,
+    });
+
+    // Search on the fallback source returns *something* for any query — often a
+    // remix, or a different song by the same artist. Playing the wrong track is
+    // worse than admitting we could not play this one.
+    if (!isPlausibleAlternative(track, replacement)) {
+      logger.debug(
+        { wanted: track.title, got: replacement.title, source: alternative },
+        'Rejected implausible alternative',
+      );
+      return null;
+    }
+    return {
+      ...replacement,
+      // Keep the listener-facing identity of the track they queued; only the
+      // stream behind it changed.
+      title: track.title,
+      author: track.author,
+      artworkUrl: track.artworkUrl ?? replacement.artworkUrl,
+    };
+  }
+
+  /** Cross-platform "listen on" links for a track. */
+  async platformLinksFor(track: QueuedTrack): Promise<PlatformLinks> {
+    const node = this.shoukaku.getIdealNode();
+    return resolvePlatformLinks(track, async (prefixed) => {
+      if (node === undefined) return null;
+      const response = await node.rest.resolve(prefixed);
+      if (response?.loadType !== LoadType.SEARCH) return null;
+      return response.data[0]?.info.uri ?? null;
+    });
   }
 
   /** One Lavalink search, served from the short-lived result cache when possible. */
