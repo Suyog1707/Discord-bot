@@ -83,6 +83,9 @@ importers:
       shoukaku:
         specifier: ^4.1.1
         version: 4.3.0
+      zod:
+        specifier: ^4.4.3
+        version: 4.4.3
     devDependencies:
       '@types/node':
         specifier: ^24.3.0
