@@ -380,8 +380,24 @@ export class MusicManager {
             );
           }
         }
+        // Seed window: the track that just started plus the last few played,
+        // straight from the in-memory queue. A window (rather than one seed)
+        // is what lets the engine recognise an existing buffer as "still
+        // following this session" instead of regenerating on every track.
+        const player = this.#players.get(guildId);
+        const played =
+          player === undefined
+            ? []
+            : player.queue.tracks.slice(0, Math.max(0, player.queue.currentIndex)).slice(-3);
         this.#autoplay?.prefetch(guildId, [
           { title: track.title, artist: track.author, identifier: track.identifier },
+          ...played
+            .reverse()
+            .map((entry) => ({
+              title: entry.title,
+              artist: entry.author,
+              identifier: entry.identifier,
+            })),
         ]);
       },
       // Learning: completions and early skips of autoplay picks are the
@@ -510,9 +526,20 @@ export class MusicManager {
     readonly title: string;
     readonly author: string;
     readonly identifier: string;
+    readonly sourceKey?: string;
   }): SessionEntry {
     const identity = identityOf(track.author, track.title);
-    return { key: identity.key, identifier: track.identifier, artistKey: identity.artistKey };
+    return {
+      key: identity.key,
+      identifier: track.identifier,
+      artistKey: identity.artistKey,
+      // A recommended track is known under two spellings: the YouTube upload
+      // (computed above) and the Last.fm candidate it was picked as. Session
+      // state carries both so the exclusion layer matches either vocabulary.
+      ...(track.sourceKey === undefined || track.sourceKey === identity.key
+        ? {}
+        : { altKey: track.sourceKey }),
+    };
   }
 
   /**
@@ -928,9 +955,20 @@ export class MusicManager {
       if (picks.length >= AUTOPLAY_PICK_TARGET) return;
       const track = fromLavalinkTrack(raw, requester);
 
+      const trackKey = identityOf(track.author, track.title).key;
       if (playedIdentifiers.has(track.identifier)) return;
-      if (excludedKeys.has(identityOf(track.author, track.title).key)) return;
-      if (picks.some((pick) => pick.identifier === track.identifier)) return;
+      if (excludedKeys.has(trackKey)) return;
+      // Within this batch, dedupe by canonical key as well as identifier —
+      // two different uploads of one song are still one song.
+      if (
+        picks.some(
+          (pick) =>
+            pick.identifier === track.identifier ||
+            identityOf(pick.author, pick.title).key === trackKey,
+        )
+      ) {
+        return;
+      }
       if (track.isStream) return;
       if (track.durationMs < 60_000 || track.durationMs > 600_000) return;
       const author = cleanAuthor(track.author);

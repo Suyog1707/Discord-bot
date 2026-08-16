@@ -92,11 +92,15 @@ export class AutoplayEngine {
   prefetch(guildId: string, seeds: readonly TrackSeed[]): void {
     if (seeds.length === 0) return;
 
+    // A buffer that still holds at least half its target and follows a track
+    // in the CURRENT seed window is good enough — regenerating it would cost a
+    // full Last.fm sweep plus Lavalink searches on every single track start,
+    // for picks that were fine.
     const existing = this.#buffers.get(guildId);
     if (
       existing !== undefined &&
-      existing.tracks.length >= this.#options.prefetchSize &&
-      existing.seedKey === seedKeyOf(seeds) &&
+      existing.tracks.length >= Math.ceil(this.#options.prefetchSize / 2) &&
+      seedWindowOf(seeds).has(existing.seedKey) &&
       Date.now() - existing.generatedAt < BUFFER_TTL_MS
     ) {
       return;
@@ -147,6 +151,20 @@ export class AutoplayEngine {
           (entry) => entry.track,
         );
       });
+      if (served.length === 0) {
+        // #gated may have coalesced this call onto a refill that was already
+        // in flight, in which case OUR work never ran — but the refill's
+        // buffer is sitting right there. Serve from it instead of falling
+        // through to the mix path with a silent empty result.
+        const coalesced = this.#drain(guildId, count, seeds);
+        if (coalesced.length > 0) {
+          logger.debug(
+            { guildId, served: coalesced.length, from: 'coalesced' },
+            'Autoplay served',
+          );
+          return coalesced;
+        }
+      }
       logger.debug({ guildId, served: served.length, from: 'synchronous' }, 'Autoplay served');
       return served;
     } catch (error) {
@@ -179,8 +197,13 @@ export class AutoplayEngine {
     const buffer = this.#buffers.get(guildId);
     if (buffer === undefined) return [];
 
+    // Valid while its seed is anywhere in the current seed window — a buffer
+    // built following the PREVIOUS track is still following this session.
+    // (The original compared two differently-shaped seed lists for equality,
+    // which never matched, so the buffer never served at all.)
     const stale =
-      Date.now() - buffer.generatedAt > BUFFER_TTL_MS || buffer.seedKey !== seedKeyOf(seeds);
+      Date.now() - buffer.generatedAt > BUFFER_TTL_MS ||
+      !seedWindowOf(seeds).has(buffer.seedKey);
     if (stale) {
       this.clear(guildId);
       return [];
@@ -207,15 +230,23 @@ export class AutoplayEngine {
 
   async #refill(guildId: string, seeds: readonly TrackSeed[]): Promise<void> {
     return this.#gated(guildId, async () => {
-      const entries = await this.#generate(guildId, seeds, this.#options.prefetchSize, {
-        background: true,
-      });
-      if (entries.length > 0) {
-        // A buffer may already exist if a take() drained part of one while
-        // this refill was queued behind it; merging (rather than overwriting)
-        // preserves reservations already made for the surviving entries.
-        const existing = this.#buffers.get(guildId);
-        const survivors = existing?.seedKey === seedKeyOf(seeds) ? existing.tracks : [];
+      // A drifted buffer must go through clear() so its reservations are
+      // RELEASED — silently dropping it kept every discarded pick locked out
+      // for the full reservation TTL, starving the pool's head.
+      const existing = this.#buffers.get(guildId);
+      const survivors =
+        existing !== undefined && seedWindowOf(seeds).has(existing.seedKey)
+          ? existing.tracks
+          : [];
+      if (existing !== undefined && survivors.length === 0) this.clear(guildId);
+
+      // Only generate the shortfall: survivors keep their reservations and
+      // their place at the front of the buffer.
+      const needed = this.#options.prefetchSize - survivors.length;
+      if (needed <= 0) return;
+
+      const entries = await this.#generate(guildId, seeds, needed, { background: true });
+      if (survivors.length + entries.length > 0) {
         this.#buffers.set(guildId, {
           tracks: [...survivors, ...entries],
           generatedAt: Date.now(),
@@ -259,6 +290,7 @@ export class AutoplayEngine {
       },
       allowRerank: options.background,
       reserve: (keys) => this.#session.reserve(guildId, keys),
+      release: (keys) => this.#session.release(guildId, keys),
     });
 
     if (result.resolved.length > 0) {
@@ -301,4 +333,16 @@ export class AutoplayEngine {
 function seedKeyOf(seeds: readonly TrackSeed[]): string {
   const newest = seeds[0];
   return newest === undefined ? '' : trackKeyOf(newest.artist, newest.title);
+}
+
+/**
+ * Every canonical key in the caller's seed window.
+ *
+ * Buffer validity is judged against the WINDOW, not just the newest seed: a
+ * buffer generated while the previous track played is following this same
+ * session and must not be torn down (with a full regeneration and a batch of
+ * orphaned reservations) merely because one more track has started since.
+ */
+function seedWindowOf(seeds: readonly TrackSeed[]): ReadonlySet<string> {
+  return new Set(seeds.slice(0, 4).map((seed) => trackKeyOf(seed.artist, seed.title)));
 }

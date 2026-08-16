@@ -63,12 +63,20 @@ export function normaliseArtist(raw: string): string {
     raw
       .replace(CHANNEL_SUFFIXES, '')
       .replace(FEATURE_CREDITS, '')
+      // Split camelCase runs: "TheWeekndVEVO" loses its suffix as "TheWeeknd",
+      // which without this never matched "The Weeknd" — every "The X" VEVO
+      // channel escaped the canonical key. Applied uniformly, so an artist
+      // spelled "OneRepublic" folds the same way from every vocabulary.
+      .replace(/(\p{Ll})(\p{Lu})/gu, '$1 $2')
       .normalize('NFKD')
-      // Strip combining marks so accented spellings match their plain forms.
-      .replace(/\p{M}+/gu, '')
+      // Strip combining marks after LATIN bases only (é → e). Indic vowel
+      // signs are combining marks too, and stripping them collapsed different
+      // artists into one affinity/fatigue bucket. \p{M} then has to survive
+      // the punctuation pass, hence its presence in the keep-class below.
+      .replace(/(?<=\p{Script=Latin})\p{M}+/gu, '')
       .toLowerCase()
       .replace(/^the\s+/u, '')
-      .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+      .replace(/[^\p{L}\p{M}\p{N}\s]/gu, ' ')
       .replace(/\s+/gu, ' ')
       .trim()
   );
@@ -92,9 +100,11 @@ export function normaliseTrackTitle(raw: string): string {
     .replace(/\s*[([][^)\]]*(?:official|video|audio|lyric|hd|4k|mv)[^)\]]*[)\]]/giu, '')
     .replace(FEATURE_CREDITS, '')
     .normalize('NFKD')
-    .replace(/\p{M}+/gu, '')
+    // Latin-only mark stripping, for the same Indic-vowel reason as
+    // `normaliseArtist` above.
+    .replace(/(?<=\p{Script=Latin})\p{M}+/gu, '')
     .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/[^\p{L}\p{M}\p{N}\s]/gu, ' ')
     .replace(/\s+/gu, ' ')
     .trim();
 }

@@ -186,3 +186,40 @@ describe('identifierKeyOf', () => {
     expect(identifierKeyOf('youtube', 'dQw4w9WgXcQ')).toBe('youtube:dQw4w9WgXcQ');
   });
 });
+
+// Regressions found by the final adversarial review, pinned here.
+describe('review regressions', () => {
+  // "TheWeekndVEVO" loses its VEVO suffix as "TheWeeknd", which never matched
+  // "The Weeknd" — every "The X" VEVO channel escaped the canonical key. The
+  // camelCase split in normaliseArtist is what bridges them.
+  it('matches concatenated VEVO channels to the plain artist name', () => {
+    expect(identityOf('TheWeekndVEVO', 'The Weeknd - Blinding Lights (Official Video)').key).toBe(
+      identityOf('The Weeknd', 'Blinding Lights').key,
+    );
+    // The split must be applied uniformly, or it would break the pairs that
+    // already worked: "OneRepublic" from Last.fm vs "OneRepublicVEVO".
+    expect(identityOf('OneRepublicVEVO', 'Counting Stars').artistKey).toBe(
+      identityOf('OneRepublic', 'Counting Stars').artistKey,
+    );
+  });
+
+  // Last.fm/Spotify spell 2020s collaborations "(with X)"; without this rule
+  // both spellings of one song entered the pool and were queued twice.
+  it('treats a "(with …)" credit as the same song', () => {
+    expect(trackKeyOf('Metro Boomin', "Creepin' (with The Weeknd, 21 Savage)")).toBe(
+      trackKeyOf('Metro Boomin', "Creepin'"),
+    );
+  });
+
+  // Indic vowel signs are combining marks; stripping them deleted every vowel,
+  // so सोच (soch) and सच (sach) — different words — collapsed into one key and
+  // each permanently excluded the other from autoplay.
+  it('keeps Devanagari and Gurmukhi vowels', () => {
+    expect(trackKeyOf('Arijit Singh', 'सोच')).not.toBe(trackKeyOf('Arijit Singh', 'सच'));
+    expect(trackKeyOf('Diljit Dosanjh', 'ਸੋਹਣੀ')).not.toBe(trackKeyOf('Diljit Dosanjh', 'ਸਹਿਣੀ'));
+  });
+
+  it('still folds Latin accents', () => {
+    expect(trackKeyOf('Beyoncé', 'Déjà Vu')).toBe(trackKeyOf('Beyonce', 'Deja Vu'));
+  });
+});

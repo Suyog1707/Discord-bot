@@ -29,7 +29,13 @@ const RESERVATION_PREFIX = 'autoplay:resv:';
 
 const DEFAULT_RECENT_LIMIT = 50;
 const DEFAULT_TTL_SECONDS = 6 * 60 * 60;
-const DEFAULT_RESERVATION_TTL_SECONDS = 10 * 60;
+/**
+ * MUST outlive the autoplay buffer TTL (15 min in autoplay.ts): a buffered but
+ * not-yet-served pick is protected by its reservation and nothing else — it is
+ * neither queued nor recently played — so a reservation that lapses before the
+ * buffer does leaves a window where a refill can pick the same song twice.
+ */
+const DEFAULT_RESERVATION_TTL_SECONDS = 20 * 60;
 
 /** Bounded so a long-running, many-guild bot cannot leak memory. */
 const MAX_GUILD_SESSIONS = 500;
@@ -41,6 +47,21 @@ export interface SessionEntry {
   readonly key: string; // canonical track key
   readonly identifier: string; // provider video id ('' when unknown)
   readonly artistKey: string; // canonical artist key
+  /**
+   * The same song's key in the OTHER vocabulary, when known. A recommended
+   * track has two spellings: the Last.fm candidate it was picked as and the
+   * YouTube upload it resolved to. Exclusion sets must hold both, or the next
+   * generation pass — which filters Last.fm-vocabulary candidates — never
+   * matches the YouTube-vocabulary key the queue recorded.
+   */
+  readonly altKey?: string;
+}
+
+/** Both keys an entry is known under. */
+function keysOf(entry: SessionEntry): readonly string[] {
+  return entry.altKey === undefined || entry.altKey === entry.key
+    ? [entry.key]
+    : [entry.key, entry.altKey];
 }
 
 export interface SessionOutcomes {
@@ -188,10 +209,12 @@ export class AutoplaySessionStore {
     }
 
     return {
-      recentKeys: recent.map((entry) => entry.key),
+      // Both vocabularies of every entry: exclusion consumers put these in
+      // Sets, so the flattening does not disturb any ordering they rely on.
+      recentKeys: recent.flatMap(keysOf),
       recentIdentifiers: recent.map((entry) => entry.identifier),
       recentArtists: recent.map((entry) => entry.artistKey),
-      queuedKeys: new Set(queued.map((entry) => entry.key)),
+      queuedKeys: new Set(queued.flatMap(keysOf)),
       queuedIdentifiers: identifiers,
       reservedKeys: new Set(session.reservations.keys()),
       artistFatigue: computeArtistFatigue(recent.map((entry) => entry.artistKey)),
@@ -290,9 +313,12 @@ export class AutoplaySessionStore {
   /** A track started playing: push to recent ring, drop from queued+reserved. */
   async recordPlayed(guildId: string, entry: SessionEntry): Promise<void> {
     const session = this.#touch(guildId);
+    const entryKeys = new Set(keysOf(entry));
     session.recent = [entry, ...session.recent].slice(0, this.#recentLimit);
-    session.queued = session.queued.filter((queuedEntry) => queuedEntry.key !== entry.key);
-    session.reservations.delete(entry.key);
+    session.queued = session.queued.filter(
+      (queuedEntry) => !keysOf(queuedEntry).some((key) => entryKeys.has(key)),
+    );
+    for (const key of entryKeys) session.reservations.delete(key);
 
     if (this.#redis === undefined) return;
 
@@ -301,7 +327,7 @@ export class AutoplaySessionStore {
       pipeline.lpush(recentKey(guildId), JSON.stringify(entry));
       pipeline.ltrim(recentKey(guildId), 0, this.#recentLimit - 1);
       pipeline.expire(recentKey(guildId), this.#ttlSeconds);
-      pipeline.del(reservationKey(guildId, entry.key));
+      for (const key of entryKeys) pipeline.del(reservationKey(guildId, key));
       await pipeline.exec();
     } catch (error) {
       this.#redisErrors += 1;
@@ -347,6 +373,11 @@ export class AutoplaySessionStore {
 
     try {
       const raw = await this.#redis.lrange(recentKey(guildId), 0, this.#recentLimit - 1);
+      // An empty list while memory holds history means the Redis key expired
+      // or a blip dropped writes — NOT that nothing played. Adopting the empty
+      // read would wipe the whole anti-repeat window in one snapshot; memory
+      // is more trustworthy than an absence.
+      if (raw.length === 0 && session.recent.length > 0) return session.recent;
       const entries = raw.map((item) => JSON.parse(item) as SessionEntry);
       session.recent = entries;
       return entries;

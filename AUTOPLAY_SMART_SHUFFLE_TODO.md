@@ -148,13 +148,13 @@ intends by "Redis fast / DB durable".
 - [x] Friendly user-facing failure messages, technical detail in logs only
 
 ### Testing
-- [ ] Duplicate protection (same song, normalized variants, provider IDs)
-- [ ] Queue conflicts (playing / queued / reserved / recent)
-- [ ] Concurrency (parallel reservation, parallel refills)
-- [ ] Artist diversity + fatigue
-- [ ] Session adaptation (session ≠ long-term)
-- [ ] AI failure (timeout, invalid output, excluded-song attempts)
-- [ ] Redis failure fallback
+- [x] Duplicate protection (same song, normalized variants, provider IDs)
+- [x] Queue conflicts (playing / queued / reserved / recent)
+- [x] Concurrency (parallel reservation, parallel refills)
+- [x] Artist diversity + fatigue
+- [x] Session adaptation (session ≠ long-term)
+- [x] AI failure (timeout, invalid output, excluded-song attempts)
+- [x] Redis failure fallback
 - [x] Sequence/manual simulation — live probe (real Last.fm + Groq, simulated
       playback, production pipeline): seeded the spec's exact pattern (Weeknd,
       Drake, Brent Faiyaz, Weeknd, Dua Lipa, Travis Scott), ran 20 autoplay
@@ -166,6 +166,6 @@ intends by "Redis fast / DB durable".
       everything upstream of the YouTube search was the production code path.
 
 ### Final review
-- [ ] Full lint/typecheck/test/build
+- [x] Full lint/typecheck/test/build
 - [ ] Final Opus review
 - [ ] Verify main branch only, no secrets

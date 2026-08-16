@@ -22,6 +22,16 @@ export interface QueuedTrack {
   readonly requestedById: string;
   /** Display name captured at request time (avoids a lookup at render time). */
   readonly requestedByName: string;
+  /**
+   * Canonical key of the CANDIDATE this track was resolved from, when it came
+   * out of the recommendation pipeline. A resolved YouTube upload carries the
+   * uploader channel and a decorated title ("T-Series", "Tum Hi Ho Full Video
+   * Song…"), so a key derived from the track alone lives in a different
+   * vocabulary than the Last.fm candidates the exclusion sets filter. This is
+   * the bridge: session state records BOTH keys, so the next generation pass
+   * recognises the song under either spelling.
+   */
+  readonly sourceKey?: string;
 }
 
 /** Lavalink `sourceName` → our source enum, defaulting unknowns to YouTube. */

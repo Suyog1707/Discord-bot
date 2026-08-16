@@ -127,7 +127,13 @@ export class GuildPlayer {
   #trackStartedAt = 0;
   /** Whether a track is actually playing right now. See `isPlaying`. */
   #playing = false;
-  #skipRequested = false;
+  /**
+   * Why the next track-end should advance with `skip()` instead of `advance()`.
+   * The DISTINCTION matters for learning: `/skip` is a rejection of the song
+   * and feeds the skip penalty; `/jump` and `/previous` are navigation and say
+   * nothing bad about the track they happen to leave.
+   */
+  #advanceIntent: 'skip' | 'jump' | null = null;
   #destroyed = false;
   #stayConnected: boolean;
   #autoplayEnabled: boolean;
@@ -280,7 +286,7 @@ export class GuildPlayer {
 
   /** Skip the current track. Resolves to the next track, or null if drained. */
   async skip(): Promise<QueuedTrack | null> {
-    this.#skipRequested = true;
+    this.#advanceIntent = 'skip';
     // stopTrack fires the 'end' event (reason: stopped); advancement happens there.
     await this.#player.stopTrack();
     return this.queue.current;
@@ -289,7 +295,7 @@ export class GuildPlayer {
   async jumpTo(index: number): Promise<QueuedTrack | null> {
     const target = this.queue.jumpTo(index);
     if (target === null) return null;
-    this.#skipRequested = true;
+    this.#advanceIntent = 'jump';
     await this.#playTrack(target);
     this.#persist();
     return target;
@@ -299,7 +305,7 @@ export class GuildPlayer {
   async previous(): Promise<QueuedTrack | null> {
     const target = this.queue.previous();
     if (target === null) return null;
-    this.#skipRequested = true;
+    this.#advanceIntent = 'jump';
     await this.#playTrack(target);
     this.#persist();
     return target;
@@ -408,7 +414,9 @@ export class GuildPlayer {
   /** Stop playback and clear the queue, but stay connected. */
   async stop(): Promise<void> {
     this.queue.reset();
-    this.#skipRequested = true;
+    // 'jump', not 'skip': ending the session says nothing bad about the song
+    // that happened to be playing, and must not feed the skip penalty.
+    this.#advanceIntent = 'jump';
     this.#stopRequested = true;
     await this.#player.stopTrack();
     this.#persist();
@@ -441,6 +449,9 @@ export class GuildPlayer {
 
   #attachPlayerEvents(): void {
     this.#player.on('start', () => {
+      // Authoritative confirmation from Lavalink — covers any path where
+      // playback began without `#playTrack` having set the flag.
+      this.#playing = true;
       this.#trackStartedAt = Date.now();
       this.#clearIdleTimer();
       this.#emit('TRACK_START');
@@ -504,8 +515,18 @@ export class GuildPlayer {
   }
 
   async #handleTrackEnd(reason: string): Promise<void> {
-    // The track is over regardless of what happens next; `#playTrack` re-sets
-    // this when recovery or the next track starts.
+    // 'replaced' means we started another track ourselves (jump, previous, a
+    // source rescue): audio IS playing. `#playing` must survive untouched —
+    // clearing it here left the flag false for the whole replacement track,
+    // which made `/play` restart the current song and let idle timers
+    // disconnect mid-music. The intent that provoked the replacement is spent.
+    if (reason === 'replaced') {
+      this.#advanceIntent = null;
+      return;
+    }
+
+    // The track is genuinely over; `#playTrack` re-sets this when recovery or
+    // the next track starts.
     this.#playing = false;
     const finished = this.queue.current;
 
@@ -523,6 +544,9 @@ export class GuildPlayer {
       await this.#notify(`⚠️ Playback error on **${finished.title}** — skipping.`);
     }
 
+    const intent = this.#advanceIntent;
+    this.#advanceIntent = null;
+
     // Record history before the cursor moves. Fire-and-forget on the normal
     // path, but the promise is kept: when the queue drains, autoplay reads
     // recent history to seed and exclude, and the single most likely track to
@@ -534,27 +558,20 @@ export class GuildPlayer {
       (reason === 'finished' || reason === 'stopped' || reason === 'loadFailed')
     ) {
       const playedMs = this.#trackStartedAt > 0 ? Date.now() - this.#trackStartedAt : 0;
+      // Only an actual /skip is a rejection; /jump and /previous also stop the
+      // track but are navigation, and labelling them skips taught the taste
+      // model to avoid whatever song the listener happened to jump away from.
+      const rejected = reason === 'stopped' && intent === 'skip';
       historyWrite = this.#store
-        .recordHistory(this.guildId, finished, {
-          playedMs,
-          skipped: reason === 'stopped',
-        })
+        .recordHistory(this.guildId, finished, { playedMs, skipped: rejected })
         .catch(() => undefined);
-      this.#onTrackFinished?.(this.guildId, finished, {
-        skipped: reason === 'stopped' && this.#skipRequested,
-        playedMs,
-      });
+      this.#onTrackFinished?.(this.guildId, finished, { skipped: rejected, playedMs });
     }
 
-    // 'replaced' means we started another track ourselves; nothing to advance.
-    if (reason === 'replaced') return;
     if (this.#destroyed) return;
 
-    const wasSkip = this.#skipRequested;
-    this.#skipRequested = false;
-
     // A user skip must not honour `track` loop, or /skip would replay it.
-    const next = wasSkip ? this.queue.skip() : this.queue.advance();
+    const next = intent !== null ? this.queue.skip() : this.queue.advance();
 
     if (next === null) {
       this.#persist();

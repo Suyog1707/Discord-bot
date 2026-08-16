@@ -33,6 +33,7 @@ import type {
   TrackResolver,
   TrackSeed,
 } from './recommender.js';
+import type { AutoplaySessionStore } from './session.js';
 import type { UserTasteService } from './taste.js';
 
 const logger = getLogger('orchestrator');
@@ -63,6 +64,13 @@ export interface OrchestratorServices {
   readonly lastfm: LastFmService;
   readonly musicbrainz: MusicBrainzService;
   readonly cache: CacheService;
+  /**
+   * When present, EVERY recommendation path — `/ask` included — runs under the
+   * session's exclusions and reservations. Without this, `/ask` raced the
+   * autoplay refill for the same guild and the two could select the same song:
+   * the anti-duplicate guarantees only hold if no path bypasses them.
+   */
+  readonly session?: AutoplaySessionStore;
 }
 
 export class MusicOrchestrator {
@@ -166,6 +174,8 @@ export class MusicOrchestrator {
       readonly allowRerank?: boolean;
       /** Atomic reservation hook, from the session store. */
       readonly reserve?: (keys: readonly string[]) => Promise<ReadonlySet<string>>;
+      /** Reservation give-back for picks that failed to resolve. */
+      readonly release?: (keys: readonly string[]) => Promise<void>;
     },
     resolve?: TrackResolver,
   ): Promise<{
@@ -178,6 +188,33 @@ export class MusicOrchestrator {
     const resolver = resolve ?? this.#resolver;
     if (resolver === undefined) {
       throw new Error('No track resolver is available to the orchestrator.');
+    }
+
+    // Callers that did not bring their own session context (the /ask path)
+    // get it from the store here, so no recommendation path can bypass the
+    // exclusion and reservation guarantees. The autoplay engine passes its
+    // own, built from the same snapshot it also needs for metrics.
+    let exclusions = request.exclusions;
+    let sessionContext = request.session;
+    let reserve = request.reserve;
+    let release = request.release;
+    const store = this.#services.session;
+    if (store !== undefined && (exclusions === undefined || reserve === undefined)) {
+      try {
+        const snap = await store.snapshot(request.guildId);
+        exclusions ??= {
+          trackKeys: new Set([...snap.recentKeys, ...snap.queuedKeys, ...snap.reservedKeys]),
+          identifiers: new Set([...snap.recentIdentifiers, ...snap.queuedIdentifiers]),
+        };
+        sessionContext ??= {
+          recentArtists: snap.recentArtists,
+          artistFatigue: snap.artistFatigue,
+        };
+        reserve ??= (keys) => store.reserve(request.guildId, keys);
+        release ??= (keys) => store.release(request.guildId, keys);
+      } catch {
+        // A failing store must not take recommendations down with it.
+      }
     }
 
     const profileStart = Date.now();
@@ -200,10 +237,11 @@ export class MusicOrchestrator {
         recent,
         ...(request.intent === undefined ? {} : { intent: request.intent }),
         ...(favourites.length === 0 ? {} : { historyCandidates: favourites }),
-        ...(request.exclusions === undefined ? {} : { exclusions: request.exclusions }),
-        ...(request.session === undefined ? {} : { session: request.session }),
+        ...(exclusions === undefined ? {} : { exclusions }),
+        ...(sessionContext === undefined ? {} : { session: sessionContext }),
         ...(request.allowRerank === undefined ? {} : { allowRerank: request.allowRerank }),
-        ...(request.reserve === undefined ? {} : { reserve: request.reserve }),
+        ...(reserve === undefined ? {} : { reserve }),
+        ...(release === undefined ? {} : { release }),
       },
       resolver,
     );

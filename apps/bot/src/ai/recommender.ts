@@ -121,6 +121,13 @@ export interface RecommendationRequest {
    * two concurrent generation passes queueing the same song.
    */
   readonly reserve?: (keys: readonly string[]) => Promise<ReadonlySet<string>>;
+  /**
+   * Hand back reservations for picks that did not survive resolution (search
+   * failed, implausible match, post-resolution duplicate). Without this every
+   * failed pick keeps its song locked out for the full reservation TTL, and a
+   * source that resolves poorly slowly starves the candidate pool's head.
+   */
+  readonly release?: (keys: readonly string[]) => Promise<void>;
 }
 
 /** Per-stage timings, in milliseconds. Logged at debug; never shown to users. */
@@ -338,6 +345,15 @@ export class RecommendationService {
     const resolveStart = Date.now();
     const { resolved, blocked } = await this.#resolveAll(reservedPicks, resolve, exclusions);
     const resolveMs = Date.now() - resolveStart;
+
+    // Reservations for picks that did not become tracks go back immediately.
+    if (request.release !== undefined) {
+      const kept = new Set(resolved.map((entry) => entry.trackKey));
+      const unused = reservedPicks
+        .map((pick) => pick.trackKey)
+        .filter((key) => !kept.has(key));
+      if (unused.length > 0) await request.release(unused).catch(() => undefined);
+    }
 
     const timings: RecommendationTimings = {
       candidateMs,
@@ -638,7 +654,11 @@ export class RecommendationService {
     for (const group of [...groups, historyGroup]) {
       for (const candidate of group) {
         const key = trackKeyOf(candidate.artist, candidate.title);
-        if (exclusions.trackKeys.has(key) || seedKeys.has(key)) {
+        if (
+          exclusions.trackKeys.has(key) ||
+          seedKeys.has(key) ||
+          (candidate.identifier !== undefined && exclusions.identifiers.has(candidate.identifier))
+        ) {
           excludedCount += 1;
           continue;
         }
@@ -789,7 +809,9 @@ export class RecommendationService {
         seenIdentifiers.add(track.identifier);
         seenKeys.add(resolvedKey);
         seenKeys.add(pick.trackKey);
-        resolved.push({ track, trackKey: pick.trackKey });
+        // Stamp the candidate's canonical key onto the track: downstream
+        // session state must know this upload under BOTH vocabularies.
+        resolved.push({ track: { ...track, sourceKey: pick.trackKey }, trackKey: pick.trackKey });
       }
     }
 

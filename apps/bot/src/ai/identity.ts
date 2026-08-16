@@ -78,11 +78,18 @@ const NOISE_PATTERNS: readonly string[] = [
   String.raw`\bout\s+now\b`,
   String.raw`\bnew\s+song\b`,
   String.raw`\bremaster(?:ed)?\b`,
-  // Bracketed feature credits ("(feat. DaBaby)") land here; the bare, unbracketed
-  // form ("Levitating feat. DaBaby") is handled separately below because it has
-  // no closing delimiter to bound it.
-  String.raw`\b(?:feat|ft|featuring)\b\.?`,
+  // Bracketed feature credits ("(feat. DaBaby)", "(with The Weeknd)") land
+  // here; the bare, unbracketed form ("Levitating feat. DaBaby") is handled
+  // separately below because it has no closing delimiter to bound it. "with"
+  // matters as much as "feat": Last.fm and Spotify spell 2020s collaborations
+  // "Creepin' (with The Weeknd, 21 Savage)", and without this rule that title
+  // and plain "Creepin'" were two different keys — the same song, queued
+  // twice in one batch.
+  String.raw`\b(?:feat|ft|featuring|with)\b\.?`,
 ];
+
+/** Precompiled noise matchers — this runs per candidate on a 400-track pool. */
+const NOISE_REGEXES: readonly RegExp[] = NOISE_PATTERNS.map((source) => new RegExp(source, 'iu'));
 
 /**
  * Words that DO distinguish one recording from another, in the order the spec
@@ -111,6 +118,15 @@ const VARIANT_MARKERS: readonly (readonly [string, string])[] = [
   ['extended', String.raw`\bextended\b`],
 ];
 
+/**
+ * Precompiled variant matchers: [marker, test, replace]. Compiling these per
+ * call was measurable — `identityOf` runs twice per candidate per generation
+ * pass, tens of thousands of regex constructions for one autoplay refill.
+ */
+const VARIANT_REGEXES: readonly (readonly [string, RegExp, RegExp])[] = VARIANT_MARKERS.map(
+  ([marker, source]) => [marker, new RegExp(source, 'iu'), new RegExp(source, 'giu')] as const,
+);
+
 /** Trailing feature credit with no bracket to bound it: "Levitating feat. DaBaby". */
 const BARE_FEATURE_SUFFIX = /\s+(?:feat\.?|ft\.?|featuring)\s+.+$/iu;
 
@@ -123,15 +139,15 @@ const SUFFIX_SEPARATORS = [' - ', ' – ', ' | '] as const;
 /** The set of variant markers `text` contains, tested independently (a phrase can hit several). */
 function matchVariants(text: string): Set<string> {
   const found = new Set<string>();
-  for (const [marker, source] of VARIANT_MARKERS) {
-    if (new RegExp(source, 'iu').test(text)) found.add(marker);
+  for (const [marker, test] of VARIANT_REGEXES) {
+    if (test.test(text)) found.add(marker);
   }
   return found;
 }
 
 /** Whether `text` contains any pure-noise word. */
 function matchesNoise(text: string): boolean {
-  return NOISE_PATTERNS.some((source) => new RegExp(source, 'iu').test(text));
+  return NOISE_REGEXES.some((regex) => regex.test(text));
 }
 
 /**
@@ -212,22 +228,32 @@ function stripSuffixChunk(text: string, variants: Set<string>): string {
  */
 function stripBareVariants(text: string, variants: Set<string>): string {
   let result = text;
-  for (const [marker, source] of VARIANT_MARKERS) {
-    if (new RegExp(source, 'iu').test(result)) {
+  for (const [marker, test, replace] of VARIANT_REGEXES) {
+    if (test.test(result)) {
       variants.add(marker);
-      result = result.replace(new RegExp(source, 'giu'), ' ');
+      result = result.replace(replace, ' ');
     }
   }
   return result;
 }
 
-/** Same character-folding rules as `normaliseArtist`'s tail, minus the artist-only "the " strip. */
+/**
+ * Same character-folding rules as `normaliseArtist`'s tail, minus the
+ * artist-only "the " strip.
+ *
+ * Combining marks are stripped only after LATIN base characters (é → e). In
+ * Indic scripts the vowel signs ARE combining marks — stripping them deletes
+ * every vowel, so सोच (soch) and सच (sach), two different words, collapsed
+ * into one key and each permanently excluded the other from autoplay. The
+ * lookbehind keeps accent-folding for Latin text while leaving Devanagari,
+ * Gurmukhi, Bengali, Tamil and the rest intact.
+ */
 function flatten(text: string): string {
   return text
     .normalize('NFKD')
-    .replace(/\p{M}+/gu, '')
+    .replace(/(?<=\p{Script=Latin})\p{M}+/gu, '')
     .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/[^\p{L}\p{M}\p{N}\s]/gu, ' ')
     .replace(/\s+/gu, ' ')
     .trim();
 }
