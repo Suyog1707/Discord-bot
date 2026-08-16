@@ -21,6 +21,7 @@
     "migrate": "prisma migrate dev",
     "deploy": "prisma migrate deploy",
     "push": "prisma db push",
+    "pull": "prisma db pull",
     "studio": "prisma studio",
     "seed": "tsx prisma/seed.ts",
     "format": "prisma format",

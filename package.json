@@ -26,6 +26,7 @@
     "db:migrate": "pnpm --filter @discord-music/database run migrate",
     "db:deploy": "pnpm --filter @discord-music/database run deploy",
     "db:push": "pnpm --filter @discord-music/database run push",
+    "db:pull": "pnpm --filter @discord-music/database run pull",
     "db:studio": "pnpm --filter @discord-music/database run studio",
     "db:seed": "pnpm --filter @discord-music/database run seed",
     "docker:up": "DOCKER_CONTEXT=${DOCKER_CONTEXT:-default} docker compose --env-file .env -f docker/docker-compose.yml up -d --build",

@@ -15,9 +15,25 @@ generator client {
   provider = "prisma-client-js"
 }
 
+// Two connection strings, because the two workloads want opposite things.
+//
+//   url       — Supabase's transaction pooler (port 6543). Every runtime query
+//               goes here: the bot and the dashboard open far more connections
+//               than Postgres allows directly, and the pooler hands each
+//               statement a connection and takes it straight back.
+//   directUrl — a session connection to the database itself. Prisma uses it
+//               *only* for `migrate dev`, `migrate deploy`, `migrate diff`,
+//               `db push`, `db pull` and `studio`. Those need advisory locks,
+//               a shadow database and session-scoped DDL — none of which
+//               survive a transaction pooler, which is why migrations against
+//               port 6543 fail rather than run slowly.
+//
+// If DIRECT_URL is unset, prisma.config.ts points it back at DATABASE_URL so
+// `prisma generate` still works on machines that only ever build (CI, Vercel).
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
 // ---------------------------------------------------------------------------

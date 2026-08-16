@@ -99,6 +99,22 @@ export const databaseEnvSchema = z.object({
       (value) => value.startsWith('postgres://') || value.startsWith('postgresql://'),
       'DATABASE_URL must be a PostgreSQL connection string.',
     ),
+  /**
+   * Session connection used by Prisma Migrate and Studio only — never by a
+   * running app, which is why it stays optional here. DDL, advisory locks and
+   * the shadow database do not work through a transaction pooler, so
+   * DATABASE_URL cannot serve both roles. Validated for shape when present so a
+   * typo surfaces at `check:env` instead of halfway through a deploy.
+   */
+  DIRECT_URL: optional(
+    z
+      .string()
+      .min(1)
+      .refine(
+        (value) => value.startsWith('postgres://') || value.startsWith('postgresql://'),
+        'DIRECT_URL must be a PostgreSQL connection string.',
+      ),
+  ),
 });
 
 /** Redis. Optional in development, required in production (see `requireInProduction`). */

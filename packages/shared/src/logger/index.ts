@@ -37,6 +37,7 @@ const REDACTED_PATHS = [
   'headers.authorization',
   'headers.cookie',
   'DATABASE_URL',
+  'DIRECT_URL',
   'REDIS_URL',
   'BOT_TOKEN',
   'NEXTAUTH_SECRET',
