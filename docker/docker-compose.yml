@@ -1,4 +1,9 @@
-# Local development infrastructure: PostgreSQL, Redis and Lavalink.
+# Local development infrastructure: Lavalink and its cipher sidecar.
+#
+# PostgreSQL and Redis are not here: this project uses Supabase and Upstash, so
+# DATABASE_URL and REDIS_URL point at those and a local copy would only be a
+# second, divergent database to keep straight. Audio is the one dependency that
+# still has to run locally.
 #
 #   pnpm run docker:up     # start
 #   pnpm run docker:logs   # follow logs
@@ -17,47 +22,6 @@
 name: discord-music
 
 services:
-  postgres:
-    image: postgres:17-alpine
-    container_name: dmp-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      POSTGRES_DB: ${POSTGRES_DB:-discord_music}
-      # Faster, deterministic collation for a dev database.
-      POSTGRES_INITDB_ARGS: '--encoding=UTF8 --locale=C'
-    ports:
-      - '${POSTGRES_PORT:-5432}:5432'
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    healthcheck:
-      test:
-        [
-          'CMD-SHELL',
-          'pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-discord_music}',
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-
-  redis:
-    image: redis:7-alpine
-    container_name: dmp-redis
-    restart: unless-stopped
-    # Persist to disk so queue state survives a container restart in dev.
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
-    ports:
-      - '${REDIS_PORT:-6379}:6379'
-    volumes:
-      - redis-data:/data
-    healthcheck:
-      test: ['CMD', 'redis-cli', 'ping']
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
   # The Lavalink image ships no /opt/Lavalink/plugins directory, so Docker
   # creates the named volume's mountpoint owned by root while the server runs as
   # uid 322. Plugin downloads then fail with "Permission denied" and the server
@@ -147,6 +111,4 @@ services:
       start_period: 90s
 
 volumes:
-  postgres-data:
-  redis-data:
   lavalink-plugins:
