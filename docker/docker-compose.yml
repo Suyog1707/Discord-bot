@@ -113,6 +113,10 @@ services:
       # source configured with credentials it cannot see is a trap.
       SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
       SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
+      # YouTube OAuth (application.yml: plugins.youtube.oauth) — the only way to
+      # play sign-in-gated videos. Off unless YT_OAUTH_ENABLED is set.
+      YT_OAUTH_ENABLED: ${YT_OAUTH_ENABLED:-false}
+      YT_OAUTH_REFRESH_TOKEN: ${YT_OAUTH_REFRESH_TOKEN:-}
     ports:
       - '${LAVALINK_PORT:-2333}:2333'
     volumes:

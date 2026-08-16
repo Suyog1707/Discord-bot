@@ -75,6 +75,9 @@ plugins:
       - MWEB
       - WEB
       - WEBEMBEDDED
+      - TV # Last: the only client that plays sign-in-gated videos, and only
+      #      once `oauth` below is switched on. Harmless while it is off — it
+      #      is reached solely for tracks every other client already refused.
     # Signature deciphering is delegated to yt-cipher. youtube-source's built-in
     # extractor could not parse YouTube's current player script — that is the
     # literal "Must find sig function from script" failure — and upstream now
@@ -91,6 +94,20 @@ plugins:
     # https://github.com/iv-org/youtube-trusted-session-generator, put them in
     # the environment, and uncomment. Both are tied to the IP that produced
     # them, so they must be regenerated when the host changes.
+    # Some videos — label-owned music in particular — are answered with "This
+    # video requires login" / "Sign in to confirm you're not a bot" on every
+    # anonymous client, no matter how many are configured. Nothing in this file
+    # fixes that: YouTube wants a signed-in session, and OAuth is how
+    # youtube-source provides one. Off by default because it means attaching a
+    # Google account — use a burner, never a primary; upstream warns the account
+    # can be terminated. Turn it on with YT_OAUTH_ENABLED=true, watch the
+    # Lavalink log for the device code, authorise it, then put the refresh token
+    # it prints into YT_OAUTH_REFRESH_TOKEN so restarts skip the flow.
+    oauth:
+      enabled: ${YT_OAUTH_ENABLED:false}
+      # Left unset rather than empty: an empty string is a value, and a blank
+      # token is not the same as "no token" to the plugin.
+      # refreshToken: '${YT_OAUTH_REFRESH_TOKEN:}'
     # pot:
     #   token: '${YT_PO_TOKEN:}'
     #   visitorData: '${YT_VISITOR_DATA:}'
@@ -130,6 +147,9 @@ logging:
   level:
     root: INFO
     lavalink: INFO
+    # Prints the device code and, after authorisation, the refresh token. The
+    # OAuth flow is unusable without it (upstream's own note).
+    dev.lavalink.youtube.http.YoutubeOauth2Handler: INFO
   logback:
     rollingpolicy:
       max-file-size: 25MB

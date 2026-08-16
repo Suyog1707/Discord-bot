@@ -351,14 +351,21 @@ export class MusicManager {
   }
 
   /** One Lavalink search, served from the short-lived result cache when possible. */
-  async #searchOne(node: Node, query: string): Promise<LavalinkTrack | null> {
-    const cached = this.#searchCache.get(query);
+  async #searchOne(
+    node: Node,
+    query: string,
+    source: 'youtube' | 'soundcloud' = 'youtube',
+  ): Promise<LavalinkTrack | null> {
+    // The prefix is part of the key: the same title on SoundCloud and YouTube
+    // are different recordings, and a shared key would serve one for the other.
+    const prefixed = buildSearchQuery(query, source);
+    const cached = this.#searchCache.get(prefixed);
     if (cached !== undefined) {
       if (cached.expiresAt > Date.now()) return cached.track;
-      this.#searchCache.delete(query);
+      this.#searchCache.delete(prefixed);
     }
 
-    const response = await node.rest.resolve(`ytsearch:${query}`);
+    const response = await node.rest.resolve(prefixed);
     if (response?.loadType !== LoadType.SEARCH) return null;
     const [best] = response.data;
     if (best === undefined) return null;
@@ -367,7 +374,7 @@ export class MusicManager {
       const oldest = this.#searchCache.keys().next();
       if (!(oldest.done ?? false)) this.#searchCache.delete(oldest.value);
     }
-    this.#searchCache.set(query, { track: best, expiresAt: Date.now() + SEARCH_CACHE_TTL_MS });
+    this.#searchCache.set(prefixed, { track: best, expiresAt: Date.now() + SEARCH_CACHE_TTL_MS });
     return best;
   }
 
@@ -382,6 +389,7 @@ export class MusicManager {
     metadata: readonly SpotifyTrackMeta[],
     requestedBy: { readonly id: string; readonly name: string },
     onBatch?: (tracks: readonly QueuedTrack[]) => Promise<void>,
+    source: 'youtube' | 'soundcloud' = 'youtube',
   ): Promise<SpotifyBackgroundResolution> {
     if (metadata.length === 0) {
       return { sourceTrackCount: 0, resolvedTrackCount: 0, failedTrackCount: 0 };
@@ -401,7 +409,7 @@ export class MusicManager {
       const matched = await Promise.all(
         batch.map(async (meta): Promise<QueuedTrack | null> => {
           try {
-            const best = await this.#searchOne(node, searchQueryFor(meta));
+            const best = await this.#searchOne(node, searchQueryFor(meta), source);
             if (best === null) return null;
             const track = fromLavalinkTrack(best, requestedBy);
             // Spotify is metadata-only: keep it for queue/display, play Lavalink's match.
@@ -452,6 +460,7 @@ export class MusicManager {
   async #resolveSpotify(
     url: string,
     requestedBy: { readonly id: string; readonly name: string },
+    source: 'youtube' | 'soundcloud' = 'youtube',
   ): Promise<ResolveResult> {
     if (this.shoukaku.getIdealNode() === undefined) {
       throw new UpstreamError('The music server is not available right now. Try again shortly.');
@@ -483,11 +492,11 @@ export class MusicManager {
     };
 
     let consumed = hasMore ? Math.min(1, firstPage.length) : firstPage.length;
-    await this.#matchSpotifyTracks(firstPage.slice(0, consumed), requestedBy, collect);
+    await this.#matchSpotifyTracks(firstPage.slice(0, consumed), requestedBy, collect, source);
     // The very first track can be unmatchable; widen until something plays.
     while (headTracks.length === 0 && consumed < firstPage.length) {
       const batch = firstPage.slice(consumed, consumed + batchSize);
-      await this.#matchSpotifyTracks(batch, requestedBy, collect);
+      await this.#matchSpotifyTracks(batch, requestedBy, collect, source);
       consumed += batch.length;
     }
 
@@ -501,11 +510,16 @@ export class MusicManager {
         // unhandled rejection if the matching ahead of it throws first.
         morePages?.catch(() => undefined);
 
-        const fromFirstPage = await this.#matchSpotifyTracks(pending, requestedBy, onTracks);
+        const fromFirstPage = await this.#matchSpotifyTracks(
+          pending,
+          requestedBy,
+          onTracks,
+          source,
+        );
         if (morePages === undefined) return fromFirstPage;
 
         const rest = await morePages;
-        const fromRest = await this.#matchSpotifyTracks(rest, requestedBy, onTracks);
+        const fromRest = await this.#matchSpotifyTracks(rest, requestedBy, onTracks, source);
         return {
           sourceTrackCount: fromFirstPage.sourceTrackCount + fromRest.sourceTrackCount,
           resolvedTrackCount: fromFirstPage.resolvedTrackCount + fromRest.resolvedTrackCount,
@@ -736,7 +750,7 @@ export class MusicManager {
     // Spotify links: metadata from the Web API, audio via search on the
     // playback sources — Spotify audio itself is never streamed.
     if (isSpotifyUrl(input)) {
-      return this.#resolveSpotify(input, requestedBy);
+      return this.#resolveSpotify(input, requestedBy, source);
     }
     if (isSpotifyWebUrl(input)) {
       throw new ValidationError('Unsupported or invalid Spotify link.');
