@@ -11,9 +11,22 @@ import 'server-only';
  */
 import { UnauthenticatedError } from '@discord-music/shared';
 import { redirect } from 'next/navigation';
+import { cache } from 'react';
 import type { Session } from 'next-auth';
 
 import { auth } from './index';
+
+/**
+ * Per-request memo of the Auth.js database session lookup.
+ *
+ * With `strategy: 'database'` every `auth()` call is a Postgres round trip
+ * (session join user). A single navigation calls it from the dashboard layout
+ * *and* the page — and again from any server action on that page — so an
+ * uncached `auth()` multiplied the session query by the number of callers.
+ * React's `cache` collapses them to one lookup per request; it is a request
+ * scope, not a cross-request cache, so revocation stays immediate.
+ */
+const cachedAuth = cache(async (): Promise<Session | null> => auth());
 
 export interface SessionUser {
   readonly id: string;
@@ -24,11 +37,11 @@ export interface SessionUser {
 }
 
 export async function getSession(): Promise<Session | null> {
-  return auth();
+  return cachedAuth();
 }
 
-export async function getCurrentUser(): Promise<SessionUser | null> {
-  const session = await auth();
+export const getCurrentUser = cache(async (): Promise<SessionUser | null> => {
+  const session = await cachedAuth();
   if (!session?.user.id) return null;
 
   return {
@@ -38,7 +51,7 @@ export async function getCurrentUser(): Promise<SessionUser | null> {
     email: session.user.email,
     image: session.user.image,
   };
-}
+});
 
 /** For API routes: throw so the route wrapper returns a structured 401. */
 export async function requireUser(): Promise<SessionUser> {

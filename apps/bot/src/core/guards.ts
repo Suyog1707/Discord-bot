@@ -13,8 +13,19 @@ import {
   type PermissionResolvable,
 } from 'discord.js';
 
+import { getLogger } from '../lib/logger.js';
 import type { CommandDefinition } from './command.js';
 import type { BotClient } from './bot-client.js';
+
+const logger = getLogger('guards');
+
+/**
+ * Longest the DJ check may wait on Postgres for a guild it has never read.
+ *
+ * Guards run before the command replies, so this competes directly with
+ * Discord's three-second acknowledgement window.
+ */
+const DJ_SETTINGS_BUDGET_MS = 800;
 
 export interface GuardResult {
   readonly allowed: boolean;
@@ -101,6 +112,11 @@ export async function runGuards(
  * DJ gate: when a DJ role is configured, restrict the command to members who
  * hold it (or can Manage Server, so admins are never locked out). With no DJ
  * role configured, everyone passes.
+ *
+ * The settings read is bounded (see {@link DJ_SETTINGS_BUDGET_MS}). If Postgres
+ * cannot answer within the budget for a guild we have never read, the command
+ * is allowed through: the DJ role is a convenience restriction, and blocking
+ * every music command whenever the database is slow is the worse failure.
  */
 async function checkDjRole(
   client: BotClient,
@@ -108,7 +124,17 @@ async function checkDjRole(
 ): Promise<GuardResult> {
   if (interaction.guildId === null) return ALLOWED;
 
-  const settings = await client.services.guilds.getSettings(interaction.guildId);
+  const settings = await client.services.guilds.getSettingsWithin(
+    interaction.guildId,
+    DJ_SETTINGS_BUDGET_MS,
+  );
+  if (settings === null) {
+    logger.warn(
+      { guildId: interaction.guildId, budgetMs: DJ_SETTINGS_BUDGET_MS },
+      'DJ role check timed out reading settings; allowing the command through',
+    );
+    return ALLOWED;
+  }
   if (settings.djRoleId === null) return ALLOWED;
 
   const member = interaction.member as GuildMember | null;

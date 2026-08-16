@@ -1,6 +1,6 @@
 import { isAppError } from '@discord-music/shared';
 import type { Metadata } from 'next';
-import Link from 'next/link';
+import { AppLink } from '@/components/navigation/app-link';
 import { notFound } from 'next/navigation';
 import { revalidatePath } from 'next/cache';
 
@@ -66,7 +66,7 @@ export default async function PlaylistDetailPage({
           </p>
         </div>
         <Button variant="ghost" size="sm" asChild>
-          <Link href="/dashboard/playlists">← All playlists</Link>
+          <AppLink href="/dashboard/playlists">← All playlists</AppLink>
         </Button>
       </div>
 

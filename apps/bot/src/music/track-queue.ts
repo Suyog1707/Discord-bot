@@ -97,6 +97,20 @@ export class TrackQueue {
   }
 
   /**
+   * Swap the playing track for an equivalent one from another source.
+   *
+   * In place and at the same index on purpose: the listener asked for this
+   * song, and a source that refused to stream it is a detail of delivery, not a
+   * change to the queue. Appending instead would duplicate the entry and move
+   * everything that follows.
+   */
+  replaceCurrent(track: QueuedTrack): boolean {
+    if (this.#currentIndex < 0 || this.#currentIndex >= this.#tracks.length) return false;
+    this.#tracks[this.#currentIndex] = track;
+    return true;
+  }
+
+  /**
    * Natural advance, called when a track finishes on its own.
    * Honours `track` loop (replays current) and `queue` loop (wraps around).
    */

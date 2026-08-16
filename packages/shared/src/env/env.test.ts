@@ -77,6 +77,20 @@ describe('botEnvSchema', () => {
     ).toThrow(/DATABASE_URL must be a PostgreSQL connection string/u);
   });
 
+  // DIRECT_URL is the migration-only connection: Prisma Migrate uses it,
+  // no running app does. It must therefore never be required at boot, but a
+  // typo in it should still surface at `check:env` rather than mid-deploy.
+  it('accepts a missing or blank DIRECT_URL', () => {
+    expect(parseEnv(botEnvSchema, validBotEnv).DIRECT_URL).toBeUndefined();
+    expect(parseEnv(botEnvSchema, { ...validBotEnv, DIRECT_URL: '' }).DIRECT_URL).toBeUndefined();
+  });
+
+  it('rejects a non-PostgreSQL DIRECT_URL', () => {
+    expect(() =>
+      parseEnv(botEnvSchema, { ...validBotEnv, DIRECT_URL: 'mysql://localhost/db' }),
+    ).toThrow(/DIRECT_URL must be a PostgreSQL connection string/u);
+  });
+
   it('reports every missing required variable at once', () => {
     let message = '';
     try {

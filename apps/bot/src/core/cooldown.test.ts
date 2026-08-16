@@ -87,4 +87,28 @@ describe('CooldownManager (in-memory fallback)', () => {
     });
     expect(redis.set).toHaveBeenCalledWith(expect.stringContaining('cooldown'), '1', 'EX', 5, 'NX');
   });
+
+  /**
+   * Cooldowns are consulted before the command replies, so a Redis that never
+   * answers must not hold the interaction past Discord's acknowledgement
+   * window — it has to hand over to the in-memory store instead.
+   */
+  it('falls back to memory when Redis exceeds its budget', async () => {
+    const hangingRedis = {
+      set: vi.fn(
+        () =>
+          new Promise(() => {
+            /* never settles */
+          }),
+      ),
+      ttl: vi.fn(),
+    };
+    const cooldowns = new CooldownManager(hangingRedis as never);
+
+    const pending = cooldowns.consume('play', 'user9', 5);
+    await vi.advanceTimersByTimeAsync(600);
+
+    await expect(pending).resolves.toMatchObject({ allowed: true });
+    expect(hangingRedis.set).toHaveBeenCalledTimes(1);
+  });
 });

@@ -1,9 +1,10 @@
 'use client';
 
 import { BarChart3, Heart, Home, ListMusic, Server, Settings } from 'lucide-react';
-import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 
+import { AppLink } from '@/components/navigation/app-link';
+import { LinkSpinner } from '@/components/navigation/route-progress';
 import { cn } from '@/lib/utils';
 
 /** Sidebar sections mirror docs/DASHBOARD.md: Overview, Servers, Player/Queue (per server), Playlists, Analytics, Settings. */
@@ -24,7 +25,7 @@ export function DashboardNav() {
       {NAV_ITEMS.map(({ href, label, icon: Icon, exact }) => {
         const active = exact ? pathname === href : pathname.startsWith(href);
         return (
-          <Link
+          <AppLink
             key={href}
             href={href}
             aria-current={active ? 'page' : undefined}
@@ -37,7 +38,8 @@ export function DashboardNav() {
           >
             <Icon aria-hidden className="size-4" />
             {label}
-          </Link>
+            <LinkSpinner className="ml-auto" />
+          </AppLink>
         );
       })}
     </nav>

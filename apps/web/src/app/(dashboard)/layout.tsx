@@ -1,4 +1,4 @@
-import Link from 'next/link';
+import { AppLink } from '@/components/navigation/app-link';
 
 import { requireUserOrRedirect } from '@/lib/auth/session';
 import { SignOutButton } from '@/components/auth/sign-out-button';
@@ -19,9 +19,9 @@ export default async function DashboardLayout({ children }: { children: React.Re
     <div className="flex min-h-dvh">
       <aside className="bg-sidebar text-sidebar-foreground border-sidebar-border hidden w-60 shrink-0 flex-col border-r md:flex">
         <div className="flex h-14 items-center px-4">
-          <Link href="/dashboard" className="text-sm font-semibold tracking-tight">
+          <AppLink href="/dashboard" className="text-sm font-semibold tracking-tight">
             Discord Music
-          </Link>
+          </AppLink>
         </div>
         <DashboardNav />
         <div className="border-sidebar-border mt-auto border-t p-3">
@@ -31,9 +31,9 @@ export default async function DashboardLayout({ children }: { children: React.Re
 
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="bg-background/80 sticky top-0 z-10 flex h-14 items-center justify-between gap-4 border-b px-4 backdrop-blur md:justify-end">
-          <Link href="/dashboard" className="text-sm font-semibold md:hidden">
+          <AppLink href="/dashboard" className="text-sm font-semibold md:hidden">
             Discord Music
-          </Link>
+          </AppLink>
           <SignOutButton />
         </header>
         <main className="flex-1 p-4 md:p-8">{children}</main>

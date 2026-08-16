@@ -8,6 +8,7 @@
 import {
   LIMITS,
   type LoopMode,
+  type MusicSource,
   type PlayerEventType,
   type PlayerSnapshot,
 } from '@discord-music/shared';
@@ -17,8 +18,42 @@ import type { FilterOptions, Player } from 'shoukaku';
 import { getLogger, type Logger } from '../lib/logger.js';
 import type { FilterPresetName } from './filters.js';
 import type { QueueStore } from './queue-store.js';
+import {
+  hasAnyLink,
+  NO_PLATFORM_LINKS,
+  renderPlatformLinks,
+  type PlatformLinks,
+} from './platform-links.js';
 import { formatTrackDuration, trackLink, type QueuedTrack } from './track.js';
 import { TrackQueue } from './track-queue.js';
+
+/**
+ * Cap on the logged `cause`. Lavalink stringifies the whole Java throwable, and
+ * for a multi-client YouTube failure that is several lines listing what each
+ * client said — worth keeping, but not worth an unbounded log line.
+ */
+const CAUSE_LOG_LIMIT = 600;
+
+/**
+ * How long the now-playing announcement waits for cross-platform links.
+ * Past this the embed goes out without them rather than arriving late.
+ */
+const LINK_WAIT_MS = 2_500;
+
+function truncate(value: string | undefined, limit: number): string | undefined {
+  if (value === undefined || value.length <= limit) return value;
+  return `${value.slice(0, limit)}… (truncated)`;
+}
+
+/**
+ * The exception class name from Lavalink's stringified throwable, so failures
+ * can be grouped by type without parsing the whole message at read time.
+ */
+function exceptionTypeOf(cause: string | undefined): string | undefined {
+  const [firstLine] = (cause ?? '').split('\n');
+  const match = /^([\w$]+(?:\.[\w$]+)*(?:Exception|Error))\b/u.exec(firstLine?.trim() ?? '');
+  return match?.[1];
+}
 
 export interface GuildPlayerOptions {
   readonly guildId: string;
@@ -42,6 +77,16 @@ export interface GuildPlayerOptions {
    * continue with (may be empty — the player then parks as usual).
    */
   readonly onAutoplayRequest: (guildId: string) => Promise<readonly QueuedTrack[]>;
+  /**
+   * Find the same recording on a source other than the one that just refused to
+   * play it. Returns null when nothing equivalent exists.
+   */
+  readonly onFindAlternative?: (
+    track: QueuedTrack,
+    failedSource: MusicSource,
+  ) => Promise<QueuedTrack | null>;
+  /** Cross-platform "listen on" links for the track that just started. */
+  readonly onResolveLinks?: (track: QueuedTrack) => Promise<PlatformLinks>;
   /** Fire-and-forget realtime event sink (Redis → dashboard SSE). */
   readonly onEvent?: (type: PlayerEventType, state: PlayerSnapshot | null) => void;
 }
@@ -70,6 +115,26 @@ export class GuildPlayer {
   #autoplayActive = false;
   #activeFilter: FilterPresetName | 'speed' | 'pitch' | null = null;
   readonly #onAutoplayRequest: (guildId: string) => Promise<readonly QueuedTrack[]>;
+  readonly #onFindAlternative:
+    ((track: QueuedTrack, failedSource: MusicSource) => Promise<QueuedTrack | null>) | undefined;
+  readonly #onResolveLinks: ((track: QueuedTrack) => Promise<PlatformLinks>) | undefined;
+  /** Links for the playing track, refreshed on every track start. */
+  #currentLinks: PlatformLinks = NO_PLATFORM_LINKS;
+  /**
+   * Identifiers already re-sourced once. A track gets exactly one alternative:
+   * without this, a song missing everywhere would bounce between sources.
+   */
+  readonly #reSourced = new Set<string>();
+  /** Set by the exception handler so the following `end` can recover instead of skipping. */
+  #recoverCurrent = false;
+  /**
+   * Set by `stop()` so the `end` it provokes does not start autoplay.
+   *
+   * Stopping empties the queue, and an empty queue is exactly the condition
+   * autoplay exists to answer — so without this, `/stop` handed straight over
+   * to the radio and the music never actually stopped.
+   */
+  #stopRequested = false;
   readonly #onEvent: ((type: PlayerEventType, state: PlayerSnapshot | null) => void) | undefined;
 
   constructor(options: GuildPlayerOptions) {
@@ -86,6 +151,8 @@ export class GuildPlayer {
     this.#autoplayEnabled = options.autoplayEnabled;
     this.#onSelfDestruct = options.onSelfDestruct;
     this.#onAutoplayRequest = options.onAutoplayRequest;
+    this.#onFindAlternative = options.onFindAlternative;
+    this.#onResolveLinks = options.onResolveLinks;
     this.#onEvent = options.onEvent;
     this.#logger = getLogger('guild-player').child({ guildId: options.guildId });
 
@@ -302,6 +369,7 @@ export class GuildPlayer {
   async stop(): Promise<void> {
     this.queue.reset();
     this.#skipRequested = true;
+    this.#stopRequested = true;
     await this.#player.stopTrack();
     this.#persist();
     this.#startIdleTimer();
@@ -336,9 +404,13 @@ export class GuildPlayer {
       this.#clearIdleTimer();
       this.#emit('TRACK_START');
       const track = this.queue.current;
-      if (track !== null && this.#announce) {
-        void this.#announceNowPlaying(track);
-      }
+      if (track === null) return;
+
+      // Links are decoration: resolve them alongside the announcement rather
+      // than in front of it, so a slow third party never delays the embed.
+      this.#currentLinks = NO_PLATFORM_LINKS;
+      void this.#refreshLinks(track);
+      if (this.#announce) void this.#announceNowPlaying(track);
     });
 
     this.#player.on('end', (event) => {
@@ -346,11 +418,32 @@ export class GuildPlayer {
     });
 
     this.#player.on('exception', (event) => {
-      this.#logger.warn({ exception: event.exception }, 'Track raised an exception');
-      void this.#notify(
-        `⚠️ Playback error on **${this.queue.current?.title ?? 'the current track'}** — skipping.`,
+      const track = this.queue.current;
+      // The chat message stays one line, but the log keeps everything needed to
+      // tell apart the failure modes that all look identical to a listener: a
+      // stale youtube-source signature extractor, YouTube demanding a login for
+      // one video, a genuinely unavailable track. `cause` is where Lavalink puts
+      // the real root cause — it is the difference between "playback broke" and
+      // "AllClientsFailedException: Must find sig function from script".
+      this.#logger.warn(
+        {
+          title: track?.title,
+          identifier: track?.identifier,
+          source: track?.source,
+          uri: track?.uri,
+          exceptionType: exceptionTypeOf(event.exception.cause),
+          exceptionMessage: event.exception.message,
+          severity: event.exception.severity,
+          cause: truncate(event.exception.cause, CAUSE_LOG_LIMIT),
+          node: this.#player.node.name,
+        },
+        'Track playback exception',
       );
-      // 'end' (loadFailed) follows; advancement handled there.
+      // Do not announce anything yet. 'end' (loadFailed) follows immediately,
+      // and that is where we try another source — telling the channel the track
+      // was skipped before we have tried to rescue it would be a lie half the
+      // time.
+      this.#recoverCurrent = true;
     });
 
     this.#player.on('stuck', (event) => {
@@ -365,6 +458,20 @@ export class GuildPlayer {
 
   async #handleTrackEnd(reason: string): Promise<void> {
     const finished = this.queue.current;
+
+    // A source that refused to stream gets one chance to be replaced by another
+    // before the track is written off. This runs here rather than in the
+    // exception handler because 'end' arrives right behind the exception and
+    // would otherwise advance the queue past the track we just rescued.
+    const recover = this.#recoverCurrent;
+    this.#recoverCurrent = false;
+    if (recover && reason === 'loadFailed' && finished !== null && !this.#destroyed) {
+      if (await this.#playFromAnotherSource(finished)) return;
+      // Nothing playable anywhere — now the skip is real, so say so. Deferring
+      // the message to here is what keeps a rescued track from being announced
+      // as skipped a moment before it starts playing.
+      await this.#notify(`⚠️ Playback error on **${finished.title}** — skipping.`);
+    }
 
     // Record history before the cursor moves.
     if (
@@ -390,6 +497,16 @@ export class GuildPlayer {
     if (next === null) {
       this.#persist();
       this.#emit('TRACK_END');
+
+      // An explicit stop means stop. Autoplay only continues a session that
+      // ran out on its own.
+      const stopped = this.#stopRequested;
+      this.#stopRequested = false;
+      if (stopped) {
+        this.#startIdleTimer();
+        return;
+      }
+
       if (await this.#tryAutoplay()) return;
       await this.#notify('✅ Queue finished. Add more with `/play`.');
       this.#startIdleTimer();
@@ -424,6 +541,53 @@ export class GuildPlayer {
     }
   }
 
+  /**
+   * Re-source `failed` and play the replacement in its place.
+   *
+   * @returns True when playback continued with an alternative; false when the
+   *   caller should fall through to its normal skip handling.
+   */
+  async #playFromAnotherSource(failed: QueuedTrack): Promise<boolean> {
+    if (this.#onFindAlternative === undefined) return false;
+    if (this.#reSourced.has(failed.identifier)) return false;
+    this.#reSourced.add(failed.identifier);
+
+    let alternative: QueuedTrack | null = null;
+    try {
+      alternative = await this.#onFindAlternative(failed, failed.source);
+    } catch (error) {
+      this.#logger.warn({ err: error, title: failed.title }, 'Alternative source lookup failed');
+    }
+
+    if (alternative === null || this.#destroyed) return false;
+    if (!this.queue.replaceCurrent(alternative)) return false;
+
+    this.#logger.info(
+      { title: failed.title, from: failed.source, to: alternative.source },
+      'Recovered track from another source',
+    );
+    await this.#playTrack(alternative);
+    this.#persist();
+    return true;
+  }
+
+  /** Resolve and store the "listen on" links for `track`. */
+  async #refreshLinks(track: QueuedTrack): Promise<void> {
+    if (this.#onResolveLinks === undefined) return;
+    try {
+      const links = await this.#onResolveLinks(track);
+      // Guard against a slow lookup landing after the next track started.
+      if (this.queue.current?.identifier === track.identifier) this.#currentLinks = links;
+    } catch (error) {
+      this.#logger.debug({ err: error, title: track.title }, 'Platform link lookup failed');
+    }
+  }
+
+  /** Cross-platform links for the playing track; empty until they resolve. */
+  get currentLinks(): PlatformLinks {
+    return this.#currentLinks;
+  }
+
   async #playTrack(track: QueuedTrack): Promise<void> {
     try {
       await this.#player.playTrack({
@@ -445,6 +609,11 @@ export class GuildPlayer {
   /* ------------------------------------------------------------------- misc */
 
   async #announceNowPlaying(track: QueuedTrack): Promise<void> {
+    // The links are being fetched concurrently by `#refreshLinks`; give them a
+    // moment to land so the announcement carries them, but never hold the
+    // message hostage to a third party that is not answering.
+    const links = await this.#awaitLinks(track);
+
     const embed = new EmbedBuilder()
       .setColor(0x5865f2)
       .setAuthor({ name: 'Now playing' })
@@ -453,9 +622,23 @@ export class GuildPlayer {
         { name: 'Duration', value: formatTrackDuration(track), inline: true },
         { name: 'Requested by', value: track.requestedByName, inline: true },
       );
+
+    const rendered = renderPlatformLinks(links);
+    if (rendered !== null) embed.addFields({ name: 'Listen on', value: rendered });
     if (track.artworkUrl !== null) embed.setThumbnail(track.artworkUrl);
 
     await this.#notify({ embeds: [embed] });
+  }
+
+  /** Poll briefly for the in-flight link lookup, then give up on it. */
+  async #awaitLinks(track: QueuedTrack): Promise<PlatformLinks> {
+    const deadline = Date.now() + LINK_WAIT_MS;
+    while (Date.now() < deadline) {
+      if (hasAnyLink(this.#currentLinks)) return this.#currentLinks;
+      if (this.queue.current?.identifier !== track.identifier) break;
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    return this.#currentLinks;
   }
 
   /** Send to the bound text channel; failures are logged, never thrown. */

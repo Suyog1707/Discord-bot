@@ -1,7 +1,7 @@
 import { isAppError } from '@discord-music/shared';
 import type { Metadata } from 'next';
 import Image from 'next/image';
-import Link from 'next/link';
+import { AppLink } from '@/components/navigation/app-link';
 import { notFound, redirect } from 'next/navigation';
 import { revalidatePath } from 'next/cache';
 
@@ -103,7 +103,7 @@ export default async function ServerDetailPage({
           <div className="mt-1 flex items-center gap-2">
             <Badge variant="success">Bot active</Badge>
             <Button variant="link" size="sm" asChild className="h-auto p-0">
-              <Link href={`/dashboard/analytics?guild=${detail.discordId}`}>View analytics →</Link>
+              <AppLink href={`/dashboard/analytics?guild=${detail.discordId}`}>View analytics →</AppLink>
             </Button>
           </div>
         </div>

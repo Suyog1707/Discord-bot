@@ -60,6 +60,23 @@ const nextConfig: NextConfig = {
   reactStrictMode: true,
   poweredByHeader: false,
 
+  experimental: {
+    /**
+     * Client-side Router Cache lifetimes, in seconds.
+     *
+     * Next 15 defaults `dynamic` to 0, so every dashboard page — all of them
+     * `force-dynamic` — was re-fetched from the server on every visit,
+     * including going back to a page opened seconds earlier. Holding the RSC
+     * payload for 30s makes back/forward and re-visits render from memory with
+     * no round trip at all. Server actions still call `revalidatePath`, which
+     * evicts these entries, so writes remain visible immediately.
+     */
+    staleTimes: {
+      dynamic: 30,
+      static: 180,
+    },
+  },
+
   typescript: {
     // Never ship a build that does not typecheck.
     ignoreBuildErrors: false,

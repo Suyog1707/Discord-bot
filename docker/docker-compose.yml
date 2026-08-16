@@ -1,8 +1,20 @@
-# Local development infrastructure: PostgreSQL, Redis and Lavalink.
+# Local development infrastructure: Lavalink and its cipher sidecar.
+#
+# PostgreSQL and Redis are not here: this project uses Supabase and Upstash, so
+# DATABASE_URL and REDIS_URL point at those and a local copy would only be a
+# second, divergent database to keep straight. Audio is the one dependency that
+# still has to run locally.
 #
 #   pnpm run docker:up     # start
 #   pnpm run docker:logs   # follow logs
 #   pnpm run docker:down   # stop
+#
+# Those scripts pin DOCKER_CONTEXT=default. A machine running Docker Desktop
+# alongside the system daemon has two independent daemons, and Desktop makes
+# itself the active context every time it starts — so a bare `docker compose up`
+# would build a *second* copy of this stack on the other daemon and fail on the
+# published ports, which are already held by the first. Export DOCKER_CONTEXT
+# yourself to override the pin.
 #
 # The apps themselves run on the host via `pnpm dev` so hot-reload stays fast.
 # Production deployment is Vercel (web) + VPS (bot/Lavalink) per docs/DEPLOYMENT.md.
@@ -10,47 +22,6 @@
 name: discord-music
 
 services:
-  postgres:
-    image: postgres:17-alpine
-    container_name: dmp-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      POSTGRES_DB: ${POSTGRES_DB:-discord_music}
-      # Faster, deterministic collation for a dev database.
-      POSTGRES_INITDB_ARGS: '--encoding=UTF8 --locale=C'
-    ports:
-      - '${POSTGRES_PORT:-5432}:5432'
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    healthcheck:
-      test:
-        [
-          'CMD-SHELL',
-          'pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-discord_music}',
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-
-  redis:
-    image: redis:7-alpine
-    container_name: dmp-redis
-    restart: unless-stopped
-    # Persist to disk so queue state survives a container restart in dev.
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
-    ports:
-      - '${REDIS_PORT:-6379}:6379'
-    volumes:
-      - redis-data:/data
-    healthcheck:
-      test: ['CMD', 'redis-cli', 'ping']
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
   # The Lavalink image ships no /opt/Lavalink/plugins directory, so Docker
   # creates the named volume's mountpoint owned by root while the server runs as
   # uid 322. Plugin downloads then fail with "Permission denied" and the server
@@ -70,6 +41,25 @@ services:
       - lavalink-plugins:/opt/Lavalink/plugins
     restart: 'no'
 
+  # Signature deciphering for the YouTube source (application.yml:
+  # plugins.youtube.remoteCipher). YouTube's player script outgrew the
+  # extractor built into youtube-source — every track failed with "Must find sig
+  # function from script" — and upstream's answer is to hand deciphering to this
+  # service instead of shipping a new regex per player release. The container
+  # name is load-bearing: Lavalink reaches it as http://yt-cipher:8001. No
+  # published port, because only Lavalink should be able to talk to it.
+  yt-cipher:
+    image: ghcr.io/kikkia/yt-cipher:master
+    container_name: dmp-yt-cipher
+    restart: unless-stopped
+    environment:
+      # Upstream: only the IAS script variants currently work reliably.
+      OVERRIDE_PLAYER_VARIANT: IAS
+    networks:
+      default:
+        aliases:
+          - yt-cipher
+
   lavalink:
     image: ghcr.io/lavalink-devs/lavalink:4
     container_name: dmp-lavalink
@@ -77,10 +67,27 @@ services:
     depends_on:
       lavalink-init:
         condition: service_completed_successfully
+      # Distroless image with no shell, so there is no healthcheck to wait on.
+      # Lavalink only calls the cipher server when a track is played, which is
+      # long after both have settled.
+      yt-cipher:
+        condition: service_started
     environment:
       _JAVA_OPTIONS: -Xmx1G
       SERVER_PORT: 2333
       LAVALINK_SERVER_PASSWORD: ${LAVALINK_PASSWORD:-youshallnotpass}
+      # application.yml interpolates these into the LavaSrc Spotify block. They
+      # were never passed through, so LavaSrc authenticated with empty strings
+      # and Spotify links handed straight to Lavalink failed with
+      # "invalid_client" surfacing as "Something went wrong while looking up the
+      # track". The bot resolves Spotify itself and rarely hits this path, but a
+      # source configured with credentials it cannot see is a trap.
+      SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
+      SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
+      # YouTube OAuth (application.yml: plugins.youtube.oauth) — the only way to
+      # play sign-in-gated videos. Off unless YT_OAUTH_ENABLED is set.
+      YT_OAUTH_ENABLED: ${YT_OAUTH_ENABLED:-false}
+      YT_OAUTH_REFRESH_TOKEN: ${YT_OAUTH_REFRESH_TOKEN:-}
     ports:
       - '${LAVALINK_PORT:-2333}:2333'
     volumes:
@@ -104,6 +111,4 @@ services:
       start_period: 90s
 
 volumes:
-  postgres-data:
-  redis-data:
   lavalink-plugins:

@@ -152,6 +152,36 @@
   --radius-xl: calc(var(--radius) + 4px);
 }
 
+/*
+ * Navigation progress bar (components/navigation/route-progress.tsx).
+ *
+ * An indeterminate "trickle": it cannot know real progress, so it eases
+ * towards 92% and parks there until the route commits, which reads as steady
+ * movement rather than a bar that stalls at a round number. The reduced-motion
+ * rule below flattens this to a static bar, which is still a valid busy cue.
+ */
+@keyframes route-progress {
+  0% {
+    width: 0%;
+  }
+  25% {
+    width: 45%;
+  }
+  50% {
+    width: 68%;
+  }
+  75% {
+    width: 82%;
+  }
+  100% {
+    width: 92%;
+  }
+}
+
+@utility animate-route-progress {
+  animation: route-progress 2.4s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;

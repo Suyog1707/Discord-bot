@@ -35,9 +35,54 @@ export interface SpotifyTrackMeta {
 }
 
 export interface SpotifyResolution {
+  /**
+   * The first page of tracks — enough to start playback. A large collection
+   * deliberately does not wait for its whole track list here: paging a
+   * thousand-track playlist is seconds of latency in front of the first note.
+   */
   readonly tracks: readonly SpotifyTrackMeta[];
   /** Set for album/playlist/artist URLs. */
   readonly collectionName: string | null;
+  /**
+   * Everything after {@link tracks}, fetched on demand once playback is under
+   * way. Absent when the first page already held the entire collection.
+   */
+  readonly more?: (() => Promise<readonly SpotifyTrackMeta[]>) | undefined;
+  /**
+   * The source could not hand over the whole playlist. Only the public embed
+   * sets this: it returns one 100-track page and ignores `offset` entirely, so
+   * the rest of a longer playlist is unreachable without user authorisation.
+   */
+  readonly truncated?: boolean;
+}
+
+/** First-page size for paged collections; also Spotify's own page maximum. */
+const PLAYLIST_PAGE_SIZE = 100;
+const ALBUM_PAGE_SIZE = 50;
+/** Parallel page fetches when expanding the tail of a collection. */
+const PAGE_CONCURRENCY = 4;
+
+/** Run `task` over `items` with a bounded number of concurrent calls, in order. */
+async function mapBounded<T, R>(
+  items: readonly T[],
+  limit: number,
+  task: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = [];
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      const item = items[index];
+      if (item === undefined) return;
+      results[index] = await task(item);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, () => worker()),
+  );
+  return results;
 }
 
 export function isSpotifyUrl(input: string): boolean {
@@ -102,17 +147,21 @@ async function apiGet<T>(path: string, token: string): Promise<T> {
   let response: Response;
   try {
     response = await fetch(path.startsWith('https://') ? path : `${API_BASE}${path}`, {
-    headers: { Authorization: `Bearer ${token}` },
-    signal: AbortSignal.timeout(TIMEOUT_MS),
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
     });
   } catch (error) {
-    throw new UpstreamError('Spotify did not respond in time. Try again shortly.', { cause: error });
+    throw new UpstreamError('Spotify did not respond in time. Try again shortly.', {
+      cause: error,
+    });
   }
   if (response.status === 404) {
     throw new ValidationError('That Spotify link points at nothing (deleted or private?).');
   }
   if (response.status === 401) {
-    throw new UpstreamError('Spotify authorization expired. Reconnect your Spotify account and try again.');
+    throw new UpstreamError(
+      'Spotify authorization expired. Reconnect your Spotify account and try again.',
+    );
   }
   if (response.status === 403) {
     throw new ValidationError('Spotify does not allow access to that item.');
@@ -133,7 +182,8 @@ async function catalogueGet<T>(path: string): Promise<T> {
 interface RawTrack {
   readonly name: string;
   readonly duration_ms: number;
-  readonly artists: readonly { readonly name: string }[];
+  /** Absent on podcast episodes, which a playlist is allowed to contain. */
+  readonly artists?: readonly { readonly name: string }[];
   readonly album?: { readonly images?: readonly { readonly url: string }[] };
   readonly external_ids?: { readonly isrc?: string };
   readonly is_local?: boolean;
@@ -142,7 +192,7 @@ interface RawTrack {
 function toMeta(track: RawTrack, artworkFallback: string | null = null): SpotifyTrackMeta {
   return {
     title: track.name,
-    artist: track.artists.map((artist) => artist.name).join(', '),
+    artist: (track.artists ?? []).map((artist) => artist.name).join(', '),
     durationMs: track.duration_ms,
     artworkUrl: track.album?.images?.[0]?.url ?? artworkFallback,
     isrc: track.external_ids?.isrc ?? null,
@@ -150,34 +200,77 @@ function toMeta(track: RawTrack, artworkFallback: string | null = null): Spotify
 }
 
 interface PlaylistPage {
-  readonly items?: readonly { readonly item: RawTrack | null }[];
+  /**
+   * Spotify names the entry's payload `track`. `item` is tolerated because an
+   * earlier revision of this file asked for that key and it costs nothing to
+   * accept both rather than silently drop every row if it ever comes back.
+   */
+  readonly items?: readonly {
+    readonly track?: RawTrack | null;
+    readonly item?: RawTrack | null;
+  }[];
   readonly next: string | null;
+  readonly total?: number;
 }
 
-async function linkedPlaylist(
-  id: string,
-  token: string,
-): Promise<SpotifyResolution> {
-  const playlist = await apiGet<{ readonly name: string }>(`/playlists/${id}?fields=name`, token);
-  const tracks: RawTrack[] = [];
-  const limit = playlistTrackLimit();
-  let path: string | null =
-    `/playlists/${id}/items?limit=100&fields=items(item(name,duration_ms,artists(name),album(images),external_ids,is_local)),next`;
+const PLAYLIST_ITEM_FIELDS =
+  'items(track(name,duration_ms,artists(name),album(images),external_ids,is_local)),next,total';
 
-  while (path !== null && tracks.length < limit) {
-    const page: PlaylistPage = await apiGet<PlaylistPage>(path, token);
-    if (page.items === undefined) {
-      // Spotify returns playlist metadata but deliberately omits items for
-      // playlists that the token holder does not own/collaborate on.
-      throw new ValidationError('Spotify did not provide items for that playlist.');
-    }
-    for (const entry of page.items) {
-      if (entry.item !== null && entry.item.is_local !== true) tracks.push(entry.item);
-      if (tracks.length >= limit) break;
-    }
-    path = page.next;
+function playablePlaylistTracks(page: PlaylistPage): RawTrack[] {
+  if (page.items === undefined) {
+    // Spotify returns playlist metadata but deliberately omits items for
+    // playlists that the token holder does not own/collaborate on.
+    throw new ValidationError('Spotify did not provide items for that playlist.');
   }
-  return { tracks: tracks.map((track) => toMeta(track)), collectionName: playlist.name };
+  return page.items.flatMap((entry) => {
+    const track = entry.track ?? entry.item;
+    // A playlist may hold podcast episodes and local files. Neither carries the
+    // artist list `toMeta` needs, and neither is playable from a search.
+    if (track == null || track.is_local === true || track.artists === undefined) return [];
+    return [track];
+  });
+}
+
+async function linkedPlaylist(id: string, token: string): Promise<SpotifyResolution> {
+  const limit = playlistTrackLimit();
+  // `/tracks` is the documented "Get Playlist Items" route. It was `/items`,
+  // which is not an endpoint Spotify publishes — the linked path had never run
+  // (no account had been connected), so nothing caught it.
+  const itemsPath = (offset: number): string =>
+    `/playlists/${id}/tracks?limit=${String(PLAYLIST_PAGE_SIZE)}&offset=${String(offset)}` +
+    `&fields=${PLAYLIST_ITEM_FIELDS}`;
+
+  // Name and first page are independent lookups — no reason to serialise them.
+  const [playlist, firstPage] = await Promise.all([
+    apiGet<{ readonly name: string }>(`/playlists/${id}?fields=name`, token),
+    apiGet<PlaylistPage>(itemsPath(0), token),
+  ]);
+
+  const first = playablePlaylistTracks(firstPage).slice(0, limit);
+  const total = Math.min(firstPage.total ?? first.length, limit);
+  const tailOffsets: number[] = [];
+  for (let offset = PLAYLIST_PAGE_SIZE; offset < total; offset += PLAYLIST_PAGE_SIZE) {
+    tailOffsets.push(offset);
+  }
+
+  return {
+    tracks: first.map((track) => toMeta(track)),
+    collectionName: playlist.name,
+    more:
+      tailOffsets.length === 0
+        ? undefined
+        : async () => {
+            // Offsets are known up front, so the tail pages go out in parallel
+            // instead of one `next` hop at a time.
+            const pages = await mapBounded(tailOffsets, PAGE_CONCURRENCY, (offset) =>
+              apiGet<PlaylistPage>(itemsPath(offset), token),
+            );
+            return pages
+              .flatMap((page) => playablePlaylistTracks(page))
+              .slice(0, Math.max(0, limit - first.length))
+              .map((track) => toMeta(track));
+          },
+  };
 }
 
 function objectTracks(value: unknown, output: RawTrack[], limit: number): void {
@@ -196,7 +289,12 @@ function objectTracks(value: unknown, output: RawTrack[], limit: number): void {
     typeof name === 'string' &&
     typeof duration === 'number' &&
     Array.isArray(artists) &&
-    artists.every((artist) => artist !== null && typeof artist === 'object' && typeof (artist as { name?: unknown }).name === 'string')
+    artists.every(
+      (artist) =>
+        artist !== null &&
+        typeof artist === 'object' &&
+        typeof (artist as { name?: unknown }).name === 'string',
+    )
   ) {
     output.push(object as unknown as RawTrack);
     return;
@@ -210,8 +308,10 @@ function htmlText(value: string): string {
     .replace(/&nbsp;/giu, ' ')
     .replace(/&amp;/giu, '&')
     .replace(/&quot;/giu, '"')
-    .replace(/&#(?:x([0-9a-f]+)|([0-9]+));/giu, (_match, hex: string | undefined, decimal: string | undefined) =>
-      String.fromCodePoint(Number.parseInt(hex ?? decimal ?? '0', hex === undefined ? 10 : 16)),
+    .replace(
+      /&#(?:x([0-9a-f]+)|([0-9]+));/giu,
+      (_match, hex: string | undefined, decimal: string | undefined) =>
+        String.fromCodePoint(Number.parseInt(hex ?? decimal ?? '0', hex === undefined ? 10 : 16)),
     )
     .trim();
 }
@@ -227,7 +327,8 @@ function durationMs(value: string): number | null {
 /** Spotify's public embed is server-rendered as a numbered h3/h4 track list. */
 function embedTracks(html: string, limit: number, artworkUrl: string | null): SpotifyTrackMeta[] {
   const tracks: SpotifyTrackMeta[] = [];
-  const pattern = /<h3[^>]*>([\s\S]*?)<\/h3>[\s\S]{0,2000}?<h4[^>]*>([\s\S]*?)<\/h4>[\s\S]{0,2000}?\b(\d{1,2}:\d{2})\b/giu;
+  const pattern =
+    /<h3[^>]*>([\s\S]*?)<\/h3>[\s\S]{0,2000}?<h4[^>]*>([\s\S]*?)<\/h4>[\s\S]{0,2000}?\b(\d{1,2}:\d{2})\b/giu;
   for (const match of html.matchAll(pattern)) {
     const title = htmlText(match[1] ?? '');
     const artist = htmlText(match[2] ?? '');
@@ -253,77 +354,121 @@ function metaContent(html: string, property: string): string | null {
   return value === undefined ? null : htmlText(value);
 }
 
+async function fetchEmbedPage(id: string, offset: number): Promise<string> {
+  const url = new URL(`https://open.spotify.com/embed/playlist/${id}`);
+  if (offset > 0) url.searchParams.set('offset', String(offset));
+  const response = await fetch(url, {
+    headers: { Accept: 'text/html', 'User-Agent': 'discord-music-platform/0.1' },
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+  });
+  if (!response.ok) throw new Error(`HTTP ${String(response.status)}`);
+  return response.text();
+}
+
+function pageSignature(tracks: readonly SpotifyTrackMeta[]): string {
+  return tracks.map((track) => `${track.title} ${track.artist}`).join('');
+}
+
+/** Serialised embed state, for a deployment that ships JSON instead of rows. */
+function embedStateTracks(html: string, limit: number): RawTrack[] {
+  const tracks: RawTrack[] = [];
+  const scriptPattern = /<script[^>]*type=["']application\/json["'][^>]*>([\s\S]*?)<\/script>/giu;
+  for (const match of html.matchAll(scriptPattern)) {
+    try {
+      objectTracks(JSON.parse(match[1] ?? ''), tracks, limit);
+    } catch {
+      // A non-state JSON script is expected on the page.
+    }
+    if (tracks.length >= limit) break;
+  }
+  return tracks;
+}
+
 /**
  * Public embed fallback. The embed is an official, unauthenticated Spotify
  * page and supplies metadata only; audio still comes from Lavalink searches.
+ * Only the first page is fetched up front — the rest arrives through `more()`.
  */
 async function publicPlaylist(id: string): Promise<SpotifyResolution> {
   const limit = playlistTrackLimit();
-  const collected: SpotifyTrackMeta[] = [];
-  let collectionName: string | null = null;
-  let lastPageSignature: string | null = null;
-  let offset = 0;
 
-  // The official embed currently renders a page of tracks. Request successive
-  // offsets when Spotify exposes them; if an embed deployment ignores offset,
-  // its repeated page signature ends expansion without duplicating tracks.
-  while (collected.length < limit) {
-    let html: string;
-    try {
-      const url = new URL(`https://open.spotify.com/embed/playlist/${id}`);
-      if (offset > 0) url.searchParams.set('offset', String(offset));
-      const response = await fetch(url, {
-        headers: { Accept: 'text/html', 'User-Agent': 'discord-music-platform/0.1' },
-        signal: AbortSignal.timeout(TIMEOUT_MS),
-      });
-      if (!response.ok) {
-        if (collected.length > 0) break;
-        throw new Error(`HTTP ${String(response.status)}`);
-      }
-      html = await response.text();
-    } catch (error) {
-      logger.debug({ err: error, id, offset }, 'Public Spotify playlist fallback failed');
-      if (collected.length > 0) break;
-      throw new ValidationError('That Spotify playlist is private or inaccessible.');
-    }
-
-    const artwork = metaContent(html, 'og:image');
-    collectionName ??= metaContent(html, 'og:title');
-    const renderedTracks = embedTracks(html, limit - collected.length, artwork);
-    const signature = renderedTracks.map((track) => `${track.title}\u0000${track.artist}`).join('\u0001');
-    if (renderedTracks.length === 0 || signature === lastPageSignature) {
-      if (collected.length > 0) break;
-      // Keep this tolerant of an embed deployment that supplies serialised
-      // state instead of rendered rows, without relying on a wrapper name.
-      const tracks: RawTrack[] = [];
-      const scriptPattern = /<script[^>]*type=["']application\/json["'][^>]*>([\s\S]*?)<\/script>/giu;
-      for (const match of html.matchAll(scriptPattern)) {
-        try {
-          objectTracks(JSON.parse(match[1] ?? ''), tracks, limit);
-        } catch {
-          // A non-state JSON script is expected on the page.
-        }
-        if (tracks.length >= limit) break;
-      }
-      if (tracks.length === 0) {
-        throw new ValidationError(
-          "I couldn't retrieve the public track list for that Spotify playlist right now.",
-        );
-      }
-      return {
-        tracks: tracks.slice(0, limit).map((track) => toMeta(track, artwork)),
-        collectionName,
-      };
-    }
-
-    collected.push(...renderedTracks);
-    lastPageSignature = signature;
-    offset += renderedTracks.length;
-    // A short page means the entire public track list was rendered.
-    if (renderedTracks.length < 50) break;
+  let html: string;
+  try {
+    html = await fetchEmbedPage(id, 0);
+  } catch (error) {
+    logger.debug({ err: error, id }, 'Public Spotify playlist fallback failed');
+    throw new ValidationError('That Spotify playlist is private or inaccessible.');
   }
 
-  return { tracks: collected, collectionName };
+  const artwork = metaContent(html, 'og:image');
+  const collectionName = metaContent(html, 'og:title');
+  const firstPage = embedTracks(html, limit, artwork);
+
+  if (firstPage.length === 0) {
+    const stateTracks = embedStateTracks(html, limit);
+    if (stateTracks.length === 0) {
+      throw new ValidationError(
+        "I couldn't retrieve the public track list for that Spotify playlist right now.",
+      );
+    }
+    return {
+      tracks: stateTracks.slice(0, limit).map((track) => toMeta(track, artwork)),
+      collectionName,
+      truncated: stateTracks.length >= PLAYLIST_PAGE_SIZE && stateTracks.length < limit,
+    };
+  }
+
+  // A short first page means the embed rendered the whole public track list.
+  if (firstPage.length < 50 || firstPage.length >= limit) {
+    return {
+      tracks: firstPage,
+      collectionName,
+      truncated: firstPage.length >= PLAYLIST_PAGE_SIZE && firstPage.length < limit,
+    };
+  }
+
+  return {
+    tracks: firstPage,
+    collectionName,
+    // A full page means Spotify capped the embed rather than reaching the end.
+    // The walk below is kept in case `offset` starts working again, but as of
+    // now it returns the same page every time and stops on the first repeat.
+    truncated: firstPage.length >= PLAYLIST_PAGE_SIZE,
+    // Offsets must still be walked one at a time: the embed exposes no total,
+    // so a short or repeated page is the only stop condition. This now runs
+    // after playback has started, so the walk is off the critical path.
+    more: async () => {
+      const collected: SpotifyTrackMeta[] = [];
+      let lastPageSignature = pageSignature(firstPage);
+      let offset = firstPage.length;
+
+      while (firstPage.length + collected.length < limit) {
+        let page: string;
+        try {
+          page = await fetchEmbedPage(id, offset);
+        } catch (error) {
+          logger.debug({ err: error, id, offset }, 'Public Spotify playlist expansion stopped');
+          break;
+        }
+        const rendered = embedTracks(
+          page,
+          limit - firstPage.length - collected.length,
+          metaContent(page, 'og:image') ?? artwork,
+        );
+        const signature = pageSignature(rendered);
+        // An embed deployment that ignores `offset` repeats itself; stop rather
+        // than queue the same tracks twice.
+        if (rendered.length === 0 || signature === lastPageSignature) break;
+
+        collected.push(...rendered);
+        lastPageSignature = signature;
+        offset += rendered.length;
+        // A short page means the rest of the public list was rendered.
+        if (rendered.length < 50) break;
+      }
+      return collected;
+    },
+  };
 }
 
 /** Resolve any supported Spotify URL into track metadata. */
@@ -336,43 +481,58 @@ export async function resolveSpotifyUrl(
   if (match === null) throw new ValidationError('Unsupported Spotify link.');
   const [, kind, id] = match as unknown as [string, string, string];
 
+  const token = await spotify.accessTokenForPlayback(discordId);
+  // A linked user reads through their own token; everyone else gets the app
+  // token, which covers the public catalogue but not playlist items.
+  const get = async <T>(path: string): Promise<T> =>
+    token === null ? catalogueGet<T>(path) : apiGet<T>(path, token);
+
   switch (kind) {
     case 'track': {
-      const token = await spotify.accessTokenForPlayback(discordId);
-      const track = await (token === null
-        ? catalogueGet<RawTrack>(`/tracks/${id}`)
-        : apiGet<RawTrack>(`/tracks/${id}`, token));
+      const track = await get<RawTrack>(`/tracks/${id}`);
       return { tracks: [toMeta(track)], collectionName: null };
     }
     case 'album': {
-      const token = await spotify.accessTokenForPlayback(discordId);
-      const album = await (token === null
-        ? catalogueGet<{
-            name: string;
-            images?: { url: string }[];
-          }>(`/albums/${id}`)
-        : apiGet<{
-        name: string;
-        images?: { url: string }[];
-          }>(`/albums/${id}`, token));
-      const tracks: RawTrack[] = [];
       const limit = playlistTrackLimit();
-      let path: string | null = `/albums/${id}/tracks?limit=50`;
-      while (path !== null && tracks.length < limit) {
-        const page: { readonly items: RawTrack[]; readonly next: string | null } = await (token === null
-          ? catalogueGet<{ items: RawTrack[]; next: string | null }>(path)
-          : apiGet<{ items: RawTrack[]; next: string | null }>(path, token));
-        tracks.push(...page.items.slice(0, limit - tracks.length));
-        path = page.next;
+      const tracksPath = (offset: number): string =>
+        `/albums/${id}/tracks?limit=${String(ALBUM_PAGE_SIZE)}&offset=${String(offset)}`;
+
+      interface AlbumPage {
+        readonly items: RawTrack[];
+        readonly total?: number;
       }
+      // Album metadata and its first track page are independent lookups.
+      const [album, firstPage] = await Promise.all([
+        get<{ name: string; images?: { url: string }[] }>(`/albums/${id}`),
+        get<AlbumPage>(tracksPath(0)),
+      ]);
+
       const artwork = album.images?.[0]?.url ?? null;
+      const first = firstPage.items.slice(0, limit);
+      const total = Math.min(firstPage.total ?? first.length, limit);
+      const tailOffsets: number[] = [];
+      for (let offset = ALBUM_PAGE_SIZE; offset < total; offset += ALBUM_PAGE_SIZE) {
+        tailOffsets.push(offset);
+      }
+
       return {
-        tracks: tracks.map((track) => toMeta(track, artwork)),
+        tracks: first.map((track) => toMeta(track, artwork)),
         collectionName: album.name,
+        more:
+          tailOffsets.length === 0
+            ? undefined
+            : async () => {
+                const pages = await mapBounded(tailOffsets, PAGE_CONCURRENCY, (offset) =>
+                  get<AlbumPage>(tracksPath(offset)),
+                );
+                return pages
+                  .flatMap((page) => page.items)
+                  .slice(0, Math.max(0, limit - first.length))
+                  .map((track) => toMeta(track, artwork));
+              },
       };
     }
     case 'playlist': {
-      const token = await spotify.accessTokenForPlayback(discordId);
       if (token === null) return publicPlaylist(id);
       try {
         return await linkedPlaylist(id, token);
@@ -385,14 +545,10 @@ export async function resolveSpotifyUrl(
       }
     }
     case 'artist': {
-      const token = await spotify.accessTokenForPlayback(discordId);
-      async function artistGet<T>(path: string): Promise<T> {
-        return token === null ? catalogueGet<T>(path) : apiGet<T>(path, token);
-      }
-      const artist = await artistGet<{ name: string }>(`/artists/${id}`);
+      const artist = await get<{ name: string }>(`/artists/${id}`);
       // `/artists/{id}/top-tracks` was removed in February 2026. Search is
       // capped at ten results, which is exactly the size we present here.
-      const top = await artistGet<{ tracks: { items: RawTrack[] } }>(
+      const top = await get<{ tracks: { items: RawTrack[] } }>(
         `/search?type=track&limit=10&q=${encodeURIComponent(`artist:${artist.name}`)}`,
       );
       return {
@@ -402,6 +558,30 @@ export async function resolveSpotifyUrl(
     }
     default:
       throw new ValidationError('Unsupported Spotify link.');
+  }
+}
+
+/**
+ * The Spotify page for a recording we are playing from somewhere else.
+ *
+ * Purely for the "listen on" links — this never feeds playback, because Spotify
+ * audio cannot be streamed. Returns null when Spotify is unconfigured or has
+ * nothing matching, so a missing link is never an error.
+ */
+export async function searchSpotifyTrack(title: string, artist: string): Promise<string | null> {
+  if (!isSpotifyConfigured()) return null;
+
+  const query = encodeURIComponent(`${title} ${artist}`.trim());
+  try {
+    const page = await catalogueGet<{
+      readonly tracks?: {
+        readonly items?: readonly { readonly external_urls?: { readonly spotify?: string } }[];
+      };
+    }>(`/search?q=${query}&type=track&limit=1`);
+    return page.tracks?.items?.[0]?.external_urls?.spotify ?? null;
+  } catch (error) {
+    logger.debug({ err: error, title }, 'Spotify link lookup failed');
+    return null;
   }
 }
 

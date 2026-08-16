@@ -1,12 +1,13 @@
-import { ExternalLink, Server } from 'lucide-react';
+import { Server } from 'lucide-react';
 import type { Metadata } from 'next';
 import Image from 'next/image';
-import Link from 'next/link';
+import { AppLink } from '@/components/navigation/app-link';
 
 import { requireUserOrRedirect } from '@/lib/auth/session';
 import { guildIconUrl } from '@/lib/discord/cdn';
 import { getEnv } from '@/lib/env';
 import { listServers } from '@/lib/services/guilds';
+import { InviteBotButton } from '@/components/dashboard/invite-bot-button';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -77,18 +78,13 @@ export default async function ServersPage() {
                 <CardContent>
                   {server.botPresent ? (
                     <Button asChild className="w-full">
-                      <Link href={`/dashboard/servers/${server.discordId}`}>Manage</Link>
+                      <AppLink href={`/dashboard/servers/${server.discordId}`}>Manage</AppLink>
                     </Button>
                   ) : (
-                    <Button asChild variant="outline" className="w-full">
-                      <a
-                        href={inviteUrl(server.discordId)}
-                        target="_blank"
-                        rel="noreferrer noopener"
-                      >
-                        <ExternalLink aria-hidden /> Invite bot
-                      </a>
-                    </Button>
+                    <InviteBotButton
+                      guildId={server.discordId}
+                      inviteUrl={inviteUrl(server.discordId)}
+                    />
                   )}
                 </CardContent>
               </Card>

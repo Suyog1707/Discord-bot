@@ -231,21 +231,16 @@ async function browsePlaylists(
 
             const requester = { id: interaction.user.id, name: interaction.user.username };
             const playNow = component.customId === 'spl:play';
-            let queued = 0;
-            for (const track of tracks) {
-              try {
-                const result = await music.resolve(searchQueryFor(track), requester);
-                const [resolved] = result.tracks;
-                if (resolved !== undefined) {
-                  // "Play now" front-loads in original order: each insert goes
-                  // after the ones already placed this batch.
-                  await player.enqueue([resolved], playNow ? { next: false } : {});
-                  queued += 1;
-                }
-              } catch {
-                // One unmatchable track must not sink the batch.
-              }
-            }
+            // Searches run in parallel batches; each finished batch is appended
+            // in original order, so playback starts on the first few tracks
+            // instead of after every one has been looked up.
+            const queued = await music.resolveEach(
+              tracks.map((track) => searchQueryFor(track)),
+              requester,
+              async (resolved) => {
+                await player.enqueue(resolved, playNow ? { next: false } : {});
+              },
+            );
             if (queued > 0 && playNow && player.queue.upcoming.length >= queued) {
               // The batch was appended; jump playback to its first track.
               const offset = player.queue.upcoming.length - queued + 1;

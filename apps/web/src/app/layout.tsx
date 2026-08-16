@@ -1,6 +1,8 @@
 import type { Metadata, Viewport } from 'next';
 import { Geist, Geist_Mono } from 'next/font/google';
 
+import { RouteProgress } from '@/components/navigation/route-progress';
+
 import './globals.css';
 
 /**
@@ -42,6 +44,7 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
     // when it sets the class before hydration.
     <html lang="en" className="dark" suppressHydrationWarning>
       <body className={`${geistSans.variable} ${geistMono.variable} min-h-dvh font-sans`}>
+        <RouteProgress />
         {children}
       </body>
     </html>

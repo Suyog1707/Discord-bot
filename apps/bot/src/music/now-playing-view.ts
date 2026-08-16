@@ -11,6 +11,7 @@ import {
 } from 'discord.js';
 
 import type { GuildPlayer } from './guild-player.js';
+import { renderPlatformLinks } from './platform-links.js';
 import { formatTrackDuration, trackLink } from './track.js';
 
 /** Button custom-id prefix routed by the interaction dispatcher. */
@@ -65,6 +66,12 @@ export function renderNowPlaying(player: GuildPlayer): {
       { name: 'Volume', value: `${String(player.volume)}%`, inline: true },
       { name: 'Loop', value: player.queue.loopMode, inline: true },
     );
+
+  // Resolved in the background on track start, so this is whatever has arrived
+  // by the time the controller redraws — absent on the first paint at worst.
+  const links = renderPlatformLinks(player.currentLinks);
+  if (links !== null) embed.addFields({ name: 'Listen on', value: links });
+
   if (current.artworkUrl !== null) embed.setThumbnail(current.artworkUrl);
 
   const row = new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(

@@ -20,6 +20,35 @@ export interface CooldownResult {
 
 const ALLOWED: CooldownResult = { allowed: true, retryAfterSeconds: 0 };
 
+/**
+ * Longest a cooldown check may hold up an interaction.
+ *
+ * Cooldowns are consulted before the command replies, so a slow Redis would
+ * otherwise eat into Discord's three-second acknowledgement window and
+ * invalidate the interaction outright. Redis stays authoritative when it
+ * answers in time; past this the in-memory store decides, which is exactly the
+ * behaviour used when Redis is not configured at all.
+ */
+const REDIS_BUDGET_MS = 500;
+
+/** Resolve to `null` if `promise` has not settled within `ms`. */
+async function within<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => {
+          resolve(null);
+        }, ms);
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 export class CooldownManager {
   readonly #redis: Redis | undefined;
   /** Fallback store: key → expiry epoch ms. */
@@ -43,11 +72,13 @@ export class CooldownManager {
 
     if (this.#redis !== undefined) {
       try {
-        const set = await this.#redis.set(key, '1', 'EX', seconds, 'NX');
-        if (set === 'OK') return ALLOWED;
-
-        const ttl = await this.#redis.ttl(key);
-        return { allowed: false, retryAfterSeconds: Math.max(ttl, 1) };
+        const outcome = await within(this.#consumeInRedis(key, seconds), REDIS_BUDGET_MS);
+        if (outcome !== null) return outcome;
+        // Slow Redis must never cost the interaction its acknowledgement.
+        logger.warn(
+          { budgetMs: REDIS_BUDGET_MS, commandName },
+          'Cooldown check exceeded its budget; falling back to memory',
+        );
       } catch (error) {
         // Redis degraded mid-session: log once per incident path and fall
         // through to memory so commands keep working.
@@ -56,6 +87,17 @@ export class CooldownManager {
     }
 
     return this.#consumeInMemory(key, seconds);
+  }
+
+  async #consumeInRedis(key: string, seconds: number): Promise<CooldownResult> {
+    const redis = this.#redis;
+    if (redis === undefined) return ALLOWED;
+
+    const set = await redis.set(key, '1', 'EX', seconds, 'NX');
+    if (set === 'OK') return ALLOWED;
+
+    const ttl = await redis.ttl(key);
+    return { allowed: false, retryAfterSeconds: Math.max(ttl, 1) };
   }
 
   #consumeInMemory(key: string, seconds: number): CooldownResult {
