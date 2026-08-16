@@ -371,12 +371,13 @@ export default defineCommand({
         // Tracks saved by the bot carry a Lavalink blob and enqueue directly;
         // imports (dashboard JSON, Spotify mirrors) re-resolve by URI/search,
         // bounded so a 500-track Spotify import cannot stall the interaction.
-        let queued = 0;
+        // The list is built first so the searches run in parallel batches
+        // rather than one blocking round-trip per track.
+        const capacity = Math.max(0, LIMITS.QUEUE_MAX_TRACKS - player.queue.size);
         let resolves = 0;
-        for (const track of ordered) {
-          if (player.queue.size >= LIMITS.QUEUE_MAX_TRACKS) break;
+        const planned = ordered.slice(0, capacity).flatMap<string | QueuedTrack>((track) => {
           if (track.encoded !== '') {
-            await player.enqueue([
+            return [
               {
                 encoded: track.encoded,
                 identifier: track.identifier,
@@ -390,26 +391,16 @@ export default defineCommand({
                 requestedById: requester.id,
                 requestedByName: requester.name,
               },
-            ]);
-            queued += 1;
-            continue;
+            ];
           }
-          if (resolves >= RESOLVE_BUDGET) continue;
+          if (resolves >= RESOLVE_BUDGET) return [];
           resolves += 1;
-          try {
-            const result = await music.resolve(
-              track.uri ?? `${track.title} ${track.author}`,
-              requester,
-            );
-            const [resolved] = result.tracks;
-            if (resolved !== undefined) {
-              await player.enqueue([resolved]);
-              queued += 1;
-            }
-          } catch {
-            // One dead link must not sink the batch.
-          }
-        }
+          return [track.uri ?? `${track.title} ${track.author}`];
+        });
+
+        const queued = await music.resolveEach(planned, requester, async (tracks) => {
+          await player.enqueue(tracks);
+        });
 
         if (queued === 0) {
           throw new NotFoundError(`Nothing in **${playlist.name}** could be queued right now.`);

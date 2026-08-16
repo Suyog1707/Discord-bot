@@ -24,6 +24,7 @@ import {
   Shoukaku,
   type LavalinkResponse,
   type Node,
+  type Track as LavalinkTrack,
 } from 'shoukaku';
 
 import type { LavalinkNode } from '../config/env.js';
@@ -54,15 +55,36 @@ export interface ResolveResult {
   readonly tracks: readonly QueuedTrack[];
   /** Set when the identifier resolved to a whole playlist. */
   readonly playlistName: string | null;
-  /** Remaining collection tracks, resolved in the background after playback starts. */
-  readonly background?: Promise<SpotifyBackgroundResolution>;
+  /** Present when the collection has more tracks than were returned above. */
+  readonly background?: SpotifyExpansion;
 }
 
 export interface SpotifyBackgroundResolution {
-  readonly tracks: readonly QueuedTrack[];
   readonly sourceTrackCount: number;
+  readonly resolvedTrackCount: number;
   readonly failedTrackCount: number;
 }
+
+export interface SpotifyExpansion {
+  /**
+   * Resolve the rest of the collection, handing each finished batch to
+   * `onTracks` in queue order. Batches are emitted as they complete so the
+   * queue keeps filling while the first tracks are already playing.
+   */
+  readonly run: (
+    onTracks: (tracks: readonly QueuedTrack[]) => Promise<void>,
+  ) => Promise<SpotifyBackgroundResolution>;
+}
+
+/**
+ * How long a Lavalink search result is reused for the same query.
+ *
+ * Spotify playback is one search per track, so replaying a playlist otherwise
+ * repeats hundreds of identical searches. Encoded tracks stay playable well
+ * beyond this window — Lavalink re-resolves the stream when it plays them.
+ */
+const SEARCH_CACHE_TTL_MS = 30 * 60_000;
+const SEARCH_CACHE_MAX_ENTRIES = 2_000;
 
 export interface JoinOptions {
   readonly guildId: string;
@@ -85,6 +107,8 @@ export class MusicManager {
 
   readonly #publishEvent: ((payload: string) => void) | undefined;
   readonly #controllers = new Map<string, ControllerMessage>();
+  /** Insertion-ordered so the oldest entry is the one evicted at capacity. */
+  readonly #searchCache = new Map<string, { track: LavalinkTrack; expiresAt: number }>();
 
   constructor(options: {
     readonly client: Client;
@@ -326,112 +350,233 @@ export class MusicManager {
     return guildPlayer;
   }
 
-  /** Map each Spotify track to its best playable match via Lavalink search. */
+  /** One Lavalink search, served from the short-lived result cache when possible. */
+  async #searchOne(node: Node, query: string): Promise<LavalinkTrack | null> {
+    const cached = this.#searchCache.get(query);
+    if (cached !== undefined) {
+      if (cached.expiresAt > Date.now()) return cached.track;
+      this.#searchCache.delete(query);
+    }
+
+    const response = await node.rest.resolve(`ytsearch:${query}`);
+    if (response?.loadType !== LoadType.SEARCH) return null;
+    const [best] = response.data;
+    if (best === undefined) return null;
+
+    if (this.#searchCache.size >= SEARCH_CACHE_MAX_ENTRIES) {
+      const oldest = this.#searchCache.keys().next();
+      if (!(oldest.done ?? false)) this.#searchCache.delete(oldest.value);
+    }
+    this.#searchCache.set(query, { track: best, expiresAt: Date.now() + SEARCH_CACHE_TTL_MS });
+    return best;
+  }
+
+  /**
+   * Map Spotify tracks to playable matches via Lavalink search.
+   *
+   * Work is done in batches of `SPOTIFY_RESOLVE_CONCURRENCY`: parallel within a
+   * batch for throughput, batch-by-batch so `onBatch` receives tracks in queue
+   * order and the queue grows while the earlier tracks are already playing.
+   */
   async #matchSpotifyTracks(
     metadata: readonly SpotifyTrackMeta[],
     requestedBy: { readonly id: string; readonly name: string },
+    onBatch?: (tracks: readonly QueuedTrack[]) => Promise<void>,
   ): Promise<SpotifyBackgroundResolution> {
+    if (metadata.length === 0) {
+      return { sourceTrackCount: 0, resolvedTrackCount: 0, failedTrackCount: 0 };
+    }
+
     const node = this.shoukaku.getIdealNode();
     if (node === undefined) {
       throw new UpstreamError('The music server is not available right now. Try again shortly.');
     }
 
     const startedAt = Date.now();
-    const matches: (QueuedTrack | null)[] = Array.from({ length: metadata.length }, () => null);
-    const concurrency = Math.min(getEnv().SPOTIFY_RESOLVE_CONCURRENCY, metadata.length);
-    let nextIndex = 0;
+    const batchSize = Math.max(1, getEnv().SPOTIFY_RESOLVE_CONCURRENCY);
+    let resolvedCount = 0;
 
-    const worker = async (): Promise<void> => {
-      while (nextIndex < metadata.length) {
-        const index = nextIndex;
-        nextIndex += 1;
-        if (index >= metadata.length) return;
-        const meta = metadata.at(index);
-        if (meta === undefined) return;
-        try {
-          const response = await node.rest.resolve(`ytsearch:${searchQueryFor(meta)}`);
-          if (response?.loadType !== LoadType.SEARCH) continue;
-          const [best] = response.data;
-          if (best === undefined) continue;
-          const track = fromLavalinkTrack(best, requestedBy);
-          // Spotify is metadata-only: keep it for queue/display, play Lavalink's match.
-          matches[index] = {
-            ...track,
-            title: meta.title,
-            author: meta.artist,
-            artworkUrl: meta.artworkUrl ?? track.artworkUrl,
-            source: 'spotify',
-          };
-        } catch (error) {
-          logger.debug({ err: error, title: meta.title }, 'Spotify track match failed');
-        }
-      }
-    };
+    for (let offset = 0; offset < metadata.length; offset += batchSize) {
+      const batch = metadata.slice(offset, offset + batchSize);
+      const matched = await Promise.all(
+        batch.map(async (meta): Promise<QueuedTrack | null> => {
+          try {
+            const best = await this.#searchOne(node, searchQueryFor(meta));
+            if (best === null) return null;
+            const track = fromLavalinkTrack(best, requestedBy);
+            // Spotify is metadata-only: keep it for queue/display, play Lavalink's match.
+            return {
+              ...track,
+              title: meta.title,
+              author: meta.artist,
+              artworkUrl: meta.artworkUrl ?? track.artworkUrl,
+              source: 'spotify',
+            };
+          } catch (error) {
+            logger.debug({ err: error, title: meta.title }, 'Spotify track match failed');
+            return null;
+          }
+        }),
+      );
 
-    await Promise.all(Array.from({ length: concurrency }, () => worker()));
-    const tracks = matches.flatMap((track) => (track === null ? [] : [track]));
+      const tracks = matched.flatMap((track) => (track === null ? [] : [track]));
+      resolvedCount += tracks.length;
+      if (tracks.length > 0 && onBatch !== undefined) await onBatch(tracks);
+    }
+
     logger.info(
       {
         sourceTracks: metadata.length,
-        resolved: tracks.length,
-        failed: metadata.length - tracks.length,
+        resolved: resolvedCount,
+        failed: metadata.length - resolvedCount,
         durationMs: Date.now() - startedAt,
-        concurrency,
+        batchSize,
       },
       'Spotify Lavalink resolution complete',
     );
     return {
-      tracks,
       sourceTrackCount: metadata.length,
-      failedTrackCount: metadata.length - tracks.length,
+      resolvedTrackCount: resolvedCount,
+      failedTrackCount: metadata.length - resolvedCount,
     };
   }
 
-  /** Map each Spotify track to its best playable match via Lavalink search. */
+  /**
+   * Resolve a Spotify URL into something playable *now*, plus a continuation.
+   *
+   * Only the smallest prefix that yields a playable track is awaited here — a
+   * large collection would otherwise put its entire metadata paging and one
+   * search per track in front of the first note. Everything else is handed
+   * back as {@link SpotifyExpansion} for the caller to drain after replying.
+   */
   async #resolveSpotify(
     url: string,
     requestedBy: { readonly id: string; readonly name: string },
   ): Promise<ResolveResult> {
-    const node = this.shoukaku.getIdealNode();
-    if (node === undefined) {
+    if (this.shoukaku.getIdealNode() === undefined) {
       throw new UpstreamError('The music server is not available right now. Try again shortly.');
     }
 
     const metadataStartedAt = Date.now();
     const resolution = await resolveSpotifyUrl(url, requestedBy.id, this.#spotify);
     logger.info(
-      { tracks: resolution.tracks.length, durationMs: Date.now() - metadataStartedAt },
+      {
+        firstPageTracks: resolution.tracks.length,
+        paged: resolution.more !== undefined,
+        durationMs: Date.now() - metadataStartedAt,
+      },
       'Spotify metadata fetch complete',
     );
-    if (resolution.tracks.length === 0) {
+    const firstPage = resolution.tracks;
+    if (firstPage.length === 0 && resolution.more === undefined) {
       throw new NotFoundError('That Spotify link contains no playable tracks.');
     }
 
-    // Resolve a small ordered prefix first so /play can start immediately;
-    // the rest is safely bounded and queued in order after the reply.
-    const initialSize = Math.min(getEnv().SPOTIFY_RESOLVE_CONCURRENCY, resolution.tracks.length);
-    const initial = await this.#matchSpotifyTracks(
-      resolution.tracks.slice(0, initialSize),
-      requestedBy,
-    );
-    const remaining = resolution.tracks.slice(initialSize);
-    const background =
-      remaining.length === 0
-        ? undefined
-        : this.#matchSpotifyTracks(remaining, requestedBy);
+    const batchSize = Math.max(1, getEnv().SPOTIFY_RESOLVE_CONCURRENCY);
+    // A collection that continues beyond this page starts on its first track;
+    // one that fits in a single batch resolves fully for the same wall clock.
+    const hasMore = resolution.more !== undefined || firstPage.length > batchSize;
+    const headTracks: QueuedTrack[] = [];
+    const collect = (tracks: readonly QueuedTrack[]): Promise<void> => {
+      headTracks.push(...tracks);
+      return Promise.resolve();
+    };
 
-    if (initial.tracks.length === 0) {
+    let consumed = hasMore ? Math.min(1, firstPage.length) : firstPage.length;
+    await this.#matchSpotifyTracks(firstPage.slice(0, consumed), requestedBy, collect);
+    // The very first track can be unmatchable; widen until something plays.
+    while (headTracks.length === 0 && consumed < firstPage.length) {
+      const batch = firstPage.slice(consumed, consumed + batchSize);
+      await this.#matchSpotifyTracks(batch, requestedBy, collect);
+      consumed += batch.length;
+    }
+
+    const pending = firstPage.slice(consumed);
+    const expansion: SpotifyExpansion = {
+      run: async (onTracks) => {
+        // Start the remaining metadata pages before matching what we already
+        // have, so paging overlaps with searching instead of following it.
+        const morePages = resolution.more?.();
+        // Awaited below; this only keeps a paging failure from surfacing as an
+        // unhandled rejection if the matching ahead of it throws first.
+        morePages?.catch(() => undefined);
+
+        const fromFirstPage = await this.#matchSpotifyTracks(pending, requestedBy, onTracks);
+        if (morePages === undefined) return fromFirstPage;
+
+        const rest = await morePages;
+        const fromRest = await this.#matchSpotifyTracks(rest, requestedBy, onTracks);
+        return {
+          sourceTrackCount: fromFirstPage.sourceTrackCount + fromRest.sourceTrackCount,
+          resolvedTrackCount: fromFirstPage.resolvedTrackCount + fromRest.resolvedTrackCount,
+          failedTrackCount: fromFirstPage.failedTrackCount + fromRest.failedTrackCount,
+        };
+      },
+    };
+    const background =
+      pending.length === 0 && resolution.more === undefined ? undefined : expansion;
+
+    if (headTracks.length === 0) {
+      // Nothing on the first page matched. Drain the continuation inline rather
+      // than reporting a failure the caller could have played through.
       if (background !== undefined) {
-        const completed = await background;
-        if (completed.tracks.length > 0) {
-          return { tracks: completed.tracks, playlistName: resolution.collectionName };
+        const drained: QueuedTrack[] = [];
+        await background.run((tracks) => {
+          drained.push(...tracks);
+          return Promise.resolve();
+        });
+        if (drained.length > 0) {
+          return { tracks: drained, playlistName: resolution.collectionName };
         }
       }
       throw new NotFoundError('No playable matches found for that Spotify link.');
     }
+
     return background === undefined
-      ? { tracks: initial.tracks, playlistName: resolution.collectionName }
-      : { tracks: initial.tracks, playlistName: resolution.collectionName, background };
+      ? { tracks: headTracks, playlistName: resolution.collectionName }
+      : { tracks: headTracks, playlistName: resolution.collectionName, background };
+  }
+
+  /**
+   * Queue a mixed list of ready tracks and unresolved queries, in order.
+   *
+   * Stored playlists and Spotify mirrors hold one search per unresolved track,
+   * which run `SPOTIFY_RESOLVE_CONCURRENCY` at a time here instead of strictly
+   * one after another. Each finished batch goes to `onBatch` in list order, so
+   * playback starts on the first batch while the rest is still being looked up.
+   *
+   * @returns How many tracks were handed to `onBatch`.
+   */
+  async resolveEach(
+    items: readonly (string | QueuedTrack)[],
+    requestedBy: { readonly id: string; readonly name: string },
+    onBatch: (tracks: readonly QueuedTrack[]) => Promise<void>,
+  ): Promise<number> {
+    const batchSize = Math.max(1, getEnv().SPOTIFY_RESOLVE_CONCURRENCY);
+    let queued = 0;
+
+    for (let offset = 0; offset < items.length; offset += batchSize) {
+      const batch = items.slice(offset, offset + batchSize);
+      const results = await Promise.all(
+        batch.map(async (item): Promise<QueuedTrack | null> => {
+          if (typeof item !== 'string') return item;
+          try {
+            const [track] = (await this.resolve(item, requestedBy)).tracks;
+            return track ?? null;
+          } catch (error) {
+            // One dead link must not sink the batch.
+            logger.debug({ err: error, query: item }, 'Batch resolve failed for one entry');
+            return null;
+          }
+        }),
+      );
+
+      const tracks = results.flatMap((track) => (track === null ? [] : [track]));
+      if (tracks.length === 0) continue;
+      queued += tracks.length;
+      await onBatch(tracks);
+    }
+    return queued;
   }
 
   /**

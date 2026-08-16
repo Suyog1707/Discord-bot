@@ -122,6 +122,14 @@ function toUserTrack(track: RawTrack): UserTrack {
 
 export class SpotifyService {
   readonly #prisma: PrismaClient;
+  /**
+   * Decrypted access tokens, held until shortly before Spotify expires them.
+   *
+   * Without this every Spotify `/play` pays a database read plus an AES
+   * decrypt before the first byte of metadata is requested; the token is valid
+   * for an hour, so re-deriving it per command is pure latency.
+   */
+  readonly #tokenCache = new Map<string, { value: string; expiresAt: number }>();
 
   constructor(prisma: PrismaClient) {
     this.#prisma = prisma;
@@ -148,20 +156,32 @@ export class SpotifyService {
    */
   async accessTokenForPlayback(discordId: string): Promise<string | null> {
     if (!this.canReadTokens()) return null;
+    const cached = this.#tokenCache.get(discordId);
+    if (cached !== undefined && cached.expiresAt - Date.now() > EXPIRY_SKEW_MS) return cached.value;
+
     const account = await this.status(discordId);
-    return account === null ? null : this.#validAccessToken(discordId);
+    // No link is normal for `/play`: the caller falls back to public metadata.
+    return account === null ? null : this.#validAccessToken(discordId, account);
   }
 
   /** Unlink. Returns false when nothing was linked. */
   async disconnect(discordId: string): Promise<boolean> {
+    this.#tokenCache.delete(discordId);
     const { count } = await this.#prisma.spotifyAccount.deleteMany({
       where: { user: { discordId } },
     });
     return count > 0;
   }
 
-  async #validAccessToken(discordId: string): Promise<string> {
-    const account = await this.status(discordId);
+  /**
+   * @param known The already-fetched account row, when the caller has one —
+   * re-reading it here would double the database cost of every Spotify command.
+   */
+  async #validAccessToken(discordId: string, known?: SpotifyAccount): Promise<string> {
+    const cached = this.#tokenCache.get(discordId);
+    if (cached !== undefined && cached.expiresAt - Date.now() > EXPIRY_SKEW_MS) return cached.value;
+
+    const account = known ?? (await this.status(discordId));
     if (account === null) {
       throw new NotFoundError(
         'No Spotify account linked — connect one with `/spotify connect` first.',
@@ -177,6 +197,7 @@ export class SpotifyService {
     }
 
     if (account.expiresAt.getTime() - Date.now() > EXPIRY_SKEW_MS) {
+      this.#tokenCache.set(discordId, { value: accessToken, expiresAt: account.expiresAt.getTime() });
       return accessToken;
     }
 
@@ -213,13 +234,16 @@ export class SpotifyService {
       expires_in: number;
     };
 
+    const expiresAt = Date.now() + data.expires_in * 1000;
+    this.#tokenCache.set(discordId, { value: data.access_token, expiresAt });
+
     await this.#prisma.spotifyAccount.update({
       where: { id: account.id },
       data: {
         accessToken: encryptToken(data.access_token),
         // Spotify usually keeps the refresh token; rotate when it sends a new one.
         refreshToken: encryptToken(data.refresh_token ?? refreshToken),
-        expiresAt: new Date(Date.now() + data.expires_in * 1000),
+        expiresAt: new Date(expiresAt),
       },
     });
     return data.access_token;
