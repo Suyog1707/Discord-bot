@@ -52,6 +52,19 @@ export interface CommandDefinition {
   readonly djOnly?: boolean;
   /** Hide from `/help` and from production command deployment. */
   readonly devOnly?: boolean;
+  /**
+   * Acknowledge the interaction with `deferReply` *before* any guard runs.
+   *
+   * Discord invalidates an interaction that is not acknowledged within three
+   * seconds (`10062 Unknown interaction`). Guards reach Redis and Postgres,
+   * both of which are remote in production, so a command that acknowledges
+   * itself is only acknowledged *after* two network round-trips. Declaring
+   * deferral moves the acknowledgement in front of all of that.
+   *
+   * A command that declares this must not call `deferReply` itself, and must
+   * respond with `editReply`/`followUp`.
+   */
+  readonly deferral?: 'public' | 'ephemeral';
   execute(context: CommandContext): Promise<void>;
   autocomplete?(context: AutocompleteContext): Promise<void>;
 }

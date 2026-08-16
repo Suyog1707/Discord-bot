@@ -75,6 +75,10 @@ export default defineCommand({
   cooldownSeconds: 2,
   djOnly: true,
   botPermissions: [PermissionFlagsBits.Connect, PermissionFlagsBits.Speak],
+  // Acknowledged by the dispatcher before guards run: the cooldown (Redis) and
+  // DJ (Postgres) checks are remote, and deferring after them is what let the
+  // three-second window lapse and invalidate the interaction.
+  deferral: 'public',
 
   /**
    * Search-as-you-type suggestions. URLs pass through untouched (suggesting
@@ -131,8 +135,8 @@ export default defineCommand({
     const music = requireMusic(client);
     const context = requireVoiceContext(interaction);
 
-    // Resolution + join can exceed the 3s interaction budget.
-    await interaction.deferReply();
+    // Already acknowledged by the dispatcher (`deferral: 'public'`), so every
+    // response below is an editReply/followUp.
 
     const query = interaction.options.getString('query', true);
     const source = (interaction.options.getString('source') ?? 'youtube') as

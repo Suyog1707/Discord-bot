@@ -7,10 +7,17 @@
  * handling and safe error replies.
  */
 import { AppError, LIMITS, toAppError } from '@discord-music/shared';
-import { EmbedBuilder, Events, GuildMember, MessageFlags, type Interaction } from 'discord.js';
+import { EmbedBuilder, Events, GuildMember, MessageFlags } from 'discord.js';
 
 import { defineEvent } from '../core/event.js';
 import { runGuards } from '../core/guards.js';
+import {
+  acknowledge,
+  claimInteraction,
+  INSTANCE_ID,
+  rejectGuard,
+  replyWithError,
+} from '../core/interaction-response.js';
 import { FILTER_PRESETS, speedFilter, type FilterPresetName } from '../music/filters.js';
 import { fetchLyrics } from '../music/lyrics.js';
 import {
@@ -20,29 +27,6 @@ import {
   type MusicButtonAction,
 } from '../music/now-playing-view.js';
 import { formatTrackDuration, trackLink } from '../music/track.js';
-
-/**
- * Reply with an error, choosing the correct method for the interaction's state.
- *
- * Once an interaction has been replied to or deferred, `reply()` throws
- * `InteractionAlreadyReplied`; this picks `followUp`/`editReply` accordingly.
- */
-async function replyWithError(
-  interaction: Extract<Interaction, { replied: boolean }>,
-  message: string,
-): Promise<void> {
-  const payload = { content: message, flags: MessageFlags.Ephemeral } as const;
-
-  if (interaction.deferred) {
-    await interaction.editReply({ content: message });
-    return;
-  }
-  if (interaction.replied) {
-    await interaction.followUp(payload);
-    return;
-  }
-  await interaction.reply(payload);
-}
 
 export default defineEvent({
   name: Events.InteractionCreate,
@@ -104,9 +88,7 @@ export default defineEvent({
         selectLogger.info('Filter select applied');
       } catch (error) {
         selectLogger.error({ err: error }, 'Filter select failed');
-        await replyWithError(interaction, 'Changing the filter failed. Try again.').catch(
-          () => undefined,
-        );
+        await replyWithError(interaction, 'Changing the filter failed. Try again.', selectLogger);
       }
       return;
     }
@@ -239,65 +221,120 @@ export default defineEvent({
         buttonLogger.info('Music button applied');
       } catch (error) {
         buttonLogger.error({ err: error }, 'Music button failed');
-        await replyWithError(interaction, 'That control failed. Try again.').catch(() => undefined);
+        await replyWithError(interaction, 'That control failed. Try again.', buttonLogger);
       }
       return;
     }
 
     if (!interaction.isChatInputCommand()) return;
 
-    const command = client.commands.get(interaction.commandName);
-
-    if (!command) {
-      // Usually a stale registration — the command was removed but not redeployed.
-      logger.warn({ command: interaction.commandName }, 'Received unknown command');
-      await replyWithError(interaction, 'That command is no longer available.');
+    // Exactly one handler owns an interaction. A duplicate id means the same
+    // gateway event was delivered or dispatched twice — the second attempt
+    // could only ever fail with 40060/10062, so it is dropped and reported
+    // instead of being allowed to race the first.
+    if (!claimInteraction(interaction.id)) {
+      logger.error(
+        {
+          interactionId: interaction.id,
+          command: interaction.commandName,
+          instanceId: INSTANCE_ID,
+          pid: process.pid,
+        },
+        'Duplicate dispatch for the same interaction id — dropping. ' +
+          'This means duplicate listeners or a second bot process sharing the token.',
+      );
       return;
     }
+
+    const command = client.commands.get(interaction.commandName);
 
     const commandLogger = logger.child({
       command: interaction.commandName,
       guildId: interaction.guildId ?? undefined,
       userId: interaction.user.id,
+      interactionId: interaction.id,
     });
 
+    if (!command) {
+      // Usually a stale registration — the command was removed but not redeployed.
+      commandLogger.warn('Received unknown command');
+      await replyWithError(interaction, 'That command is no longer available.', commandLogger);
+      return;
+    }
+
     const startedAt = Date.now();
+    // How long the interaction had already been alive when it reached us. A
+    // value close to Discord's three-second budget is the signal that the
+    // acknowledgement is at risk, whatever the eventual outcome.
+    const receivedAgeMs = startedAt - interaction.createdTimestamp;
+
+    // Acknowledge first when the command asks for it: everything below this
+    // point (guards included) performs remote I/O.
+    if (command.deferral !== undefined) {
+      const alive = await acknowledge(interaction, command.deferral, commandLogger);
+      if (!alive) return;
+      commandLogger.debug(
+        { ackMs: Date.now() - startedAt, receivedAgeMs, deferral: command.deferral },
+        'Interaction acknowledged',
+      );
+    }
 
     // Guards cover guild-only, permissions, cooldowns and the DJ role.
+    const guardStartedAt = Date.now();
     try {
       const guard = await runGuards(client, command, interaction);
       if (!guard.allowed) {
-        await replyWithError(interaction, guard.message ?? 'You cannot use that right now.');
+        await rejectGuard(
+          interaction,
+          guard.message ?? 'You cannot use that right now.',
+          commandLogger,
+        );
         return;
       }
     } catch (error) {
       // A guard that *errors* (e.g. settings lookup with the DB down) must not
       // dead-end the interaction with silence.
       commandLogger.error({ err: error }, 'Guard evaluation failed');
-      await replyWithError(interaction, 'Something went wrong checking permissions. Try again.');
+      await replyWithError(
+        interaction,
+        'Something went wrong checking permissions. Try again.',
+        commandLogger,
+      );
       return;
     }
+    const guardMs = Date.now() - guardStartedAt;
 
     try {
       await command.execute({ interaction, logger: commandLogger });
-      commandLogger.info({ durationMs: Date.now() - startedAt }, 'Command executed');
+      commandLogger.info(
+        { durationMs: Date.now() - startedAt, guardMs, receivedAgeMs },
+        'Command executed',
+      );
     } catch (error) {
       const appError = toAppError(error);
 
       // Expected failures (bad input, not found) are warnings, not incidents.
       const level = appError.expected ? 'warn' : 'error';
-      commandLogger[level]({ err: appError, durationMs: Date.now() - startedAt }, 'Command failed');
+      commandLogger[level](
+        {
+          err: appError,
+          durationMs: Date.now() - startedAt,
+          guardMs,
+          receivedAgeMs,
+          acknowledged: interaction.deferred || interaction.replied,
+        },
+        'Command failed',
+      );
 
-      try {
-        await replyWithError(
-          interaction,
-          appError instanceof AppError && appError.expected
-            ? appError.message
-            : 'Something went wrong while running that command. Please try again.',
-        );
-      } catch (replyError) {
-        commandLogger.error({ err: replyError }, 'Failed to send error reply');
-      }
+      // replyWithError never throws: a dead interaction is logged and dropped
+      // rather than retried into a second Unknown interaction.
+      await replyWithError(
+        interaction,
+        appError instanceof AppError && appError.expected
+          ? appError.message
+          : 'Something went wrong while running that command. Please try again.',
+        commandLogger,
+      );
     }
   },
 });

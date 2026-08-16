@@ -92,15 +92,9 @@ export class GuildService {
         },
       });
 
-      logger.info(
-        { guildId: discordGuildId },
-        'Guild marked inactive',
-      );
+      logger.info({ guildId: discordGuildId }, 'Guild marked inactive');
     } catch {
-      logger.warn(
-        { guildId: discordGuildId },
-        'Guild left but no row existed',
-      );
+      logger.warn({ guildId: discordGuildId }, 'Guild left but no row existed');
     }
   }
 
@@ -136,6 +130,49 @@ export class GuildService {
   /** Drop the cached settings for a guild (after any write). */
   invalidateSettings(discordGuildId: string): void {
     this.#settingsCache.delete(discordGuildId);
+  }
+
+  /**
+   * Settings for a path that must not block Discord's acknowledgement window.
+   *
+   * A known guild answers from cache immediately — even past the TTL, with the
+   * refresh continuing in the background — because a slightly stale DJ role is
+   * far better than an interaction invalidated by a slow database. A guild with
+   * nothing cached races the read against `timeoutMs` and reports `null` if
+   * Postgres did not answer in time, leaving the decision to the caller.
+   */
+  async getSettingsWithin(
+    discordGuildId: string,
+    timeoutMs: number,
+  ): Promise<GuildSettings | null> {
+    const cached = this.#settingsCache.get(discordGuildId);
+    if (cached !== undefined) {
+      if (cached.expiresAt <= Date.now()) {
+        // Expired: serve the stale value now, refresh for the next caller.
+        void this.getSettings(discordGuildId).catch((error: unknown) => {
+          logger.warn(
+            { err: error, guildId: discordGuildId },
+            'Background settings refresh failed',
+          );
+        });
+      }
+      return cached.value;
+    }
+
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        this.getSettings(discordGuildId),
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => {
+            resolve(null);
+          }, timeoutMs);
+          timer.unref();
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
   async #loadSettings(discordGuildId: string): Promise<GuildSettings> {
