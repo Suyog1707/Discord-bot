@@ -20,7 +20,13 @@ import type { RecentContext, TasteProfile } from './taste.js';
 
 /** Where a candidate came from. Affects how much its raw match score is trusted. */
 export type CandidateOrigin =
-  'similar-track' | 'similar-artist' | 'tag-chart' | 'youtube-mix' | 'history';
+  | 'similar-track'
+  | 'similar-artist'
+  | 'taste-artist'
+  | 'discovery'
+  | 'tag-chart'
+  | 'youtube-mix'
+  | 'history';
 
 export interface Candidate {
   readonly title: string;
@@ -106,6 +112,13 @@ export interface ScoredCandidate {
 const ORIGIN_TRUST: Readonly<Record<CandidateOrigin, number>> = {
   'similar-track': 1,
   'similar-artist': 0.75,
+  // A favourite artist's catalogue: strong prior on taste, no claim about
+  // similarity to what is playing — the affinity signal carries the rest.
+  'taste-artist': 0.7,
+  // Neighbours of favourites the listener has never played. Trust is lowest of
+  // the personalised sources by design: discovery earns its place through the
+  // sequence selector's dedicated slots, not by outranking known-good picks.
+  discovery: 0.6,
   'youtube-mix': 0.8,
   'tag-chart': 0.5,
   history: 0.6,

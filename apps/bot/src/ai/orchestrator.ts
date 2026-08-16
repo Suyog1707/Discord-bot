@@ -26,7 +26,13 @@ import type { CacheService } from './cache.js';
 import { type IntentService, type MusicIntent, musicIntentSchema } from './intent.js';
 import type { LastFmService } from './lastfm.js';
 import type { MusicBrainzService } from './musicbrainz.js';
-import type { RecommendationService, TrackResolver, TrackSeed } from './recommender.js';
+import type {
+  RecommendationExclusions,
+  RecommendationService,
+  SessionContext,
+  TrackResolver,
+  TrackSeed,
+} from './recommender.js';
 import type { UserTasteService } from './taste.js';
 
 const logger = getLogger('orchestrator');
@@ -152,10 +158,20 @@ export class MusicOrchestrator {
       readonly seeds: readonly TrackSeed[];
       readonly count: number;
       readonly intent?: MusicIntent;
+      /** Hard exclusions — playing, queued, reserved, recent. See recommender. */
+      readonly exclusions?: RecommendationExclusions;
+      /** Live session signals (fatigue, recent artists). */
+      readonly session?: SessionContext;
+      /** Allow the background LLM rerank pass. */
+      readonly allowRerank?: boolean;
+      /** Atomic reservation hook, from the session store. */
+      readonly reserve?: (keys: readonly string[]) => Promise<ReadonlySet<string>>;
     },
     resolve?: TrackResolver,
   ): Promise<{
     readonly tracks: readonly QueuedTrack[];
+    readonly resolved: readonly { readonly track: QueuedTrack; readonly trackKey: string }[];
+    readonly blockedCount: number;
     readonly timings: Readonly<Record<string, number>>;
     readonly strategies: readonly string[];
   }> {
@@ -167,11 +183,12 @@ export class MusicOrchestrator {
     const profileStart = Date.now();
     // The guild profile is what a room listens to; a personal profile only
     // applies when one user asked for something for themselves.
-    const [profile, recent] = await Promise.all([
+    const [profile, recent, favourites] = await Promise.all([
       this.#services.taste.profile(
         request.userId === undefined ? { guildId: request.guildId } : { userId: request.userId },
       ),
       this.#services.taste.recentContext(request.guildId),
+      this.#services.taste.favouriteTracks(request.guildId),
     ]);
     const profileMs = Date.now() - profileStart;
 
@@ -182,12 +199,19 @@ export class MusicOrchestrator {
         profile,
         recent,
         ...(request.intent === undefined ? {} : { intent: request.intent }),
+        ...(favourites.length === 0 ? {} : { historyCandidates: favourites }),
+        ...(request.exclusions === undefined ? {} : { exclusions: request.exclusions }),
+        ...(request.session === undefined ? {} : { session: request.session }),
+        ...(request.allowRerank === undefined ? {} : { allowRerank: request.allowRerank }),
+        ...(request.reserve === undefined ? {} : { reserve: request.reserve }),
       },
       resolver,
     );
 
     return {
       tracks: result.tracks,
+      resolved: result.resolved,
+      blockedCount: result.blockedCount,
       strategies: result.strategies,
       timings: { profileMs, ...result.timings },
     };

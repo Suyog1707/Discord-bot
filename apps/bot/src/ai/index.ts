@@ -22,6 +22,8 @@ import { type LLMProvider, NULL_PROVIDER } from './llm/provider.js';
 import { MusicBrainzService } from './musicbrainz.js';
 import { MusicOrchestrator } from './orchestrator.js';
 import { RecommendationService } from './recommender.js';
+import { ShortlistReranker } from './rerank.js';
+import { AutoplaySessionStore } from './session.js';
 import { UserTasteService } from './taste.js';
 
 const logger = getLogger('ai');
@@ -30,6 +32,8 @@ export interface AiStack {
   readonly orchestrator: MusicOrchestrator;
   readonly autoplay: AutoplayEngine;
   readonly cache: CacheService;
+  /** Per-guild played/queued/reserved state; the anti-repeat ledger. */
+  readonly session: AutoplaySessionStore;
 }
 
 export function createAiStack(options: {
@@ -53,10 +57,15 @@ export function createAiStack(options: {
   const lastfm = new LastFmService(cache, env.LASTFM_API_KEY);
   const musicbrainz = new MusicBrainzService(cache, env.MUSICBRAINZ_ENABLED);
   const taste = new UserTasteService(prisma, cache, lastfm, musicbrainz);
-  const recommender = new RecommendationService(lastfm, cache, {
-    poolSize: env.RECOMMENDATION_POOL_SIZE,
-    concurrency: env.RECOMMENDATION_CONCURRENCY,
-  });
+  const recommender = new RecommendationService(
+    lastfm,
+    cache,
+    {
+      poolSize: env.RECOMMENDATION_POOL_SIZE,
+      concurrency: env.RECOMMENDATION_CONCURRENCY,
+    },
+    new ShortlistReranker(llm),
+  );
 
   const orchestrator = new MusicOrchestrator({
     intent: new IntentService(llm),
@@ -67,7 +76,8 @@ export function createAiStack(options: {
     cache,
   });
 
-  const autoplay = new AutoplayEngine(orchestrator, {
+  const session = new AutoplaySessionStore(redis === undefined ? {} : { redis });
+  const autoplay = new AutoplayEngine(orchestrator, session, {
     prefetchSize: env.AUTOPLAY_PREFETCH_SIZE,
   });
 
@@ -81,8 +91,10 @@ export function createAiStack(options: {
     'Recommendation stack ready',
   );
 
-  return { orchestrator, autoplay, cache };
+  return { orchestrator, autoplay, cache, session };
 }
 
 export { AutoplayEngine, CacheService, MusicOrchestrator };
+export { AutoplaySessionStore } from './session.js';
+export type { SessionEntry } from './session.js';
 export type { MusicIntent } from './intent.js';

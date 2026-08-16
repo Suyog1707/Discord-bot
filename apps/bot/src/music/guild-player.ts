@@ -78,10 +78,22 @@ export interface GuildPlayerOptions {
    */
   readonly onAutoplayRequest: (guildId: string) => Promise<readonly QueuedTrack[]>;
   /**
-   * Called when a track starts, so the next autoplay batch can be prepared
-   * while it plays. Must return immediately — the playback path never waits.
+   * Called when a track starts — EVERY track, not only with autoplay on: the
+   * session ledger must see manual plays too, or the anti-repeat window has
+   * holes exactly where the listener was most engaged. Must return
+   * immediately — the playback path never waits.
    */
   readonly onTrackStarted?: (guildId: string, track: QueuedTrack) => void;
+  /**
+   * Called when a track finishes or is skipped, with how much of it actually
+   * played. This is where recommendation outcomes (completed/skipped) come
+   * from. Must return immediately.
+   */
+  readonly onTrackFinished?: (
+    guildId: string,
+    track: QueuedTrack,
+    outcome: { readonly skipped: boolean; readonly playedMs: number },
+  ) => void;
   /**
    * Find the same recording on a source other than the one that just refused to
    * play it. Returns null when nothing equivalent exists.
@@ -123,6 +135,13 @@ export class GuildPlayer {
   #activeFilter: FilterPresetName | 'speed' | 'pitch' | null = null;
   readonly #onAutoplayRequest: (guildId: string) => Promise<readonly QueuedTrack[]>;
   readonly #onTrackStarted: ((guildId: string, track: QueuedTrack) => void) | undefined;
+  readonly #onTrackFinished:
+    | ((
+        guildId: string,
+        track: QueuedTrack,
+        outcome: { readonly skipped: boolean; readonly playedMs: number },
+      ) => void)
+    | undefined;
   readonly #onFindAlternative:
     ((track: QueuedTrack, failedSource: MusicSource) => Promise<QueuedTrack | null>) | undefined;
   readonly #onResolveLinks: ((track: QueuedTrack) => Promise<PlatformLinks>) | undefined;
@@ -160,6 +179,7 @@ export class GuildPlayer {
     this.#onSelfDestruct = options.onSelfDestruct;
     this.#onAutoplayRequest = options.onAutoplayRequest;
     this.#onTrackStarted = options.onTrackStarted;
+    this.#onTrackFinished = options.onTrackFinished;
     this.#onFindAlternative = options.onFindAlternative;
     this.#onResolveLinks = options.onResolveLinks;
     this.#onEvent = options.onEvent;
@@ -437,7 +457,7 @@ export class GuildPlayer {
       // Generating a recommendation takes a candidate sweep and a search, so
       // doing it only once the queue drains is heard as a gap of silence.
       // Fire-and-forget by construction — nothing here is awaited.
-      if (this.#autoplayEnabled) this.#onTrackStarted?.(this.guildId, track);
+      this.#onTrackStarted?.(this.guildId, track);
     });
 
     this.#player.on('end', (event) => {
@@ -513,12 +533,17 @@ export class GuildPlayer {
       finished !== null &&
       (reason === 'finished' || reason === 'stopped' || reason === 'loadFailed')
     ) {
+      const playedMs = this.#trackStartedAt > 0 ? Date.now() - this.#trackStartedAt : 0;
       historyWrite = this.#store
         .recordHistory(this.guildId, finished, {
-          playedMs: this.#trackStartedAt > 0 ? Date.now() - this.#trackStartedAt : 0,
+          playedMs,
           skipped: reason === 'stopped',
         })
         .catch(() => undefined);
+      this.#onTrackFinished?.(this.guildId, finished, {
+        skipped: reason === 'stopped' && this.#skipRequested,
+        playedMs,
+      });
     }
 
     // 'replaced' means we started another track ourselves; nothing to advance.

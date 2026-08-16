@@ -24,9 +24,11 @@ import { getLogger } from '../lib/logger.js';
 import type { QueuedTrack } from '../music/track.js';
 
 import type { CacheService } from './cache.js';
+import { identityOf, trackKeyOf } from './identity.js';
 import type { MusicIntent } from './intent.js';
 import type { LastFmService } from './lastfm.js';
 import { normaliseArtist, primaryArtist } from './musicbrainz.js';
+import type { RerankContext, ShortlistReranker } from './rerank.js';
 import {
   type Candidate,
   type ScoredCandidate,
@@ -35,6 +37,7 @@ import {
   explainScore,
   scoreCandidate,
   selectDiverse,
+  selectSequence,
 } from './scoring.js';
 import type { RecentContext, TasteProfile } from './taste.js';
 
@@ -50,11 +53,44 @@ const MAX_SEEDS = 4;
 const MAX_TAG_LOOKUPS = 60;
 /** Shortlist size as a multiple of the request, so diversity has room to choose. */
 const SHORTLIST_FACTOR = 3;
+/** Shortlist floor: a 5-track autoplay batch still deserves a real choice. */
+const MIN_SHORTLIST = 40;
+/**
+ * Ceiling on how much the LLM's opinion can move a score. Enough to reorder
+ * near-ties, never enough to overturn the deterministic ranking outright.
+ */
+const RERANK_BONUS = 0.08;
 
 export interface TrackSeed {
   readonly title: string;
   readonly artist: string;
   readonly identifier?: string;
+}
+
+/**
+ * The hard exclusion layer. Anything here is REMOVED from the pipeline — never
+ * merely down-scored. A recently played song with a brilliant score is still a
+ * recently played song, and letting scoring arbitrate that is exactly how the
+ * repeated-song bug survived: the rule must be structural, not statistical.
+ */
+export interface RecommendationExclusions {
+  /** Canonical track keys: playing now, queued, reserved, recently played. */
+  readonly trackKeys: ReadonlySet<string>;
+  /** Provider identifiers for the same set, catching cross-vocabulary slips. */
+  readonly identifiers: ReadonlySet<string>;
+}
+
+const EMPTY_EXCLUSIONS: RecommendationExclusions = {
+  trackKeys: new Set<string>(),
+  identifiers: new Set<string>(),
+};
+
+/** Live session signals, distinct from the long-term profile. */
+export interface SessionContext {
+  /** Artist keys played this session, newest first. */
+  readonly recentArtists: readonly string[];
+  /** Adaptive per-artist fatigue, 0..1. */
+  readonly artistFatigue: ReadonlyMap<string, number>;
 }
 
 export interface RecommendationRequest {
@@ -63,6 +99,28 @@ export interface RecommendationRequest {
   readonly profile: TasteProfile;
   readonly recent: RecentContext;
   readonly intent?: MusicIntent;
+  readonly exclusions?: RecommendationExclusions;
+  readonly session?: SessionContext;
+  /**
+   * Loved-and-rested songs from play history (the `history` origin). Supplied
+   * by the caller because history lives behind the taste service, not here.
+   */
+  readonly historyCandidates?: readonly {
+    readonly title: string;
+    readonly artist: string;
+    readonly identifier: string;
+  }[];
+  /**
+   * Allow one LLM rerank pass over the shortlist. Only the background prefetch
+   * path sets this — the synchronous playback path must never wait on a model.
+   */
+  readonly allowRerank?: boolean;
+  /**
+   * Atomically reserve selected candidates before resolution. Returns the keys
+   * this caller won; picks that lost the race are dropped, which is what stops
+   * two concurrent generation passes queueing the same song.
+   */
+  readonly reserve?: (keys: readonly string[]) => Promise<ReadonlySet<string>>;
 }
 
 /** Per-stage timings, in milliseconds. Logged at debug; never shown to users. */
@@ -76,9 +134,21 @@ export interface RecommendationTimings {
 
 export interface RecommendationResult {
   readonly tracks: readonly QueuedTrack[];
+  /** Each resolved track paired with the candidate key it was reserved under. */
+  readonly resolved: readonly { readonly track: QueuedTrack; readonly trackKey: string }[];
   /** Ranked picks, including the score breakdown behind each one. */
   readonly picks: readonly ScoredCandidate[];
   readonly candidateCount: number;
+  /** Candidates removed by the hard exclusion layer before ranking. */
+  readonly excludedCount: number;
+  /**
+   * Duplicates caught AFTER resolution — picks whose resolved upload turned
+   * out to be something already playing, queued or recently played. This is
+   * the near-miss counter behind duplicate_recommendation_rate.
+   */
+  readonly blockedCount: number;
+  /** Whether the LLM reranker actually contributed to the ordering. */
+  readonly reranked: boolean;
   readonly timings: RecommendationTimings;
   /** Which generation strategies contributed, for diagnosis. */
   readonly strategies: readonly string[];
@@ -112,15 +182,18 @@ export class RecommendationService {
   readonly #lastfm: LastFmService;
   readonly #cache: CacheService;
   readonly #tuning: RecommendationTuning;
+  readonly #reranker: ShortlistReranker | undefined;
 
   constructor(
     lastfm: LastFmService,
     cache: CacheService,
     tuning: RecommendationTuning = DEFAULT_TUNING,
+    reranker?: ShortlistReranker,
   ) {
     this.#lastfm = lastfm;
     this.#cache = cache;
     this.#tuning = tuning;
+    this.#reranker = reranker;
   }
 
   /**
@@ -134,16 +207,32 @@ export class RecommendationService {
     resolve: TrackResolver,
   ): Promise<RecommendationResult> {
     const startedAt = Date.now();
+    const exclusions = request.exclusions ?? EMPTY_EXCLUSIONS;
+    logger.debug(
+      {
+        event: 'AUTOPLAY_RECOMMENDATION_STARTED',
+        requested: request.count,
+        excludedKeys: exclusions.trackKeys.size,
+      },
+      'Recommendation started',
+    );
 
     const candidateStart = Date.now();
-    const { candidates, strategies } = await this.#generateCandidates(request);
+    const { candidates, strategies, excludedCount } = await this.#generateCandidates(
+      request,
+      exclusions,
+    );
     const candidateMs = Date.now() - candidateStart;
 
     if (candidates.length === 0) {
       return {
         tracks: [],
+        resolved: [],
         picks: [],
         candidateCount: 0,
+        excludedCount,
+        blockedCount: 0,
+        reranked: false,
         strategies,
         timings: {
           candidateMs,
@@ -162,7 +251,12 @@ export class RecommendationService {
     const roughlyRanked = candidates
       .map((candidate) => scoreCandidate(candidate, context))
       .sort((a, b) => b.breakdown.final - a.breakdown.final);
-    const shortlist = roughlyRanked.slice(0, request.count * SHORTLIST_FACTOR);
+    // A floor on the shortlist keeps small requests from starving the
+    // diversity and rerank stages of choice.
+    const shortlist = roughlyRanked.slice(
+      0,
+      Math.max(request.count * SHORTLIST_FACTOR, MIN_SHORTLIST),
+    );
     const scoreMs = Date.now() - scoreStart;
 
     // Pass two: tags for the shortlist's artists only.
@@ -170,13 +264,79 @@ export class RecommendationService {
     const tagged = await this.#enrichWithTags(shortlist.map((entry) => entry.candidate));
     const enrichMs = Date.now() - enrichStart;
 
-    const finalRanked = tagged.map((candidate) => scoreCandidate(candidate, context));
-    const picks = selectDiverse(finalRanked, request.count, {
-      enforceArtistDiversity: request.intent?.artistDiversity ?? true,
-    });
+    let finalRanked = tagged
+      .map((candidate) => scoreCandidate(candidate, context))
+      .sort((a, b) => b.breakdown.final - a.breakdown.final);
+
+    // Optional LLM pass. It sees an already-filtered list and returns indices,
+    // so it can suggest ordering but structurally cannot introduce a song. Its
+    // opinion lands as a bounded bonus, not a veto over the deterministic
+    // scores — and any failure leaves the ranking exactly as it was.
+    let reranked = false;
+    if (request.allowRerank === true && this.#reranker !== undefined) {
+      const permutation = await this.#reranker.rerank(
+        finalRanked.map((entry) => ({
+          title: entry.candidate.title,
+          artist: entry.candidate.artist,
+          score: entry.breakdown.final,
+          ...(entry.candidate.tags === undefined ? {} : { tags: entry.candidate.tags }),
+        })),
+        this.#rerankContext(request),
+      );
+      if (permutation !== null) {
+        reranked = true;
+        const bonusFor = new Map<number, number>();
+        permutation.forEach((originalIndex, rank) => {
+          bonusFor.set(originalIndex, RERANK_BONUS * (1 - rank / permutation.length));
+        });
+        finalRanked = finalRanked.map((entry, index) => {
+          const bonus = bonusFor.get(index) ?? 0;
+          return bonus === 0
+            ? entry
+            : {
+                ...entry,
+                breakdown: {
+                  ...entry.breakdown,
+                  final: Math.min(1, entry.breakdown.final + bonus),
+                },
+              };
+        });
+      }
+    }
+
+    // Session requests get the sequence-aware selector; one-shot requests
+    // (/ask playlists) keep the simpler per-batch diversity cap.
+    const session = request.session;
+    const picks =
+      session === undefined
+        ? selectDiverse(finalRanked, request.count, {
+            enforceArtistDiversity: request.intent?.artistDiversity ?? true,
+          })
+        : selectSequence(finalRanked, request.count, {
+            artistFatigue: session.artistFatigue,
+            knownArtists: new Set(Object.keys(request.profile.artistAffinity)),
+          });
+
+    // Reserve before resolving: a pick that loses the race to a concurrent
+    // generation pass is dropped here, never resolved, never queued twice.
+    let reservedPicks = picks;
+    if (request.reserve !== undefined && picks.length > 0) {
+      const granted = await request.reserve(picks.map((pick) => pick.trackKey));
+      reservedPicks = picks.filter((pick) => granted.has(pick.trackKey));
+      if (reservedPicks.length < picks.length) {
+        logger.debug(
+          {
+            event: 'RECOMMENDATION_RESERVED',
+            requested: picks.length,
+            granted: reservedPicks.length,
+          },
+          'Reservation dropped contested picks',
+        );
+      }
+    }
 
     const resolveStart = Date.now();
-    const tracks = await this.#resolveAll(picks, resolve);
+    const { resolved, blocked } = await this.#resolveAll(reservedPicks, resolve, exclusions);
     const resolveMs = Date.now() - resolveStart;
 
     const timings: RecommendationTimings = {
@@ -189,10 +349,13 @@ export class RecommendationService {
 
     logger.debug(
       {
+        event: 'CANDIDATES_FILTERED',
         requested: request.count,
         candidates: candidates.length,
-        picked: picks.length,
-        resolved: tracks.length,
+        excluded: excludedCount + blocked,
+        picked: reservedPicks.length,
+        resolved: resolved.length,
+        reranked,
         strategies,
         ...timings,
       },
@@ -202,7 +365,7 @@ export class RecommendationService {
     // The audit trail for "why was this song recommended?". Trace level because
     // it is one line per track and would drown a production log.
     if (logger.isLevelEnabled('trace')) {
-      for (const pick of picks.slice(0, 10)) {
+      for (const pick of reservedPicks.slice(0, 10)) {
         logger.trace(
           { track: `${pick.candidate.artist} — ${pick.candidate.title}` },
           explainScore(pick),
@@ -210,7 +373,33 @@ export class RecommendationService {
       }
     }
 
-    return { tracks, picks, candidateCount: candidates.length, timings, strategies };
+    return {
+      tracks: resolved.map((entry) => entry.track),
+      resolved,
+      picks: reservedPicks,
+      candidateCount: candidates.length,
+      excludedCount,
+      blockedCount: blocked,
+      reranked,
+      timings,
+      strategies,
+    };
+  }
+
+  #rerankContext(request: RecommendationRequest): RerankContext {
+    const topOf = (record: Readonly<Record<string, number>>, take: number): string[] =>
+      Object.entries(record)
+        .filter(([, value]) => value > 0)
+        .sort(([, a], [, b]) => b - a)
+        .slice(0, take)
+        .map(([name]) => name);
+
+    return {
+      topArtists: topOf(request.profile.artistAffinity, 5),
+      topTags: topOf(request.profile.tagAffinity, 5),
+      recentTitles: request.recent.titles.slice(0, 6),
+      discoveryLevel: 0.15,
+    };
   }
 
   #scoringContext(request: RecommendationRequest): ScoringContext {
@@ -231,6 +420,9 @@ export class RecommendationService {
         normaliseArtist(primaryArtist(artist)),
       ),
       ...(intent === undefined ? {} : { avoidRecent: intent.avoidRecent }),
+      ...(request.session === undefined
+        ? {}
+        : { artistFatigue: request.session.artistFatigue }),
     };
   }
 
@@ -241,19 +433,41 @@ export class RecommendationService {
    * cache-fronted API, and running them in series would make the pool the
    * slowest part of the pipeline for no reason.
    */
-  async #generateCandidates(request: RecommendationRequest): Promise<{
+  async #generateCandidates(
+    request: RecommendationRequest,
+    exclusions: RecommendationExclusions,
+  ): Promise<{
     candidates: readonly Candidate[];
     strategies: readonly string[];
+    excludedCount: number;
   }> {
     const poolLimit = this.#tuning.poolSize;
     const seeds = request.seeds.slice(0, MAX_SEEDS);
     const intent = request.intent;
     const strategies: string[] = [];
 
+    // Loved-and-rested history joins the pool directly — no lookup needed, the
+    // caller already vetted completion and cooldown. It is also the one source
+    // that works with no Last.fm key at all.
+    const historyGroup: readonly Candidate[] = (request.historyCandidates ?? []).map(
+      (song): Candidate => ({
+        title: song.title,
+        artist: song.artist,
+        origin: 'history',
+        match: 0.5,
+        identifier: song.identifier,
+      }),
+    );
+    if (historyGroup.length > 0) strategies.push('history');
+
     if (!this.#lastfm.enabled) {
-      // No discovery source. The caller's own fallback (YouTube mixes) takes
-      // over — this is not an error, just a thinner pipeline.
-      return { candidates: [], strategies: ['lastfm-disabled'] };
+      strategies.push('lastfm-disabled');
+      if (historyGroup.length === 0) {
+        // No discovery source and no resurfaceable history. The caller's own
+        // fallback (YouTube mixes) takes over — this is not an error, just a
+        // thinner pipeline.
+        return { candidates: [], strategies, excludedCount: 0 };
+      }
     }
 
     const tasks: Promise<readonly Candidate[]>[] = [];
@@ -304,13 +518,86 @@ export class RecommendationService {
     }
     if (seeds.length > 0) strategies.push('similar-artists');
 
+    // The taste profile as a candidate SOURCE, not just a re-ranker. Without
+    // this the pool is pure current-song similarity, and autoplay orbits
+    // whatever happens to be playing instead of the person listening. Sorted
+    // by affinity so it is the listener's actual favourites that expand.
+    const profileArtists = Object.entries(request.profile.artistAffinity)
+      .filter(([, affinity]) => affinity > 0)
+      .sort(([, a], [, b]) => b - a)
+      .map(([artist]) => artist);
+
+    for (const artist of profileArtists.slice(0, 6)) {
+      tasks.push(
+        this.#lastfm
+          .artistTopTracks(artist, 12)
+          .then((tracks) =>
+            tracks.map(
+              (track): Candidate => ({
+                title: track.name,
+                artist: track.artist,
+                origin: 'taste-artist',
+                match: track.match,
+              }),
+            ),
+          )
+          .catch(() => []),
+      );
+    }
+    if (profileArtists.length > 0) strategies.push('taste-artists');
+
+    // Discovery: neighbours of favourites the listener has never played.
+    // Semantic taste neighbourhood, not randomness — Frank Ocean for a Weeknd
+    // listener, never a random classical track.
+    const knownArtists = new Set(Object.keys(request.profile.artistAffinity));
+    for (const artist of profileArtists.slice(0, 2)) {
+      tasks.push(
+        this.#lastfm
+          .similarArtists(artist, 12)
+          .then(async (similar) => {
+            const fresh = similar
+              .filter((neighbour) => !knownArtists.has(normaliseArtist(neighbour.name)))
+              .slice(0, 4);
+            const perArtist = await Promise.all(
+              fresh.map(async (neighbour) => {
+                const tracks = await this.#lastfm
+                  .artistTopTracks(neighbour.name, 6)
+                  .catch(() => []);
+                return tracks.map(
+                  (track): Candidate => ({
+                    title: track.name,
+                    artist: track.artist,
+                    origin: 'discovery',
+                    match: track.match * neighbour.match,
+                  }),
+                );
+              }),
+            );
+            return perArtist.flat();
+          })
+          .catch(() => []),
+      );
+    }
+    if (profileArtists.length > 0) strategies.push('discovery');
+
     // Tag charts turn a mood or genre from the request into real songs, without
-    // the model ever naming one.
+    // the model ever naming one. When the request carries no tags (autoplay's
+    // continuation intent never does), the profile's own top tags anchor the
+    // pool to the listener's genres instead of contributing nothing.
     const requestedTags = [...(intent?.mood ?? []), ...(intent?.genre ?? [])];
+    const profileTags =
+      requestedTags.length > 0
+        ? []
+        : Object.entries(request.profile.tagAffinity)
+            .filter(([, affinity]) => affinity > 0)
+            .sort(([, a], [, b]) => b - a)
+            .slice(0, 2)
+            .map(([tag]) => tag);
     const languageTag = intent?.language;
     const tagQueries = [
       ...new Set([
         ...requestedTags,
+        ...profileTags,
         ...(languageTag === null || languageTag === undefined ? [] : [languageTag]),
       ]),
     ];
@@ -336,13 +623,25 @@ export class RecommendationService {
 
     const groups = await Promise.all(tasks);
 
-    // Dedupe by normalised artist+title, keeping the strongest evidence for each
-    // track: the same song arriving from three sources should be scored on its
-    // best claim, not its last.
+    // Seeds must never recommend themselves: the pool is largely built FROM
+    // them, and "the song that is playing right now" is the most jarring
+    // repeat of all.
+    const seedKeys = new Set(seeds.map((seed) => trackKeyOf(seed.artist, seed.title)));
+
+    // Dedupe on the CANONICAL key — the same identity used by scoring, history
+    // and the session store. Using a different key here (raw lowercase titles,
+    // as this once did) let "Song" and "Song (Official Video)" survive as two
+    // candidates that resolved to the same upload. Hard exclusions apply in
+    // the same pass: excluded songs are REMOVED, never merely down-scored.
+    let excludedCount = 0;
     const byKey = new Map<string, Candidate>();
-    for (const group of groups) {
+    for (const group of [...groups, historyGroup]) {
       for (const candidate of group) {
-        const key = `${normaliseArtist(primaryArtist(candidate.artist))}::${candidate.title.toLowerCase()}`;
+        const key = trackKeyOf(candidate.artist, candidate.title);
+        if (exclusions.trackKeys.has(key) || seedKeys.has(key)) {
+          excludedCount += 1;
+          continue;
+        }
         const existing = byKey.get(key);
         if (existing === undefined) {
           byKey.set(key, candidate);
@@ -370,7 +669,16 @@ export class RecommendationService {
       .filter((candidate) => !excluded.has(normaliseArtist(primaryArtist(candidate.artist))))
       .slice(0, poolLimit);
 
-    return { candidates, strategies };
+    logger.debug(
+      {
+        event: 'CANDIDATES_GENERATED',
+        pool: candidates.length,
+        excluded: excludedCount,
+        strategies,
+      },
+      'Candidate pool built',
+    );
+    return { candidates, strategies, excludedCount };
   }
 
   /**
@@ -422,17 +730,24 @@ export class RecommendationService {
   async #resolveAll(
     picks: readonly ScoredCandidate[],
     resolve: TrackResolver,
-  ): Promise<readonly QueuedTrack[]> {
+    exclusions: RecommendationExclusions,
+  ): Promise<{
+    resolved: readonly { readonly track: QueuedTrack; readonly trackKey: string }[];
+    blocked: number;
+  }> {
     const batchSize = Math.max(1, this.#tuning.concurrency);
-    const resolved: QueuedTrack[] = [];
-    const seen = new Set<string>();
+    const resolved: { track: QueuedTrack; trackKey: string }[] = [];
+    const seenIdentifiers = new Set<string>();
+    const seenKeys = new Set<string>();
+    let blocked = 0;
 
     for (let offset = 0; offset < picks.length; offset += batchSize) {
       const batch = picks.slice(offset, offset + batchSize);
       const results = await Promise.all(
         batch.map(async (pick) => {
           try {
-            return await resolve(pick.candidate);
+            const track = await resolve(pick.candidate);
+            return track === null ? null : { track, pick };
           } catch (error) {
             // One unresolvable candidate must never sink the batch.
             logger.debug(
@@ -444,15 +759,40 @@ export class RecommendationService {
         }),
       );
 
-      for (const track of results) {
-        // Two candidates can resolve to the same upload; the queue should not
-        // hold it twice just because Last.fm listed it under two names.
-        if (track === null || seen.has(track.identifier)) continue;
-        seen.add(track.identifier);
-        resolved.push(track);
+      for (const entry of results) {
+        if (entry === null) continue;
+        const { track, pick } = entry;
+        // The resolved upload has its own vocabulary ("Song (Official Video)"
+        // by "Artist - Topic"), so its identity is checked AGAIN here: two
+        // different candidates can resolve to the same video, and a resolved
+        // track can turn out to be something the queue or history already
+        // holds even though the candidate key looked fresh.
+        const resolvedKey = identityOf(track.author, track.title).key;
+        if (
+          seenIdentifiers.has(track.identifier) ||
+          seenKeys.has(resolvedKey) ||
+          seenKeys.has(pick.trackKey) ||
+          exclusions.identifiers.has(track.identifier) ||
+          exclusions.trackKeys.has(resolvedKey)
+        ) {
+          blocked += 1;
+          logger.debug(
+            {
+              event: 'CANDIDATE_EXCLUDED',
+              track: `${track.author} — ${track.title}`,
+              identifier: track.identifier,
+            },
+            'Post-resolution duplicate blocked',
+          );
+          continue;
+        }
+        seenIdentifiers.add(track.identifier);
+        seenKeys.add(resolvedKey);
+        seenKeys.add(pick.trackKey);
+        resolved.push({ track, trackKey: pick.trackKey });
       }
     }
 
-    return resolved;
+    return { resolved, blocked };
   }
 }

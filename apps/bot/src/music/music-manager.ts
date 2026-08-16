@@ -29,7 +29,9 @@ import {
 } from 'shoukaku';
 
 import type { AutoplayEngine } from '../ai/autoplay.js';
+import { identityOf } from '../ai/identity.js';
 import type { MusicOrchestrator } from '../ai/orchestrator.js';
+import type { AutoplaySessionStore, SessionEntry } from '../ai/session.js';
 import type { LavalinkNode } from '../config/env.js';
 import { getEnv } from '../config/env.js';
 import { getLogger } from '../lib/logger.js';
@@ -126,6 +128,8 @@ export class MusicManager {
    * Undefined leaves autoplay on its original YouTube-mix behaviour.
    */
   #autoplay: AutoplayEngine | undefined;
+  /** The engine's session store — played/queued/reserved state per guild. */
+  #autoplaySession: AutoplaySessionStore | undefined;
 
   readonly #publishEvent: ((payload: string) => void) | undefined;
   readonly #controllers = new Map<string, ControllerMessage>();
@@ -360,16 +364,61 @@ export class MusicManager {
         await this.destroyPlayer(guildId);
       },
       onAutoplayRequest: (guildId) => this.pickAutoplayTracks(guildId),
-      // Warm the buffer from the track that just started, so the next autoplay
-      // top-up is a map lookup rather than a full generation pass.
+      // A track actually started: this is the moment it becomes "recently
+      // played" in the session ledger (recommended ≠ played — only real
+      // playback events move this state), and the moment to warm the buffer
+      // so the next top-up is a map lookup rather than a generation pass.
       onTrackStarted: (guildId, track) => {
+        const session = this.#autoplaySession;
+        if (session !== undefined) {
+          void session.recordPlayed(guildId, this.#sessionEntryOf(track)).catch(() => undefined);
+          if (track.requestedByName === 'Autoplay') {
+            void session.recordOutcome(guildId, 'played').catch(() => undefined);
+            logger.debug(
+              { event: 'RECOMMENDATION_PLAYED', guildId, track: track.title },
+              'Autoplay pick started',
+            );
+          }
+        }
         this.#autoplay?.prefetch(guildId, [
           { title: track.title, artist: track.author, identifier: track.identifier },
         ]);
       },
+      // Learning: completions and early skips of autoplay picks are the
+      // recommendation outcomes future scoring feeds on.
+      onTrackFinished: (guildId, track, outcome) => {
+        const session = this.#autoplaySession;
+        if (session === undefined || track.requestedByName !== 'Autoplay') return;
+        const completed =
+          !outcome.skipped &&
+          track.durationMs > 0 &&
+          outcome.playedMs / track.durationMs >= 0.8;
+        const kind = outcome.skipped ? 'skipped' : completed ? 'completed' : null;
+        if (kind !== null) {
+          void session.recordOutcome(guildId, kind).catch(() => undefined);
+          logger.debug(
+            {
+              event: kind === 'skipped' ? 'RECOMMENDATION_SKIPPED' : 'RECOMMENDATION_COMPLETED',
+              guildId,
+              track: track.title,
+            },
+            'Autoplay pick finished',
+          );
+        }
+      },
       onFindAlternative: (track, failedSource) => this.findAlternativeSource(track, failedSource),
       onResolveLinks: (track) => this.platformLinksFor(track),
       onEvent: (type, state) => {
+        // Keep the session's queued-set mirrored on every queue mutation.
+        if (type === 'QUEUE_UPDATE' || type === 'QUEUE_CLEAR' || type === 'TRACK_START') {
+          this.#syncSessionQueue(options.guildId);
+        }
+        // A stop empties the queue; picks buffered for the old session would
+        // be the wrong music for whatever comes next, and their reservations
+        // must be released so the songs are not penalised unheard.
+        if (type === 'QUEUE_CLEAR') {
+          this.#autoplay?.clear(options.guildId);
+        }
         this.#emitEvent(options.guildId, type, state);
       },
     });
@@ -452,7 +501,37 @@ export class MusicManager {
    */
   attachAutoplay(engine: AutoplayEngine, orchestrator: MusicOrchestrator): void {
     this.#autoplay = engine;
+    this.#autoplaySession = engine.session;
     orchestrator.setResolver(async (candidate) => this.resolveCandidate(candidate));
+  }
+
+  /** A queue/history track as the session store sees it. */
+  #sessionEntryOf(track: {
+    readonly title: string;
+    readonly author: string;
+    readonly identifier: string;
+  }): SessionEntry {
+    const identity = identityOf(track.author, track.title);
+    return { key: identity.key, identifier: track.identifier, artistKey: identity.artistKey };
+  }
+
+  /**
+   * Mirror a guild's live queue (current track included) into the session
+   * store. Called on every queue mutation, so the recommendation pipeline's
+   * "already queued" exclusion can never drift from the real queue.
+   */
+  #syncSessionQueue(guildId: string): void {
+    const session = this.#autoplaySession;
+    if (session === undefined) return;
+    const player = this.#players.get(guildId);
+    const entries =
+      player === undefined
+        ? []
+        : [
+            ...(player.queue.current === null ? [] : [player.queue.current]),
+            ...player.queue.upcoming,
+          ].map((track) => this.#sessionEntryOf(track));
+    void session.syncQueue(guildId, entries).catch(() => undefined);
   }
 
   /**
@@ -791,6 +870,9 @@ export class MusicManager {
     // as it did before any of this existed.
     const engine = this.#autoplay;
     if (engine !== undefined) {
+      // The session's queued-set must be current BEFORE generation reads it:
+      // this is the hard "already in the queue" exclusion.
+      this.#syncSessionQueue(guildId);
       const seeds = history.slice(0, 4).map((entry) => ({
         title: entry.title,
         artist: entry.author,
@@ -800,7 +882,12 @@ export class MusicManager {
       const recommended = await engine.take(guildId, AUTOPLAY_PICK_TARGET, seeds);
       if (recommended.length > 0) {
         logger.info(
-          { guildId, strategy: 'recommender', picked: recommended.length },
+          {
+            event: 'RECOMMENDATION_QUEUED',
+            guildId,
+            strategy: 'recommender',
+            picked: recommended.length,
+          },
           'Autoplay selection',
         );
         return recommended;
@@ -808,7 +895,22 @@ export class MusicManager {
       logger.debug({ guildId }, 'Recommender returned nothing; falling back to mixes');
     }
 
-    const playedIdentifiers = new Set(history.map((entry) => entry.identifier));
+    // The mix fallback shares the recommender's exclusion state where it can:
+    // history identifiers always, plus the session's queued/recent sets when
+    // the AI stack is wired.
+    const sessionSnapshot = await this.#autoplaySession
+      ?.snapshot(guildId)
+      .catch(() => undefined);
+    const playedIdentifiers = new Set([
+      ...history.map((entry) => entry.identifier),
+      ...(sessionSnapshot?.recentIdentifiers ?? []),
+      ...(sessionSnapshot?.queuedIdentifiers ?? []),
+    ]);
+    const excludedKeys = new Set([
+      ...(sessionSnapshot?.recentKeys ?? []),
+      ...(sessionSnapshot?.queuedKeys ?? []),
+      ...(sessionSnapshot?.reservedKeys ?? []),
+    ]);
     // "Artist - Topic" / "ArtistVEVO" are YouTube channel artifacts, not names.
     const cleanAuthor = (author: string): string =>
       author.replace(/\s*-\s*Topic$/iu, '').replace(/VEVO$/iu, '');
@@ -827,6 +929,7 @@ export class MusicManager {
       const track = fromLavalinkTrack(raw, requester);
 
       if (playedIdentifiers.has(track.identifier)) return;
+      if (excludedKeys.has(identityOf(track.author, track.title).key)) return;
       if (picks.some((pick) => pick.identifier === track.identifier)) return;
       if (track.isStream) return;
       if (track.durationMs < 60_000 || track.durationMs > 600_000) return;
@@ -955,6 +1058,10 @@ export class MusicManager {
     if (player === undefined) return;
 
     this.#players.delete(guildId);
+    // The queue is gone with the player; the session's queued-mirror must not
+    // keep excluding tracks from a queue that no longer exists. Recent-play
+    // history intentionally survives: reconnecting must not reset anti-repeat.
+    this.#syncSessionQueue(guildId);
     const controller = this.#controllers.get(guildId);
     this.#controllers.delete(guildId);
     if (controller !== undefined) await controller.destroy();

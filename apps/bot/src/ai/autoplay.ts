@@ -1,40 +1,50 @@
 /**
- * Autoplay with prefetching.
+ * Autoplay with prefetching, session state, and reservations.
  *
- * The problem this solves is a gap of silence. Generating a recommendation takes
- * a candidate sweep, a ranking pass and a Lavalink search — comfortably a second
- * or two — and doing that only once the queue has already drained means the
- * listener hears the end of one song, then nothing, then the next.
+ * Two problems live here. The first is a gap of silence: generating a
+ * recommendation takes a candidate sweep, a ranking pass and a Lavalink search,
+ * and doing that only once the queue has drained means the listener hears the
+ * end of one song, then nothing. So the work starts while the current track is
+ * still playing, into a small per-guild buffer.
  *
- * So the work starts while the current track is still playing. A small buffer of
- * vetted tracks is kept ready per guild; when the queue drains, autoplay takes
- * from the buffer and the transition is instant. The buffer is refilled in the
- * background, and refilling is deliberately *not* awaited by anything on the
- * playback path.
+ * The second is repetition, and it is why the session store is wired through
+ * everything: every generation pass excludes what is playing, queued, reserved
+ * and recently played — as HARD exclusions, before ranking — and every pick is
+ * atomically reserved before it is resolved, so two passes racing each other
+ * cannot select the same song. The original engine had neither: refills
+ * regenerated from the same seeds with no memory of what they had already
+ * served, and the deterministic pipeline dutifully produced the same list.
  *
- * The buffer is intentionally small. Generating a hundred tracks ahead would
- * waste most of them — the listener queues something themselves, changes mood,
- * or leaves — and every wasted candidate is a Lavalink search that competed with
- * real playback for nothing.
+ * The LLM reranker runs only on background refills. The synchronous path — a
+ * listener waiting in a voice channel — never waits on a model.
  */
 import { getLogger } from '../lib/logger.js';
 import type { QueuedTrack } from '../music/track.js';
 
+import { trackKeyOf } from './identity.js';
+import { computeAutoplayMetrics } from './metrics.js';
 import { MusicOrchestrator } from './orchestrator.js';
 import type { TrackSeed } from './recommender.js';
+import type { AutoplaySessionStore } from './session.js';
 
 const logger = getLogger('autoplay');
 
 /**
- * A buffer older than this is stale: the session has moved on and the picks were
- * chosen to follow music that is now several tracks back.
+ * A buffer older than this is stale: the session has moved on and the picks
+ * were chosen to follow music that is now several tracks back.
  */
 const BUFFER_TTL_MS = 15 * 60_000;
 
+interface BufferedTrack {
+  readonly track: QueuedTrack;
+  /** The candidate key this track is reserved under in the session store. */
+  readonly reservedKey: string;
+}
+
 interface Buffer {
-  readonly tracks: QueuedTrack[];
+  readonly tracks: BufferedTrack[];
   readonly generatedAt: number;
-  /** Seeds the buffer was built from, to detect that the session has drifted. */
+  /** Seed identity the buffer was built from, to detect session drift. */
   readonly seedKey: string;
 }
 
@@ -45,15 +55,31 @@ export interface AutoplayOptions {
 
 export class AutoplayEngine {
   readonly #orchestrator: MusicOrchestrator;
+  readonly #session: AutoplaySessionStore;
   readonly #options: AutoplayOptions;
 
   readonly #buffers = new Map<string, Buffer>();
-  /** In-flight refills, so a burst of track-start events cannot stampede. */
+  /**
+   * In-flight generation per guild. BOTH the background refill and the
+   * synchronous fallback register here, so a take-generate and a refill can
+   * never run concurrently for one guild — that overlap was one of the ways
+   * the same song got selected twice.
+   */
   readonly #inFlight = new Map<string, Promise<void>>();
 
-  constructor(orchestrator: MusicOrchestrator, options: AutoplayOptions) {
+  constructor(
+    orchestrator: MusicOrchestrator,
+    session: AutoplaySessionStore,
+    options: AutoplayOptions,
+  ) {
     this.#orchestrator = orchestrator;
+    this.#session = session;
     this.#options = options;
+  }
+
+  /** Read-only view of the session store, for wiring and diagnostics. */
+  get session(): AutoplaySessionStore {
+    return this.#session;
   }
 
   /**
@@ -84,11 +110,10 @@ export class AutoplayEngine {
   /**
    * Take up to `count` tracks for a guild that has just run out.
    *
-   * Serves from the buffer when it can, which is the whole point — that path is
-   * a map lookup rather than a network round trip. Falls through to generating
-   * synchronously when the buffer is empty or stale, and returns an empty array
-   * rather than throwing when generation itself fails, so the caller's own
-   * fallback (a YouTube mix) can take over.
+   * Serves from the buffer when it can — that path is a map lookup rather than
+   * a network round trip. Falls through to generating synchronously (without
+   * the LLM pass) when the buffer is empty or stale, and returns an empty
+   * array rather than throwing, so the caller's own fallback can take over.
    */
   async take(
     guildId: string,
@@ -103,8 +128,8 @@ export class AutoplayEngine {
       return buffered;
     }
 
-    // An in-flight prefetch is worth waiting for — it is already most of the way
-    // through the work this call would otherwise redo from scratch.
+    // An in-flight generation is worth waiting for — it is already most of the
+    // way through the work this call would otherwise redo from scratch.
     const pending = this.#inFlight.get(guildId);
     if (pending !== undefined) {
       await pending.catch(() => undefined);
@@ -116,18 +141,38 @@ export class AutoplayEngine {
     }
 
     try {
-      const result = await this.#generate(guildId, seeds, count);
-      logger.debug({ guildId, served: result.length, from: 'synchronous' }, 'Autoplay served');
-      return result;
+      let served: readonly QueuedTrack[] = [];
+      await this.#gated(guildId, async () => {
+        served = (await this.#generate(guildId, seeds, count, { background: false })).map(
+          (entry) => entry.track,
+        );
+      });
+      logger.debug({ guildId, served: served.length, from: 'synchronous' }, 'Autoplay served');
+      return served;
     } catch (error) {
       logger.warn({ err: error, guildId }, 'Autoplay generation failed');
       return [];
     }
   }
 
-  /** Drop a guild's buffer — on stop, disconnect, or a manual queue change. */
+  /**
+   * Drop a guild's buffer — on stop, disconnect, or a manual queue change.
+   *
+   * Buffered tracks' reservations are released so the songs become eligible
+   * again; they were never queued, and holding them would punish the next
+   * session for picks nobody heard.
+   */
   clear(guildId: string): void {
+    const buffer = this.#buffers.get(guildId);
     this.#buffers.delete(guildId);
+    if (buffer !== undefined && buffer.tracks.length > 0) {
+      void this.#session
+        .release(
+          guildId,
+          buffer.tracks.map((entry) => entry.reservedKey),
+        )
+        .catch(() => undefined);
+    }
   }
 
   #drain(guildId: string, count: number, seeds: readonly TrackSeed[]): readonly QueuedTrack[] {
@@ -137,63 +182,123 @@ export class AutoplayEngine {
     const stale =
       Date.now() - buffer.generatedAt > BUFFER_TTL_MS || buffer.seedKey !== seedKeyOf(seeds);
     if (stale) {
-      this.#buffers.delete(guildId);
+      this.clear(guildId);
       return [];
     }
 
     const taken = buffer.tracks.splice(0, count);
     if (buffer.tracks.length === 0) this.#buffers.delete(guildId);
-    return taken;
+    // Reservations on served tracks stay: the caller is about to queue them,
+    // and the reservation TTL covers the gap until the queue sync sees them.
+    return taken.map((entry) => entry.track);
   }
 
-  async #refill(guildId: string, seeds: readonly TrackSeed[]): Promise<void> {
+  /** Run `work` as THE generation pass for a guild; concurrent calls coalesce. */
+  async #gated(guildId: string, work: () => Promise<void>): Promise<void> {
     const existing = this.#inFlight.get(guildId);
     if (existing !== undefined) return existing;
 
-    const work = (async () => {
-      const tracks = await this.#generate(guildId, seeds, this.#options.prefetchSize);
-      if (tracks.length > 0) {
+    const gate = work().finally(() => {
+      this.#inFlight.delete(guildId);
+    });
+    this.#inFlight.set(guildId, gate);
+    return gate;
+  }
+
+  async #refill(guildId: string, seeds: readonly TrackSeed[]): Promise<void> {
+    return this.#gated(guildId, async () => {
+      const entries = await this.#generate(guildId, seeds, this.#options.prefetchSize, {
+        background: true,
+      });
+      if (entries.length > 0) {
+        // A buffer may already exist if a take() drained part of one while
+        // this refill was queued behind it; merging (rather than overwriting)
+        // preserves reservations already made for the surviving entries.
+        const existing = this.#buffers.get(guildId);
+        const survivors = existing?.seedKey === seedKeyOf(seeds) ? existing.tracks : [];
         this.#buffers.set(guildId, {
-          tracks: [...tracks],
+          tracks: [...survivors, ...entries],
           generatedAt: Date.now(),
           seedKey: seedKeyOf(seeds),
         });
       }
-    })().finally(() => {
-      this.#inFlight.delete(guildId);
     });
-
-    this.#inFlight.set(guildId, work);
-    return work;
   }
 
   async #generate(
     guildId: string,
     seeds: readonly TrackSeed[],
     count: number,
-  ): Promise<readonly QueuedTrack[]> {
+    options: { readonly background: boolean },
+  ): Promise<readonly BufferedTrack[]> {
+    const snapshot = await this.#session.snapshot(guildId);
+
+    // Everything the session knows about is a hard exclusion: playing/queued,
+    // reserved by another pass, or inside the recent-play cooldown window.
+    const exclusions = {
+      trackKeys: new Set([
+        ...snapshot.recentKeys,
+        ...snapshot.queuedKeys,
+        ...snapshot.reservedKeys,
+      ]),
+      identifiers: new Set([...snapshot.recentIdentifiers, ...snapshot.queuedIdentifiers]),
+    };
+
     const result = await this.#orchestrator.recommend({
       guildId,
       seeds,
       count,
       // Autoplay continues a session; there is no sentence to parse, so the
-      // intent is synthesised and no LLM is involved at any point here.
+      // intent is synthesised. The only LLM involvement is the optional rerank
+      // pass, and only when this generation is running in the background.
       intent: MusicOrchestrator.continuationIntent(count),
+      exclusions,
+      session: {
+        recentArtists: snapshot.recentArtists,
+        artistFatigue: snapshot.artistFatigue,
+      },
+      allowRerank: options.background,
+      reserve: (keys) => this.#session.reserve(guildId, keys),
     });
-    return result.tracks;
+
+    if (result.resolved.length > 0) {
+      void this.#session
+        .recordOutcome(guildId, 'recommended', result.resolved.length)
+        .catch(() => undefined);
+    }
+    if (result.blockedCount > 0) {
+      void this.#session
+        .recordOutcome(guildId, 'duplicatesBlocked', result.blockedCount)
+        .catch(() => undefined);
+    }
+
+    // Quality is measured, not asserted: one structured line per generation
+    // pass, so a regression shows up in the logs before it shows up in a
+    // complaint.
+    logger.debug(
+      {
+        event: 'AUTOPLAY_METRICS',
+        guildId,
+        ...computeAutoplayMetrics(snapshot.outcomes, snapshot.recentArtists),
+      },
+      'Autoplay quality metrics',
+    );
+
+    return result.resolved.map((entry) => ({ track: entry.track, reservedKey: entry.trackKey }));
   }
 }
 
 /**
- * Identity of the seed set.
+ * Identity of the seed set — the newest seed's canonical key.
  *
- * A buffer built while a Punjabi track was playing is the wrong buffer once the
- * room has moved to something else, and comparing seeds is how that is noticed
- * without waiting for the TTL.
+ * A buffer built while a Punjabi track was playing is the wrong buffer once
+ * the room has moved on, and comparing seed identity is how that is noticed
+ * without waiting for the TTL. Exactly ONE seed participates, canonicalised:
+ * the original compared two differently-sized seed lists from two call sites
+ * as raw strings, which never matched — every buffer was judged stale and the
+ * prefetch path silently never served.
  */
 function seedKeyOf(seeds: readonly TrackSeed[]): string {
-  return seeds
-    .slice(0, 2)
-    .map((seed) => `${seed.artist}|${seed.title}`.toLowerCase())
-    .join('::');
+  const newest = seeds[0];
+  return newest === undefined ? '' : trackKeyOf(newest.artist, newest.title);
 }

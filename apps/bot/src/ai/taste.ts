@@ -47,6 +47,8 @@ const DECAY_HALF_LIFE_DAYS = 14;
  */
 const REFRESH_COOLDOWN_MS = 10 * 60_000;
 const PROFILE_CACHE_TTL_MS = 5 * 60_000;
+/** How long a loved song rests before it may be resurfaced by autoplay. */
+const FAVOURITE_COOLDOWN_MS = 48 * 60 * 60_000;
 
 /**
  * Below this many plays the aggregate is mostly noise, so affinities are damped
@@ -324,6 +326,69 @@ export class UserTasteService {
     } catch (error) {
       logger.warn({ err: error, guildId }, 'Recent context read failed');
       return EMPTY_RECENT_CONTEXT;
+    }
+  }
+
+  /**
+   * Songs this guild demonstrably loves and has not heard in a while.
+   *
+   * "Loved" is behavioural — played essentially to completion, never
+   * early-skipped — and "a while" matters as much as the love: resurfacing a
+   * favourite too soon is a repeat, resurfacing it after days is a welcome
+   * return. These become the `history` candidate source, so a great radio
+   * session is not condemned to permanent novelty.
+   */
+  async favouriteTracks(
+    guildId: string,
+    limit = 20,
+  ): Promise<readonly { title: string; artist: string; identifier: string }[]> {
+    const cooldown = new Date(Date.now() - FAVOURITE_COOLDOWN_MS);
+    try {
+      const rows = await this.#prisma.songHistory.findMany({
+        where: { guild: { discordId: guildId }, skipped: false },
+        orderBy: { playedAt: 'desc' },
+        take: 300,
+        select: {
+          identifier: true,
+          author: true,
+          title: true,
+          playedMs: true,
+          durationMs: true,
+          playedAt: true,
+        },
+      });
+
+      // Aggregate per canonical song: total plays, best completion, last heard.
+      const bySong = new Map<
+        string,
+        { title: string; artist: string; identifier: string; plays: number; lastPlayedAt: Date }
+      >();
+      for (const row of rows) {
+        if (completionOf(row) < 0.85) continue;
+        const key = trackKeyOf(row.author, row.title);
+        const existing = bySong.get(key);
+        if (existing === undefined) {
+          bySong.set(key, {
+            title: row.title,
+            artist: row.author,
+            identifier: row.identifier,
+            plays: 1,
+            lastPlayedAt: row.playedAt,
+          });
+        } else {
+          existing.plays += 1;
+          if (row.playedAt > existing.lastPlayedAt) existing.lastPlayedAt = row.playedAt;
+        }
+      }
+
+      return [...bySong.values()]
+        .filter((song) => song.lastPlayedAt < cooldown)
+        .sort((a, b) => b.plays - a.plays)
+        .slice(0, limit)
+        .map(({ title, artist, identifier }) => ({ title, artist, identifier }));
+    } catch (error) {
+      logger.warn({ err: error, guildId }, 'Favourite tracks read failed');
+      return [];
     }
   }
 

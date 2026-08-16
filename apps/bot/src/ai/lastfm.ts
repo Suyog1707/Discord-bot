@@ -70,6 +70,15 @@ interface TopTagsBody {
   };
 }
 
+interface ArtistTopTracksBody {
+  readonly toptracks?: {
+    readonly track?: readonly {
+      readonly name?: string;
+      readonly artist?: { readonly name?: string };
+    }[];
+  };
+}
+
 interface TagTracksBody {
   readonly tracks?: {
     readonly track?: readonly {
@@ -171,6 +180,31 @@ export class LastFmService {
       if (name === undefined || artistName === undefined) return [];
       // Tag charts carry no per-track match; treat them as a uniform mid signal
       // so they never outrank a genuine similarity hit.
+      return [{ name, artist: artistName, match: 0.5 }];
+    });
+  }
+
+  /**
+   * An artist's best-known tracks.
+   *
+   * This is what lets the *taste profile* generate candidates instead of only
+   * re-ranking them: a listener's favourite artists become a candidate source
+   * of their own, so autoplay is anchored to the person's taste rather than
+   * orbiting whatever song happens to be playing.
+   */
+  async artistTopTracks(artist: string, limit = 20): Promise<readonly SimilarTrack[]> {
+    const body = await this.#call<ArtistTopTracksBody>('artist.gettoptracks', {
+      artist,
+      limit: String(limit),
+      autocorrect: '1',
+    });
+
+    return (body?.toptracks?.track ?? []).flatMap((entry) => {
+      const name = entry.name;
+      const artistName = entry.artist?.name ?? artist;
+      if (name === undefined) return [];
+      // Popularity within one artist says nothing about similarity to the
+      // session; a uniform mid signal keeps these from outranking real matches.
       return [{ name, artist: artistName, match: 0.5 }];
     });
   }
