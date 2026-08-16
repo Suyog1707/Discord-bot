@@ -12,7 +12,13 @@ Targets: Web → Vercel · Bot + Lavalink → VPS · PostgreSQL → managed · R
    Add the production callback URL in the Discord developer portal:
    `https://<domain>/api/auth/callback/discord`.
 4. **Lavalink (VPS)** — run `docker/lavalink/application.yml` with a strong
-   `LAVALINK_PASSWORD`; keep port 2333 firewalled to the bot host only.
+   `LAVALINK_PASSWORD`; keep port 2333 firewalled to the bot host only. Deploy
+   the `yt-cipher` sidecar alongside it (it is in `docker/docker-compose.yml`)
+   and leave it unpublished — Lavalink reaches it as `http://yt-cipher:8001` to
+   decipher YouTube stream signatures. Without it, YouTube playback fails with
+   `Must find sig function from script`. Keep the `youtube-plugin` version in
+   `application.yml` current: the startup log prints a notice when a newer
+   release exists, and YouTube regularly breaks older ones.
 5. **Bot (VPS)** — build `apps/bot/Dockerfile` from the repo root; run with
    `NODE_ENV=production` and the full env. Deploy slash commands once:
    `pnpm --filter @discord-music/bot run commands:deploy` (unset

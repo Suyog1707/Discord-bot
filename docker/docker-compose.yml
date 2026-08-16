@@ -70,6 +70,25 @@ services:
       - lavalink-plugins:/opt/Lavalink/plugins
     restart: 'no'
 
+  # Signature deciphering for the YouTube source (application.yml:
+  # plugins.youtube.remoteCipher). YouTube's player script outgrew the
+  # extractor built into youtube-source — every track failed with "Must find sig
+  # function from script" — and upstream's answer is to hand deciphering to this
+  # service instead of shipping a new regex per player release. The container
+  # name is load-bearing: Lavalink reaches it as http://yt-cipher:8001. No
+  # published port, because only Lavalink should be able to talk to it.
+  yt-cipher:
+    image: ghcr.io/kikkia/yt-cipher:master
+    container_name: dmp-yt-cipher
+    restart: unless-stopped
+    environment:
+      # Upstream: only the IAS script variants currently work reliably.
+      OVERRIDE_PLAYER_VARIANT: IAS
+    networks:
+      default:
+        aliases:
+          - yt-cipher
+
   lavalink:
     image: ghcr.io/lavalink-devs/lavalink:4
     container_name: dmp-lavalink
@@ -77,10 +96,23 @@ services:
     depends_on:
       lavalink-init:
         condition: service_completed_successfully
+      # Distroless image with no shell, so there is no healthcheck to wait on.
+      # Lavalink only calls the cipher server when a track is played, which is
+      # long after both have settled.
+      yt-cipher:
+        condition: service_started
     environment:
       _JAVA_OPTIONS: -Xmx1G
       SERVER_PORT: 2333
       LAVALINK_SERVER_PASSWORD: ${LAVALINK_PASSWORD:-youshallnotpass}
+      # application.yml interpolates these into the LavaSrc Spotify block. They
+      # were never passed through, so LavaSrc authenticated with empty strings
+      # and Spotify links handed straight to Lavalink failed with
+      # "invalid_client" surfacing as "Something went wrong while looking up the
+      # track". The bot resolves Spotify itself and rarely hits this path, but a
+      # source configured with credentials it cannot see is a trap.
+      SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
+      SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
     ports:
       - '${LAVALINK_PORT:-2333}:2333'
     volumes:

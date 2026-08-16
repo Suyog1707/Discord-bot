@@ -20,6 +20,28 @@ import type { QueueStore } from './queue-store.js';
 import { formatTrackDuration, trackLink, type QueuedTrack } from './track.js';
 import { TrackQueue } from './track-queue.js';
 
+/**
+ * Cap on the logged `cause`. Lavalink stringifies the whole Java throwable, and
+ * for a multi-client YouTube failure that is several lines listing what each
+ * client said — worth keeping, but not worth an unbounded log line.
+ */
+const CAUSE_LOG_LIMIT = 600;
+
+function truncate(value: string | undefined, limit: number): string | undefined {
+  if (value === undefined || value.length <= limit) return value;
+  return `${value.slice(0, limit)}… (truncated)`;
+}
+
+/**
+ * The exception class name from Lavalink's stringified throwable, so failures
+ * can be grouped by type without parsing the whole message at read time.
+ */
+function exceptionTypeOf(cause: string | undefined): string | undefined {
+  const [firstLine] = (cause ?? '').split('\n');
+  const match = /^([\w$]+(?:\.[\w$]+)*(?:Exception|Error))\b/u.exec(firstLine?.trim() ?? '');
+  return match?.[1];
+}
+
 export interface GuildPlayerOptions {
   readonly guildId: string;
   readonly voiceChannelId: string;
@@ -346,9 +368,29 @@ export class GuildPlayer {
     });
 
     this.#player.on('exception', (event) => {
-      this.#logger.warn({ exception: event.exception }, 'Track raised an exception');
+      const track = this.queue.current;
+      // The chat message stays one line, but the log keeps everything needed to
+      // tell apart the failure modes that all look identical to a listener: a
+      // stale youtube-source signature extractor, YouTube demanding a login for
+      // one video, a genuinely unavailable track. `cause` is where Lavalink puts
+      // the real root cause — it is the difference between "playback broke" and
+      // "AllClientsFailedException: Must find sig function from script".
+      this.#logger.warn(
+        {
+          title: track?.title,
+          identifier: track?.identifier,
+          source: track?.source,
+          uri: track?.uri,
+          exceptionType: exceptionTypeOf(event.exception.cause),
+          exceptionMessage: event.exception.message,
+          severity: event.exception.severity,
+          cause: truncate(event.exception.cause, CAUSE_LOG_LIMIT),
+          node: this.#player.node.name,
+        },
+        'Track playback exception',
+      );
       void this.#notify(
-        `⚠️ Playback error on **${this.queue.current?.title ?? 'the current track'}** — skipping.`,
+        `⚠️ Playback error on **${track?.title ?? 'the current track'}** — skipping.`,
       );
       // 'end' (loadFailed) follows; advancement handled there.
     });
