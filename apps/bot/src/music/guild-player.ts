@@ -113,6 +113,8 @@ export class GuildPlayer {
   #idleTimeoutSeconds: number;
   #idleTimer: NodeJS.Timeout | undefined;
   #trackStartedAt = 0;
+  /** Whether a track is actually playing right now. See `isPlaying`. */
+  #playing = false;
   #skipRequested = false;
   #destroyed = false;
   #stayConnected: boolean;
@@ -191,7 +193,12 @@ export class GuildPlayer {
   }
 
   get isPlaying(): boolean {
-    return this.#player.track !== null;
+    // Tracked explicitly rather than read from `#player.track`: shoukaku never
+    // clears `track` on a natural TrackEndEvent (only stopTrack/clean do), so
+    // the player object reports "playing" forever after a song finishes on its
+    // own. That stale value made `enqueue` refuse to start playback for
+    // autoplay top-ups — the tracks were added and then silently parked.
+    return this.#playing;
   }
 
   get stayConnected(): boolean {
@@ -235,7 +242,13 @@ export class GuildPlayer {
     this.#emit('QUEUE_UPDATE');
 
     if (!this.isPlaying) {
-      const first = this.queue.advance() ?? this.queue.jumpTo(position);
+      // After the queue drains, the cursor parks at the old length — exactly
+      // where `add` just placed the first new track, so `current` is already
+      // it. Calling `advance()` from there would move to the SECOND new track:
+      // the first would be announced, never played, never recorded in history,
+      // and (being the top-scoring pick) re-recommended on every autoplay
+      // cycle. On a fresh queue `current` is null and `advance()` is correct.
+      const first = this.queue.current ?? this.queue.advance() ?? this.queue.jumpTo(position);
       if (first !== null) {
         await this.#playTrack(first);
         return { position, startedPlayback: true };
@@ -387,6 +400,7 @@ export class GuildPlayer {
   async destroy(): Promise<void> {
     if (this.#destroyed) return;
     this.#destroyed = true;
+    this.#playing = false;
     this.#emit('PLAYER_DISCONNECT');
 
     this.#clearIdleTimer();
@@ -470,6 +484,9 @@ export class GuildPlayer {
   }
 
   async #handleTrackEnd(reason: string): Promise<void> {
+    // The track is over regardless of what happens next; `#playTrack` re-sets
+    // this when recovery or the next track starts.
+    this.#playing = false;
     const finished = this.queue.current;
 
     // A source that refused to stream gets one chance to be replaced by another
@@ -486,15 +503,22 @@ export class GuildPlayer {
       await this.#notify(`⚠️ Playback error on **${finished.title}** — skipping.`);
     }
 
-    // Record history before the cursor moves.
+    // Record history before the cursor moves. Fire-and-forget on the normal
+    // path, but the promise is kept: when the queue drains, autoplay reads
+    // recent history to seed and exclude, and the single most likely track to
+    // be re-recommended is the one that JUST finished — racing this write
+    // meant it was routinely missing from both.
+    let historyWrite: Promise<unknown> = Promise.resolve();
     if (
       finished !== null &&
       (reason === 'finished' || reason === 'stopped' || reason === 'loadFailed')
     ) {
-      void this.#store.recordHistory(this.guildId, finished, {
-        playedMs: this.#trackStartedAt > 0 ? Date.now() - this.#trackStartedAt : 0,
-        skipped: reason === 'stopped',
-      });
+      historyWrite = this.#store
+        .recordHistory(this.guildId, finished, {
+          playedMs: this.#trackStartedAt > 0 ? Date.now() - this.#trackStartedAt : 0,
+          skipped: reason === 'stopped',
+        })
+        .catch(() => undefined);
     }
 
     // 'replaced' means we started another track ourselves; nothing to advance.
@@ -520,6 +544,8 @@ export class GuildPlayer {
         return;
       }
 
+      // The just-finished track must be visible to autoplay's history reads.
+      await historyWrite;
       if (await this.#tryAutoplay()) return;
       await this.#notify('✅ Queue finished. Add more with `/play`.');
       this.#startIdleTimer();
@@ -547,7 +573,12 @@ export class GuildPlayer {
       }
       return startedPlayback;
     } catch (error) {
+      // Technical detail stays in the log; the listener gets an explanation
+      // and reassurance, not an exception name.
       this.#logger.warn({ err: error }, 'Autoplay failed; parking the player');
+      await this.#notify(
+        "⚠️ I couldn't prepare the next songs right now. I'll try again when the queue runs low — you can also add songs with `/play`.",
+      );
       return false;
     } finally {
       this.#autoplayActive = false;
@@ -603,11 +634,13 @@ export class GuildPlayer {
 
   async #playTrack(track: QueuedTrack): Promise<void> {
     try {
+      this.#playing = true;
       await this.#player.playTrack({
         track: { encoded: track.encoded },
         volume: this.#volume,
       });
     } catch (error) {
+      this.#playing = false;
       this.#logger.error({ err: error, track: track.identifier }, 'playTrack failed');
       await this.#notify(`⚠️ Could not play **${track.title}** — skipping.`);
       const next = this.queue.skip();
