@@ -19,6 +19,7 @@ import {
   REDIS_NAMESPACE,
   redisKey,
 } from '@discord-music/shared';
+import { cache } from 'react';
 
 import { canManageGuild } from '@/lib/discord/permissions';
 import { getDb } from '@/lib/db';
@@ -176,17 +177,99 @@ async function discordFetch<T>(userId: string, path: string): Promise<T> {
 }
 
 /**
- * Guilds the user belongs to, cached briefly in Redis (when available) to
- * stay clear of Discord's strict per-user rate limit on this endpoint.
+ * Guild-list cache lifetime.
+ *
+ * This endpoint sits on the render path of every dashboard page, so a short
+ * TTL meant most navigations paid a live Discord round trip. Five minutes is
+ * safe because the only fact users change and expect to see immediately —
+ * whether the bot is in the guild — is read from Postgres in
+ * `listServers`/`requireManagedGuild`, not from this payload. Name, icon and
+ * permission bits are what is cached here, and those change rarely.
  */
-export async function fetchUserGuilds(userId: string): Promise<readonly DiscordGuildSummary[]> {
+const GUILDS_TTL_SECONDS = CACHE_TTL_SECONDS.MEDIUM;
+const GUILDS_TTL_MS = GUILDS_TTL_SECONDS * 1000;
+/** Bound the process-local mirror so a busy instance cannot grow it forever. */
+const LOCAL_GUILD_CACHE_MAX = 500;
+
+interface GuildCacheEntry {
+  readonly guilds: readonly DiscordGuildSummary[];
+  readonly expiresAtMs: number;
+}
+
+/**
+ * Process-local mirror of the Redis entry.
+ *
+ * Redis is optional (unset `REDIS_URL` in development and in small
+ * deployments), and without it every navigation hit Discord directly. This
+ * tier keeps the dashboard fast in that configuration and spares even the
+ * Redis round trip in the configured one.
+ */
+const localGuildCache = new Map<string, GuildCacheEntry>();
+
+/** Concurrent misses for one user share a single upstream fetch. */
+const inFlightGuildFetches = new Map<string, Promise<readonly DiscordGuildSummary[]>>();
+
+function readLocalGuilds(userId: string): readonly DiscordGuildSummary[] | undefined {
+  const entry = localGuildCache.get(userId);
+  if (entry === undefined) return undefined;
+  if (entry.expiresAtMs <= Date.now()) {
+    localGuildCache.delete(userId);
+    return undefined;
+  }
+  return entry.guilds;
+}
+
+function writeLocalGuilds(userId: string, guilds: readonly DiscordGuildSummary[]): void {
+  if (localGuildCache.size >= LOCAL_GUILD_CACHE_MAX) {
+    const now = Date.now();
+    for (const [key, entry] of localGuildCache) {
+      if (entry.expiresAtMs <= now) localGuildCache.delete(key);
+    }
+    // Still full after pruning expired entries: drop the oldest insertion.
+    if (localGuildCache.size >= LOCAL_GUILD_CACHE_MAX) {
+      const oldest = localGuildCache.keys().next();
+      if (oldest.done !== true) localGuildCache.delete(oldest.value);
+    }
+  }
+  localGuildCache.set(userId, { guilds, expiresAtMs: Date.now() + GUILDS_TTL_MS });
+}
+
+/**
+ * Guilds the user belongs to, cached to stay clear of Discord's strict
+ * per-user rate limit on this endpoint and off the render critical path.
+ *
+ * Three tiers, cheapest first: React `cache` (one call per request, even
+ * though the layout, the page and `requireManagedGuild` all ask), a
+ * process-local TTL map, then Redis when configured.
+ */
+export const fetchUserGuilds = cache(
+  async (userId: string): Promise<readonly DiscordGuildSummary[]> => {
+    const local = readLocalGuilds(userId);
+    if (local !== undefined) return local;
+
+    const existing = inFlightGuildFetches.get(userId);
+    if (existing !== undefined) return existing;
+
+    const attempt = loadUserGuilds(userId).finally(() => {
+      inFlightGuildFetches.delete(userId);
+    });
+    inFlightGuildFetches.set(userId, attempt);
+    return attempt;
+  },
+);
+
+async function loadUserGuilds(userId: string): Promise<readonly DiscordGuildSummary[]> {
   const cacheKey = redisKey(REDIS_NAMESPACE.CACHE, 'user-guilds', userId);
   const redis = getRedis();
 
   if (redis !== undefined) {
     try {
       const cached = await redis.get(cacheKey);
-      if (cached !== null) return JSON.parse(cached) as DiscordGuildSummary[];
+      if (cached !== null) {
+        const guilds = JSON.parse(cached) as DiscordGuildSummary[];
+        writeLocalGuilds(userId, guilds);
+        return guilds;
+      }
     } catch {
       // Cache is an optimisation; fall through to the API on any Redis error.
     }
@@ -201,9 +284,11 @@ export async function fetchUserGuilds(userId: string): Promise<readonly DiscordG
     permissions,
   }));
 
+  writeLocalGuilds(userId, summary);
+
   if (redis !== undefined) {
     try {
-      await redis.set(cacheKey, JSON.stringify(summary), 'EX', CACHE_TTL_SECONDS.SHORT);
+      await redis.set(cacheKey, JSON.stringify(summary), 'EX', GUILDS_TTL_SECONDS);
     } catch {
       // Same: never let the cache break the request.
     }
