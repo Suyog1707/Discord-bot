@@ -28,6 +28,7 @@ import { GuildService } from '../services/guild-service.js';
 import { PlaylistsService } from '../services/playlists-service.js';
 import { SpotifyService } from '../services/spotify-service.js';
 import { CommandRegistry } from './command-registry.js';
+import { type AiStack, createAiStack } from '../ai/index.js';
 import { CooldownManager } from './cooldown.js';
 import { EventRegistry } from './event-registry.js';
 
@@ -75,6 +76,12 @@ export class BotClient extends Client {
    * development). Commands go through `requireMusic()` for a friendly error.
    */
   readonly music: MusicManager | undefined;
+
+  /**
+   * Intent parsing, taste and recommendations. Always present — with nothing
+   * configured its services are simply disabled, so callers never branch.
+   */
+  readonly ai: AiStack;
 
   /**
    * Redis, or `undefined` when it is not configured or was unreachable at boot.
@@ -143,6 +150,17 @@ export class BotClient extends Client {
               this.#redis?.publish(PLAYER_EVENT_CHANNEL, payload).catch(() => 0);
             },
           });
+
+    // The recommendation stack is built unconditionally: with no keys set it is
+    // a null LLM and a disabled discovery service, and autoplay falls straight
+    // through to its original YouTube-mix behaviour. Building it either way
+    // keeps `client.ai` non-optional for every consumer.
+    this.ai = createAiStack({
+      env,
+      prisma: this.prisma,
+      ...(this.#redis && { redis: this.#redis }),
+    });
+    this.music?.attachAutoplay(this.ai.autoplay, this.ai.orchestrator);
   }
 
   /**
@@ -170,10 +188,7 @@ export class BotClient extends Client {
     await this.#connect();
     await this.#startCommandSubscriber();
 
-    this.logger.info(
-      { durationMs: Date.now() - startedAt },
-      'Bot startup complete',
-    );
+    this.logger.info({ durationMs: Date.now() - startedAt }, 'Bot startup complete');
   }
 
   /**

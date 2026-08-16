@@ -28,6 +28,8 @@ import {
   type Track as LavalinkTrack,
 } from 'shoukaku';
 
+import type { AutoplayEngine } from '../ai/autoplay.js';
+import type { MusicOrchestrator } from '../ai/orchestrator.js';
 import type { LavalinkNode } from '../config/env.js';
 import { getEnv } from '../config/env.js';
 import { getLogger } from '../lib/logger.js';
@@ -118,6 +120,12 @@ export class MusicManager {
   /** Nodes already carrying a give-up listener, so retries never double-log. */
   readonly #watchedNodes = new WeakSet<Node>();
   #reconnectTimer: NodeJS.Timeout | undefined;
+
+  /**
+   * The recommendation-backed autoplay engine, when the AI stack is configured.
+   * Undefined leaves autoplay on its original YouTube-mix behaviour.
+   */
+  #autoplay: AutoplayEngine | undefined;
 
   readonly #publishEvent: ((payload: string) => void) | undefined;
   readonly #controllers = new Map<string, ControllerMessage>();
@@ -352,6 +360,13 @@ export class MusicManager {
         await this.destroyPlayer(guildId);
       },
       onAutoplayRequest: (guildId) => this.pickAutoplayTracks(guildId),
+      // Warm the buffer from the track that just started, so the next autoplay
+      // top-up is a map lookup rather than a full generation pass.
+      onTrackStarted: (guildId, track) => {
+        this.#autoplay?.prefetch(guildId, [
+          { title: track.title, artist: track.author, identifier: track.identifier },
+        ]);
+      },
       onFindAlternative: (track, failedSource) => this.findAlternativeSource(track, failedSource),
       onResolveLinks: (track) => this.platformLinksFor(track),
       onEvent: (type, state) => {
@@ -426,6 +441,82 @@ export class MusicManager {
       if (response?.loadType !== LoadType.SEARCH) return null;
       return response.data[0]?.info.uri ?? null;
     });
+  }
+
+  /**
+   * Attach the recommendation-backed autoplay engine.
+   *
+   * Called once at boot when the AI stack is configured. Also hands the
+   * orchestrator the resolver it needs, which is the only direction the
+   * dependency runs in — the AI layer never imports the player.
+   */
+  attachAutoplay(engine: AutoplayEngine, orchestrator: MusicOrchestrator): void {
+    this.#autoplay = engine;
+    orchestrator.setResolver(async (candidate) => this.resolveCandidate(candidate));
+  }
+
+  /**
+   * Turn a recommended `artist — title` into something Lavalink can play.
+   *
+   * The plausibility guard matters more here than anywhere else: a search for a
+   * track YouTube does not have returns *something* regardless, and without the
+   * check autoplay would confidently queue a lyric video, a cover, or an
+   * unrelated song that merely shares a word with the request.
+   */
+  async resolveCandidate(candidate: {
+    readonly title: string;
+    readonly artist: string;
+  }): Promise<QueuedTrack | null> {
+    const node = this.shoukaku.getIdealNode();
+    if (node === undefined) return null;
+
+    const raw = await this.#searchOne(node, `${candidate.artist} ${candidate.title}`);
+    if (raw === null) return null;
+
+    const track = fromLavalinkTrack(raw, {
+      id: this.#client.user?.id ?? '0',
+      name: 'Autoplay',
+    });
+
+    // Live streams and radio rips are not songs; long uploads are usually full
+    // albums or hour-long mixes that would swallow the queue.
+    if (track.isStream) return null;
+    if (track.durationMs < 60_000 || track.durationMs > 900_000) return null;
+
+    // Duration 0 deliberately: a recommendation carries a title and an artist
+    // but no running time, and `isPlausibleAlternative` treats a non-positive
+    // duration as "nothing to compare" — so the word-overlap and variant checks
+    // still apply while the duration comparison is skipped rather than faked.
+    const wanted = { title: candidate.title, author: candidate.artist, durationMs: 0 };
+    if (!isPlausibleAlternative(wanted, track)) {
+      logger.debug(
+        {
+          wanted: `${candidate.artist} — ${candidate.title}`,
+          got: `${track.author} — ${track.title}`,
+        },
+        'Rejected an implausible recommendation match',
+      );
+      return null;
+    }
+
+    return track;
+  }
+
+  /**
+   * Warm the autoplay buffer for a guild while a track is still playing.
+   *
+   * Fire-and-forget by design: nothing on the playback path may wait for it.
+   */
+  prefetchAutoplay(guildId: string, history: readonly { title: string; author: string }[]): void {
+    this.#autoplay?.prefetch(
+      guildId,
+      history.slice(0, 4).map((entry) => ({ title: entry.title, artist: entry.author })),
+    );
+  }
+
+  /** Drop a guild's prefetched autoplay buffer — on stop or disconnect. */
+  clearAutoplayBuffer(guildId: string): void {
+    this.#autoplay?.clear(guildId);
   }
 
   /** One Lavalink search, served from the short-lived result cache when possible. */
@@ -693,6 +784,30 @@ export class MusicManager {
     const history = await this.#store.recentHistory(guildId, 40);
     if (history.length === 0) return [];
 
+    // The recommendation engine goes first when it is configured: it knows the
+    // guild's taste, its recent skips and the language it listens in, none of
+    // which a mix URL does. It returns nothing when Last.fm is unavailable or
+    // the pool came back thin, and the YouTube-mix path below then runs exactly
+    // as it did before any of this existed.
+    const engine = this.#autoplay;
+    if (engine !== undefined) {
+      const seeds = history.slice(0, 4).map((entry) => ({
+        title: entry.title,
+        artist: entry.author,
+        identifier: entry.identifier,
+      }));
+
+      const recommended = await engine.take(guildId, AUTOPLAY_PICK_TARGET, seeds);
+      if (recommended.length > 0) {
+        logger.info(
+          { guildId, strategy: 'recommender', picked: recommended.length },
+          'Autoplay selection',
+        );
+        return recommended;
+      }
+      logger.debug({ guildId }, 'Recommender returned nothing; falling back to mixes');
+    }
+
     const playedIdentifiers = new Set(history.map((entry) => entry.identifier));
     // "Artist - Topic" / "ArtistVEVO" are YouTube channel artifacts, not names.
     const cleanAuthor = (author: string): string =>
@@ -833,6 +948,9 @@ export class MusicManager {
 
   /** Tear down a guild's player and leave its voice channel. */
   async destroyPlayer(guildId: string): Promise<void> {
+    // Free the prefetch buffer with the player; a guild that left should not
+    // keep tracks parked in memory waiting for a queue that will never drain.
+    this.#autoplay?.clear(guildId);
     const player = this.#players.get(guildId);
     if (player === undefined) return;
 

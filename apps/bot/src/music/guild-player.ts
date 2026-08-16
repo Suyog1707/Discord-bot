@@ -78,6 +78,11 @@ export interface GuildPlayerOptions {
    */
   readonly onAutoplayRequest: (guildId: string) => Promise<readonly QueuedTrack[]>;
   /**
+   * Called when a track starts, so the next autoplay batch can be prepared
+   * while it plays. Must return immediately — the playback path never waits.
+   */
+  readonly onTrackStarted?: (guildId: string, track: QueuedTrack) => void;
+  /**
    * Find the same recording on a source other than the one that just refused to
    * play it. Returns null when nothing equivalent exists.
    */
@@ -115,6 +120,7 @@ export class GuildPlayer {
   #autoplayActive = false;
   #activeFilter: FilterPresetName | 'speed' | 'pitch' | null = null;
   readonly #onAutoplayRequest: (guildId: string) => Promise<readonly QueuedTrack[]>;
+  readonly #onTrackStarted: ((guildId: string, track: QueuedTrack) => void) | undefined;
   readonly #onFindAlternative:
     ((track: QueuedTrack, failedSource: MusicSource) => Promise<QueuedTrack | null>) | undefined;
   readonly #onResolveLinks: ((track: QueuedTrack) => Promise<PlatformLinks>) | undefined;
@@ -151,6 +157,7 @@ export class GuildPlayer {
     this.#autoplayEnabled = options.autoplayEnabled;
     this.#onSelfDestruct = options.onSelfDestruct;
     this.#onAutoplayRequest = options.onAutoplayRequest;
+    this.#onTrackStarted = options.onTrackStarted;
     this.#onFindAlternative = options.onFindAlternative;
     this.#onResolveLinks = options.onResolveLinks;
     this.#onEvent = options.onEvent;
@@ -411,6 +418,12 @@ export class GuildPlayer {
       this.#currentLinks = NO_PLATFORM_LINKS;
       void this.#refreshLinks(track);
       if (this.#announce) void this.#announceNowPlaying(track);
+
+      // Start choosing what comes after this while it is still playing.
+      // Generating a recommendation takes a candidate sweep and a search, so
+      // doing it only once the queue drains is heard as a gap of silence.
+      // Fire-and-forget by construction — nothing here is awaited.
+      if (this.#autoplayEnabled) this.#onTrackStarted?.(this.guildId, track);
     });
 
     this.#player.on('end', (event) => {
