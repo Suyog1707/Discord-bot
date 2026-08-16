@@ -14,6 +14,7 @@
  * so a guild, an experiment, or a future learned model can replace them without
  * touching the arithmetic.
  */
+import { languageFromTags } from './language.js';
 import { normaliseArtist, normaliseTrackTitle, primaryArtist } from './musicbrainz.js';
 import type { RecentContext, TasteProfile } from './taste.js';
 
@@ -106,31 +107,6 @@ const ORIGIN_TRUST: Readonly<Record<CandidateOrigin, number>> = {
 
 /** How far back a repeat still counts as a repeat. */
 const RECENCY_WINDOW = 50;
-
-/** Language tokens that identify a candidate's language from its tags. */
-const LANGUAGE_TAG_HINTS: Readonly<Record<string, string>> = {
-  hindi: 'hindi',
-  bollywood: 'hindi',
-  desi: 'hindi',
-  punjabi: 'punjabi',
-  bhangra: 'punjabi',
-  tamil: 'tamil',
-  telugu: 'telugu',
-  bengali: 'bengali',
-  urdu: 'urdu',
-  korean: 'korean',
-  kpop: 'korean',
-  'k-pop': 'korean',
-  japanese: 'japanese',
-  jpop: 'japanese',
-  'j-pop': 'japanese',
-  spanish: 'spanish',
-  latin: 'spanish',
-  reggaeton: 'spanish',
-  french: 'french',
-  arabic: 'arabic',
-  english: 'english',
-};
 
 export function trackKeyOf(artist: string, title: string): string {
   return `${normaliseArtist(primaryArtist(artist))}::${normaliseTrackTitle(title)}`;
@@ -281,11 +257,7 @@ function scoreMoodFit(tags: readonly string[], context: ScoringContext, artistKe
 
 /** The language a candidate's tags imply, or null when they say nothing. */
 export function languageOf(tags: readonly string[]): string | null {
-  for (const tag of tags) {
-    const language = LANGUAGE_TAG_HINTS[tag];
-    if (language !== undefined) return language;
-  }
-  return null;
+  return languageFromTags(tags);
 }
 
 /** The listener's main language, when one clearly dominates. */

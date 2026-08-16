@@ -25,8 +25,9 @@ import type { PrismaClient } from '@discord-music/database';
 import { getLogger } from '../lib/logger.js';
 
 import type { CacheService } from './cache.js';
-import type { LastFmService } from './lastfm.js';
-import { normaliseArtist, primaryArtist } from './musicbrainz.js';
+import { languageFromTag } from './language.js';
+import type { LastFmService, LastFmTag } from './lastfm.js';
+import { type MusicBrainzService, normaliseArtist, primaryArtist } from './musicbrainz.js';
 
 const logger = getLogger('taste');
 
@@ -50,34 +51,6 @@ const PROFILE_CACHE_TTL_MS = 5 * 60_000;
  * establish a permanent favourite artist.
  */
 const CONFIDENCE_FULL_SAMPLE = 25;
-
-/** Tags Last.fm uses that actually name a language, mapped to a canonical form. */
-const LANGUAGE_TAGS: Readonly<Record<string, string>> = {
-  hindi: 'hindi',
-  bollywood: 'hindi',
-  desi: 'hindi',
-  punjabi: 'punjabi',
-  bhangra: 'punjabi',
-  tamil: 'tamil',
-  kollywood: 'tamil',
-  telugu: 'telugu',
-  tollywood: 'telugu',
-  bengali: 'bengali',
-  marathi: 'marathi',
-  urdu: 'urdu',
-  'k-pop': 'korean',
-  kpop: 'korean',
-  korean: 'korean',
-  'j-pop': 'japanese',
-  jpop: 'japanese',
-  japanese: 'japanese',
-  spanish: 'spanish',
-  latin: 'spanish',
-  reggaeton: 'spanish',
-  french: 'french',
-  arabic: 'arabic',
-  english: 'english',
-};
 
 export interface TasteProfile {
   /** Normalised artist -> affinity in [-1, 1]. */
@@ -155,11 +128,18 @@ export class UserTasteService {
   readonly #prisma: PrismaClient;
   readonly #cache: CacheService;
   readonly #lastfm: LastFmService;
+  readonly #musicbrainz: MusicBrainzService;
 
-  constructor(prisma: PrismaClient, cache: CacheService, lastfm: LastFmService) {
+  constructor(
+    prisma: PrismaClient,
+    cache: CacheService,
+    lastfm: LastFmService,
+    musicbrainz: MusicBrainzService,
+  ) {
     this.#prisma = prisma;
     this.#cache = cache;
     this.#lastfm = lastfm;
+    this.#musicbrainz = musicbrainz;
   }
 
   /**
@@ -250,14 +230,20 @@ export class UserTasteService {
       artistAffinity[artist] = clamp(score / weight, -1, 1);
     }
 
-    const favouredArtists = Object.entries(artistAffinity)
-      .filter(([, score]) => score > -0.2)
-      .sort(([, a], [, b]) => b - a)
+    // Ranked by how much this listener *plays* an artist, not by how much they
+    // enjoy them. Gating on positive affinity was wrong: a live probe against a
+    // real guild found every artist scoring negative — the room skips a lot —
+    // which left the tag list empty and, with it, the language. Someone who
+    // skips half the Hindi songs they put on is still a Hindi listener. Affinity
+    // still decides how each artist's tags are *weighted* below; it just no
+    // longer decides whether they are looked at.
+    const listenedArtists = [...artistScore.entries()]
+      .sort(([, a], [, b]) => b.weight - a.weight)
       .slice(0, 12)
       .map(([artist]) => artist);
 
     const { tagAffinity, languageAffinity } = await this.#deriveTags(
-      favouredArtists,
+      listenedArtists,
       artistAffinity,
     );
 
@@ -331,15 +317,31 @@ export class UserTasteService {
     const tagAffinity: Record<string, number> = {};
     const languageWeight: Record<string, number> = {};
 
-    if (!this.#lastfm.enabled || artists.length === 0) {
-      return { tagAffinity, languageAffinity: {} };
-    }
+    if (artists.length === 0) return { tagAffinity, languageAffinity: {} };
+
+    /**
+     * Tags for one artist, from Last.fm if it is configured and MusicBrainz
+     * otherwise.
+     *
+     * The fallback is load-bearing rather than decorative. Language matching —
+     * the thing that keeps a Hindi session Hindi — is driven entirely by tags,
+     * and a live probe showed it silently producing nothing whenever Last.fm was
+     * absent. MusicBrainz needs no API key and returned "bollywood, filmi,
+     * indian pop" for the same artist, which is exactly the signal required. Its
+     * tags are coarser and unweighted, so they are treated as a uniform medium
+     * strength rather than being given Last.fm's confidence.
+     */
+    const tagsFor = async (artist: string): Promise<readonly LastFmTag[]> => {
+      if (this.#lastfm.enabled) {
+        const fromLastFm = await this.#lastfm.artistTags(artist).catch(() => []);
+        if (fromLastFm.length > 0) return fromLastFm;
+      }
+      const canonical = await this.#musicbrainz.canonicalArtist(artist).catch(() => null);
+      return (canonical?.tags ?? []).map((name) => ({ name, count: 60 }));
+    };
 
     const tagLists = await Promise.all(
-      artists.map(async (artist) => ({
-        artist,
-        tags: await this.#lastfm.artistTags(artist).catch(() => []),
-      })),
+      artists.map(async (artist) => ({ artist, tags: await tagsFor(artist) })),
     );
 
     for (const { artist, tags } of tagLists) {
@@ -349,8 +351,8 @@ export class UserTasteService {
         const strength = Math.min(1, tag.count / 100);
         tagAffinity[tag.name] = (tagAffinity[tag.name] ?? 0) + affinity * strength;
 
-        const language = LANGUAGE_TAGS[tag.name];
-        if (language !== undefined) {
+        const language = languageFromTag(tag.name);
+        if (language !== null) {
           languageWeight[language] = (languageWeight[language] ?? 0) + Math.max(0, strength);
         }
       }

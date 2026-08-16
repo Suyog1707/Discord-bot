@@ -174,7 +174,9 @@ export function parseIntentHeuristically(raw: string): MusicIntent {
     mood: [...mood],
     language: language ?? null,
     quantity,
-    avoidRecent: /\b(haven'?t heard|something new|fresh|new to me)\b/u.test(text),
+    // Both the contraction and the expanded form: a live probe of "songs I have
+    // not heard recently" fell through when only `haven't` was matched.
+    avoidRecent: /\b(have ?n'?t heard|have not heard|something new|fresh|new to me)\b/u.test(text),
     // "similar but not the same artist" is the phrasing this exists to catch.
     artistDiversity: !/\b(only|just) (this|that) artist\b/u.test(text),
   });

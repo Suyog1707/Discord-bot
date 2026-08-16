@@ -52,7 +52,7 @@ export function createAiStack(options: {
 
   const lastfm = new LastFmService(cache, env.LASTFM_API_KEY);
   const musicbrainz = new MusicBrainzService(cache, env.MUSICBRAINZ_ENABLED);
-  const taste = new UserTasteService(prisma, cache, lastfm);
+  const taste = new UserTasteService(prisma, cache, lastfm, musicbrainz);
   const recommender = new RecommendationService(lastfm, cache, {
     poolSize: env.RECOMMENDATION_POOL_SIZE,
     concurrency: env.RECOMMENDATION_CONCURRENCY,
