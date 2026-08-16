@@ -195,6 +195,44 @@ export const botEnvSchema = requireInProduction(
       NEXTAUTH_SECRET: optional(z.string().min(32)),
       /** Public dashboard URL for links in bot replies (controller, /spotify connect). */
       DASHBOARD_URL: optional(url),
+
+      /* ---------------------------------------------------------------- */
+      /* AI + recommendations                                              */
+      /*                                                                   */
+      /* Every one of these is optional on purpose. The recommendation      */
+      /* stack degrades service by service: no Groq means natural-language  */
+      /* requests fall back to the existing keyword parser, no Last.fm      */
+      /* means candidates come from history and search instead of the       */
+      /* similarity graph. Playback never depends on any of them.          */
+      /* ---------------------------------------------------------------- */
+
+      /** Groq — fast intent parsing. Without it `/ask` uses the heuristic parser. */
+      GROQ_API_KEY: optional(z.string().min(1)),
+      /**
+       * Groq model id. Defaults to Llama 3.3 70B Versatile: the latency here is
+       * user-facing (someone is waiting on a slash command), and this is the
+       * strongest model Groq serves at conversational speed.
+       */
+      GROQ_MODEL: z.string().min(1).default('llama-3.3-70b-versatile'),
+      /** Hard ceiling on one intent parse. Past this the heuristic parser wins anyway. */
+      GROQ_TIMEOUT_MS: z.coerce.number().int().min(500).max(30_000).default(6_000),
+
+      /** Last.fm API key — the similar-tracks / tags discovery signal. */
+      LASTFM_API_KEY: optional(z.string().min(1)),
+
+      /**
+       * MusicBrainz needs no key, so this exists only as a kill switch: it is
+       * rate-limited to one request per second and a heavily-loaded bot may
+       * prefer local normalisation alone.
+       */
+      MUSICBRAINZ_ENABLED: booleanish.default(true),
+
+      /** Candidate pool size per recommendation pass, before ranking and trimming. */
+      RECOMMENDATION_POOL_SIZE: z.coerce.number().int().min(20).max(2_000).default(400),
+      /** Bounded parallelism for turning ranked candidates into playable tracks. */
+      RECOMMENDATION_CONCURRENCY: z.coerce.number().int().min(1).max(32).default(8),
+      /** Autoplay keeps this many vetted tracks ready before the current one ends. */
+      AUTOPLAY_PREFETCH_SIZE: z.coerce.number().int().min(1).max(50).default(15),
     }),
   ['REDIS_URL', 'LAVALINK_HOST', 'LAVALINK_PASSWORD'],
 );
