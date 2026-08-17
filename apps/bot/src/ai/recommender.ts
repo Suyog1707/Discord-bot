@@ -26,6 +26,7 @@ import type { QueuedTrack } from '../music/track.js';
 import type { CacheService } from './cache.js';
 import { identityOf, trackKeyOf } from './identity.js';
 import type { MusicIntent } from './intent.js';
+import { languageFromTags, languageFromText } from './language.js';
 import type { LastFmService } from './lastfm.js';
 import { normaliseArtist, primaryArtist } from './musicbrainz.js';
 import type { RerankContext, ShortlistReranker } from './rerank.js';
@@ -224,10 +225,17 @@ export class RecommendationService {
       'Recommendation started',
     );
 
+    // The session's language, resolved before the pool is built so it can
+    // both anchor a language tag-chart (supply) and gate the ranking (demand).
+    // An explicitly requested language needs no lookup at all.
+    const seedLanguage =
+      request.intent?.language ?? (await this.#seedLanguage(request.seeds));
+
     const candidateStart = Date.now();
     const { candidates, strategies, excludedCount } = await this.#generateCandidates(
       request,
       exclusions,
+      seedLanguage,
     );
     const candidateMs = Date.now() - candidateStart;
 
@@ -251,7 +259,7 @@ export class RecommendationService {
       };
     }
 
-    const context = this.#scoringContext(request);
+    const context = this.#scoringContext(request, seedLanguage);
 
     // Pass one: no tags, no I/O. Cheap enough to run over the whole pool.
     const scoreStart = Date.now();
@@ -271,7 +279,35 @@ export class RecommendationService {
     const tagged = await this.#enrichWithTags(shortlist.map((entry) => entry.candidate));
     const enrichMs = Date.now() - enrichStart;
 
-    let finalRanked = tagged
+    // With tags in hand, a candidate whose language confidently DIFFERS from
+    // the session's is removed outright — the scoring penalty alone still let
+    // high-similarity outliers through, and "a Hindi session played an English
+    // song" is a complaint about one track, not an average. Unknown-language
+    // candidates stay: most tags say nothing about language, and dropping them
+    // would empty the pool. If the filter would remove everything (sparse or
+    // eccentric tagging), ranking with the penalty is the safer fallback.
+    const desiredLanguage = context.desiredLanguage ?? null;
+    const languageKept =
+      desiredLanguage === null
+        ? tagged
+        : tagged.filter((candidate) => {
+            const candidateLanguage = languageFromTags(candidate.tags ?? []);
+            return candidateLanguage === null || candidateLanguage === desiredLanguage;
+          });
+    const pool = languageKept.length > 0 ? languageKept : tagged;
+    if (languageKept.length < tagged.length) {
+      logger.debug(
+        {
+          event: 'LANGUAGE_FILTERED',
+          language: desiredLanguage,
+          dropped: tagged.length - languageKept.length,
+          kept: languageKept.length,
+        },
+        'Wrong-language candidates dropped',
+      );
+    }
+
+    let finalRanked = pool
       .map((candidate) => scoreCandidate(candidate, context))
       .sort((a, b) => b.breakdown.final - a.breakdown.final);
 
@@ -418,7 +454,10 @@ export class RecommendationService {
     };
   }
 
-  #scoringContext(request: RecommendationRequest): ScoringContext {
+  #scoringContext(
+    request: RecommendationRequest,
+    seedLanguage: string | null,
+  ): ScoringContext {
     const intent = request.intent;
     const desiredTags = [...(intent?.mood ?? []), ...(intent?.genre ?? [])].map((tag) =>
       tag.toLowerCase(),
@@ -428,10 +467,12 @@ export class RecommendationService {
       profile: request.profile,
       recent: request.recent,
       ...(desiredTags.length === 0 ? {} : { desiredTags }),
-      // An explicitly requested language always wins; otherwise fall back to
-      // whatever the listener has established, which is what keeps a Hindi
-      // session Hindi without anyone having to ask for it.
-      desiredLanguage: intent?.language ?? dominantLanguage(request.profile),
+      // An explicitly requested language always wins. After that, the SEEDS
+      // decide (`seedLanguage` already folds the intent in): the language of
+      // what is playing right now is what keeps a Hindi session Hindi even in
+      // a guild whose long-term history is mostly English. The profile's
+      // dominant language is the last resort, for seedless requests.
+      desiredLanguage: seedLanguage ?? dominantLanguage(request.profile),
       excludedArtists: (intent?.excludeArtists ?? []).map((artist) =>
         normaliseArtist(primaryArtist(artist)),
       ),
@@ -452,6 +493,7 @@ export class RecommendationService {
   async #generateCandidates(
     request: RecommendationRequest,
     exclusions: RecommendationExclusions,
+    seedLanguage: string | null,
   ): Promise<{
     candidates: readonly Candidate[];
     strategies: readonly string[];
@@ -609,12 +651,15 @@ export class RecommendationService {
             .sort(([, a], [, b]) => b - a)
             .slice(0, 2)
             .map(([tag]) => tag);
-    const languageTag = intent?.language;
+    // The session's language doubles as a tag chart — it is how a Hindi
+    // session gets Hindi SUPPLY even when the profile's favourite artists and
+    // top tags would fill the pool with English. (`seedLanguage` already
+    // prefers an explicitly requested language over the inferred one.)
     const tagQueries = [
       ...new Set([
         ...requestedTags,
         ...profileTags,
-        ...(languageTag === null || languageTag === undefined ? [] : [languageTag]),
+        ...(seedLanguage === null ? [] : [seedLanguage]),
       ]),
     ];
 
@@ -717,17 +762,7 @@ export class RecommendationService {
     const tagsByArtist = new Map<string, readonly string[]>();
     await Promise.all(
       artists.map(async (artist) => {
-        const key = normaliseArtist(artist);
-        const cached = await this.#cache.get<readonly string[]>(`artist-tags:${key}`);
-        if (cached !== null) {
-          tagsByArtist.set(key, cached);
-          return;
-        }
-        const tags = (await this.#lastfm.artistTags(artist).catch(() => []))
-          .slice(0, 8)
-          .map((tag) => tag.name);
-        tagsByArtist.set(key, tags);
-        await this.#cache.set(`artist-tags:${key}`, tags, 7 * 24 * 60 * 60_000);
+        tagsByArtist.set(normaliseArtist(artist), await this.#artistTags(artist));
       }),
     );
 
@@ -736,6 +771,42 @@ export class RecommendationService {
       if (artistTags.length === 0) return candidate;
       return { ...candidate, tags: [...new Set([...(candidate.tags ?? []), ...artistTags])] };
     });
+  }
+
+  /** One artist's community tags, cache-fronted for a week. */
+  async #artistTags(artist: string): Promise<readonly string[]> {
+    const key = normaliseArtist(artist);
+    const cached = await this.#cache.get<readonly string[]>(`artist-tags:${key}`);
+    if (cached !== null) return cached;
+    const tags = (await this.#lastfm.artistTags(artist).catch(() => []))
+      .slice(0, 8)
+      .map((tag) => tag.name);
+    await this.#cache.set(`artist-tags:${key}`, tags, 7 * 24 * 60 * 60_000);
+    return tags;
+  }
+
+  /**
+   * The language of the music that is PLAYING, read off the seed tracks.
+   *
+   * This is what makes "I played a Hindi song, give me Hindi songs" work when
+   * the guild's long-term profile says something else (or, below a 50%
+   * majority, says nothing). The long-term profile answers "what does this
+   * room usually like"; the seeds answer "what is this session", and for
+   * autoplay the session must win.
+   *
+   * Newest seed first: the room follows what is playing now, not what played
+   * four tracks ago. Title script is checked before artist tags because it is
+   * free and cannot be wrong; tags cover the (common) transliterated case.
+   */
+  async #seedLanguage(seeds: readonly TrackSeed[]): Promise<string | null> {
+    for (const seed of seeds.slice(0, 3)) {
+      const byScript = languageFromText(`${seed.title} ${seed.artist}`);
+      if (byScript !== null) return byScript;
+      if (!this.#lastfm.enabled) continue;
+      const byTags = languageFromTags(await this.#artistTags(primaryArtist(seed.artist)));
+      if (byTags !== null) return byTags;
+    }
+    return null;
   }
 
   /**

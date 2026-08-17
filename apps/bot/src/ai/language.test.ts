@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { languageFromTag, languageFromTags } from './language.js';
+import { languageFromTag, languageFromTags, languageFromText } from './language.js';
 
 describe('languageFromTag', () => {
   // The bug this file exists for: a real guild listening to Indian hip hop
@@ -52,5 +52,35 @@ describe('languageFromTags', () => {
   it('returns null when no tag implies one', () => {
     expect(languageFromTags(['chill', 'guitar'])).toBeNull();
     expect(languageFromTags([])).toBeNull();
+  });
+
+  // Nobody tags anglophone music "english"; nationality tags are how Last.fm
+  // actually marks it. Without these, English candidates were unknown-language
+  // and slid past the mismatch penalty in a Hindi session.
+  it('reads anglophone nationality tags as English', () => {
+    expect(languageFromTag('british')).toBe('english');
+    expect(languageFromTag('american pop')).toBe('english');
+    expect(languageFromTag('britpop')).toBe('english');
+  });
+
+  it('does not read "latin american" as English', () => {
+    expect(languageFromTag('latin american')).toBe('spanish');
+  });
+});
+
+describe('languageFromText', () => {
+  // A Devanagari title is a Hindi song regardless of tags, and the title is
+  // available before any network call — this is the free signal seed-language
+  // inference tries first.
+  it('reads a language off the writing system', () => {
+    expect(languageFromText('तुम ही हो')).toBe('hindi');
+    expect(languageFromText('ਪੰਜਾਬੀ ਗੀਤ')).toBe('punjabi');
+    expect(languageFromText('사랑해')).toBe('korean');
+    expect(languageFromText('夜に駆ける feat. ずっと')).toBe('japanese');
+  });
+
+  it('returns null for Latin script — transliteration says nothing', () => {
+    expect(languageFromText('Tum Hi Ho')).toBeNull();
+    expect(languageFromText('Shape of You')).toBeNull();
   });
 });

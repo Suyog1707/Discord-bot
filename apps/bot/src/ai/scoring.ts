@@ -93,6 +93,7 @@ export interface ScoreBreakdown {
   readonly recencyPenalty: number;
   readonly artistPenalty: number;
   readonly skipPenalty: number;
+  readonly languagePenalty: number;
   readonly final: number;
 }
 
@@ -232,7 +233,23 @@ export function scoreCandidate(candidate: Candidate, context: ScoringContext): S
       ? 0.5
       : 0;
 
-  const final = clamp01(positive - recencyPenalty - artistPenalty - skipPenalty);
+  // A candidate whose tags confidently name a DIFFERENT language than the
+  // session's is near-disqualified, not nudged. Folded into moodFit alone it
+  // was worth 0.4 × 0.15 ≈ 0.06 of the final score — a rounding error next to
+  // similarity, which is exactly how an English track outranked every Hindi
+  // one. Unknown language stays unpunished: most tags say nothing about it.
+  const sessionLanguage = context.desiredLanguage ?? dominantLanguage(profile);
+  const candidateLanguage = languageFromTags(tags);
+  const languagePenalty =
+    sessionLanguage !== null &&
+    candidateLanguage !== null &&
+    candidateLanguage !== sessionLanguage
+      ? 0.35
+      : 0;
+
+  const final = clamp01(
+    positive - recencyPenalty - artistPenalty - skipPenalty - languagePenalty,
+  );
 
   return {
     candidate,
@@ -248,6 +265,7 @@ export function scoreCandidate(candidate: Candidate, context: ScoringContext): S
       recencyPenalty,
       artistPenalty,
       skipPenalty,
+      languagePenalty,
       final,
     },
   };
@@ -516,6 +534,7 @@ export function explainScore(entry: ScoredCandidate): string {
     b.recencyPenalty > 0 ? `-recency ${b.recencyPenalty.toFixed(2)}` : null,
     b.artistPenalty > 0 ? `-artist ${b.artistPenalty.toFixed(2)}` : null,
     b.skipPenalty > 0 ? `-skipped ${b.skipPenalty.toFixed(2)}` : null,
+    b.languagePenalty > 0 ? `-language ${b.languagePenalty.toFixed(2)}` : null,
   ].filter((part): part is string => part !== null);
 
   return `${b.final.toFixed(3)} = ${parts.join(', ')}${

@@ -606,4 +606,124 @@ describe('RecommendationService — rerank safety', () => {
     expect(result.reranked).toBe(false);
     expect(result.tracks.length).toBeGreaterThan(0);
   });
+
+  // The complaint behind this test: play a Hindi song in a guild whose history
+  // is mostly English, start autoplay, get English songs. The seed's language
+  // must decide the session's language — and a candidate confidently tagged as
+  // another language must never surface, even when raw similarity favours it.
+  it('keeps a Hindi session Hindi even when English candidates outscore on similarity', async () => {
+    const tagsByArtist: Record<string, readonly string[]> = {
+      'Arijit Singh': ['bollywood', 'romantic'],
+      ...Object.fromEntries(
+        Array.from({ length: 5 }, (_, index) => [
+          `Desi Artist ${String(index)}`,
+          ['hindi', 'filmi'],
+        ]),
+      ),
+      ...Object.fromEntries(
+        Array.from({ length: 5 }, (_, index) => [
+          `English Artist ${String(index)}`,
+          ['british', 'pop'],
+        ]),
+      ),
+    };
+
+    const service = {
+      enabled: true,
+      similarTracks: vi.fn((): Promise<readonly SimilarTrack[]> =>
+        Promise.resolve([
+          // English candidates get PERFECT similarity; Hindi ones middling.
+          // Ranking alone would put every English track first.
+          ...Array.from({ length: 20 }, (_, index) => ({
+            name: `English Hit ${String(index)}`,
+            artist: `English Artist ${String(index % 5)}`,
+            match: 1,
+          })),
+          ...Array.from({ length: 20 }, (_, index) => ({
+            name: `Hindi Song ${String(index)}`,
+            artist: `Desi Artist ${String(index % 5)}`,
+            match: 0.6,
+          })),
+        ]),
+      ),
+      similarArtists: vi.fn((): Promise<readonly SimilarArtist[]> => Promise.resolve([])),
+      artistTags: vi.fn((artist: string): Promise<readonly LastFmTag[]> =>
+        Promise.resolve(
+          (tagsByArtist[artist] ?? []).map((name) => ({ name, count: 10 })),
+        ),
+      ),
+      trackTags: vi.fn((): Promise<readonly LastFmTag[]> => Promise.resolve([])),
+      tagTopTracks: vi.fn((): Promise<readonly SimilarTrack[]> => Promise.resolve([])),
+    } as unknown as LastFmService;
+
+    const recommender = new RecommendationService(service, new CacheService());
+    const { resolve } = trackingResolver();
+
+    const result = await recommender.recommend(
+      {
+        seeds: [{ title: 'Tum Hi Ho', artist: 'Arijit Singh' }],
+        count: 6,
+        profile: EMPTY_TASTE_PROFILE,
+        recent: EMPTY_RECENT_CONTEXT,
+      },
+      resolve,
+    );
+
+    expect(result.tracks.length).toBeGreaterThan(0);
+    for (const entry of result.tracks) {
+      expect(entry.author).toMatch(/^Desi Artist/);
+    }
+  });
+
+  it('reads the session language off a native-script title without any tag lookup', async () => {
+    const service = {
+      enabled: true,
+      similarTracks: vi.fn((): Promise<readonly SimilarTrack[]> =>
+        Promise.resolve([
+          ...Array.from({ length: 10 }, (_, index) => ({
+            name: `English Hit ${String(index)}`,
+            artist: `English Artist ${String(index % 5)}`,
+            match: 1,
+          })),
+          ...Array.from({ length: 10 }, (_, index) => ({
+            name: `Hindi Song ${String(index)}`,
+            artist: `Desi Artist ${String(index % 5)}`,
+            match: 0.6,
+          })),
+        ]),
+      ),
+      similarArtists: vi.fn((): Promise<readonly SimilarArtist[]> => Promise.resolve([])),
+      // Tags identify candidate languages but say nothing about the seed —
+      // the Devanagari title alone must establish the session as Hindi.
+      artistTags: vi.fn((artist: string): Promise<readonly LastFmTag[]> =>
+        Promise.resolve(
+          artist.startsWith('English')
+            ? [{ name: 'british', count: 10 }]
+            : artist.startsWith('Desi')
+              ? [{ name: 'bollywood', count: 10 }]
+              : [],
+        ),
+      ),
+      trackTags: vi.fn((): Promise<readonly LastFmTag[]> => Promise.resolve([])),
+      tagTopTracks: vi.fn((): Promise<readonly SimilarTrack[]> => Promise.resolve([])),
+    } as unknown as LastFmService;
+
+    const recommender = new RecommendationService(service, new CacheService());
+    const { resolve } = trackingResolver();
+
+    const result = await recommender.recommend(
+      {
+        seeds: [{ title: 'तुम ही हो', artist: 'Arijit Singh' }],
+        count: 4,
+        profile: EMPTY_TASTE_PROFILE,
+        recent: EMPTY_RECENT_CONTEXT,
+      },
+      resolve,
+    );
+
+    expect(result.tracks.length).toBeGreaterThan(0);
+    for (const entry of result.tracks) {
+      expect(entry.author).toMatch(/^Desi Artist/);
+    }
+  });
 });

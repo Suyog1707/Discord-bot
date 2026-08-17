@@ -51,6 +51,13 @@ const LANGUAGE_TOKENS: readonly (readonly [string, string])[] = [
   ['turkish', 'turkish'],
   ['portuguese', 'portuguese'],
   ['brazilian', 'portuguese'],
+  // Nationality tags are how Last.fm actually marks anglophone artists —
+  // nobody tags "english", but "british" and "american" are everywhere. They
+  // sit BELOW 'latin', so "latin american" resolves to Spanish first.
+  ['britpop', 'english'],
+  ['british', 'english'],
+  ['american', 'english'],
+  ['australian', 'english'],
   ['english', 'english'],
 ];
 
@@ -74,6 +81,38 @@ export function languageFromTags(tags: readonly string[]): string | null {
   for (const tag of tags) {
     const language = languageFromTag(tag);
     if (language !== null) return language;
+  }
+  return null;
+}
+
+/**
+ * Writing systems that pin a language on their own. A Devanagari title is a
+ * Hindi song no matter what the tags say — and unlike tags, the title is
+ * available for free, with no lookup, before any network call.
+ *
+ * Latin script is deliberately absent: Bollywood tracks are routinely
+ * transliterated ("Tum Hi Ho"), so Latin text says nothing about language.
+ */
+const SCRIPT_RANGES: readonly (readonly [RegExp, string])[] = [
+  [/[ऀ-ॿ]/u, 'hindi'], // Devanagari
+  [/[਀-੿]/u, 'punjabi'], // Gurmukhi
+  [/[ঀ-৿]/u, 'bengali'],
+  [/[஀-௿]/u, 'tamil'],
+  [/[ఀ-౿]/u, 'telugu'],
+  [/[ಀ-೿]/u, 'kannada'],
+  [/[ഀ-ൿ]/u, 'malayalam'],
+  [/[가-힯ᄀ-ᇿ]/u, 'korean'], // Hangul
+  [/[぀-ヿ]/u, 'japanese'], // Hiragana + Katakana
+  [/[؀-ۿ]/u, 'arabic'],
+];
+
+/**
+ * The language a piece of text implies by its writing system, or null when the
+ * script is ambiguous (Latin, digits, punctuation).
+ */
+export function languageFromText(text: string): string | null {
+  for (const [pattern, language] of SCRIPT_RANGES) {
+    if (pattern.test(text)) return language;
   }
   return null;
 }
