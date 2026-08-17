@@ -102,6 +102,18 @@ export interface RecentContext {
   readonly skipped: readonly string[];
   /** Canonical track keys of early skips, for candidates with no identifier. */
   readonly skippedKeys: readonly string[];
+  /**
+   * Artists of recent USER-originated, non-skipped plays, newest first. The
+   * "session sounds like this" positive signal reads these — never the full
+   * artist list, which includes autoplay's own picks and would let the
+   * recommender reward proximity to its previous output (drift).
+   */
+  readonly anchorArtists?: readonly string[];
+  /**
+   * Artists of the early skips, one entry per skip. Repeats matter: two skips
+   * of one artist say more than one, and the scorer escalates accordingly.
+   */
+  readonly skippedArtists?: readonly string[];
 }
 
 export const EMPTY_RECENT_CONTEXT: RecentContext = {
@@ -111,6 +123,8 @@ export const EMPTY_RECENT_CONTEXT: RecentContext = {
   artists: [],
   skipped: [],
   skippedKeys: [],
+  anchorArtists: [],
+  skippedArtists: [],
 };
 
 export type TasteScope = { readonly guildId: string } | { readonly userId: string };
@@ -122,7 +136,30 @@ interface HistoryRow {
   readonly durationMs: number;
   readonly playedMs: number;
   readonly skipped: boolean;
+  readonly origin: string;
   readonly playedAt: Date;
+}
+
+/**
+ * How much one play counts toward the long-term profile, by where it came from.
+ *
+ * A person choosing a song is the profile's ground truth: full weight. An
+ * autoplay play the listener merely tolerated says little — the recommender
+ * picked it, not the person — so it counts for a fraction; letting it count
+ * fully would feed the recommender's output back in as taste (drift, in slow
+ * motion). Two autoplay cases carry real information and keep more weight: a
+ * skip is genuine negative feedback at full strength, and a near-complete
+ * listen is a mild endorsement.
+ */
+export function originWeightOf(row: {
+  readonly origin: string;
+  readonly skipped: boolean;
+  readonly playedMs: number;
+  readonly durationMs: number;
+}): number {
+  if (row.origin !== 'autoplay') return 1;
+  if (row.skipped) return 1;
+  return completionOf(row) >= 0.85 ? 0.6 : 0.35;
 }
 
 function scopeKey(scope: TasteScope): string {
@@ -207,9 +244,9 @@ export class UserTasteService {
     if (rows.length === 0) return EMPTY_TASTE_PROFILE;
 
     const now = Date.now();
-    const weightOf = (playedAt: Date): number => {
-      const ageDays = (now - playedAt.getTime()) / 86_400_000;
-      return Math.pow(0.5, ageDays / DECAY_HALF_LIFE_DAYS);
+    const weightOf = (row: HistoryRow): number => {
+      const ageDays = (now - row.playedAt.getTime()) / 86_400_000;
+      return Math.pow(0.5, ageDays / DECAY_HALF_LIFE_DAYS) * originWeightOf(row);
     };
 
     // Pass one: this listener's own baseline, so "played 70%" can be read as
@@ -217,7 +254,7 @@ export class UserTasteService {
     let weightedCompletion = 0;
     let totalWeight = 0;
     for (const row of rows) {
-      const weight = weightOf(row.playedAt);
+      const weight = weightOf(row);
       totalWeight += weight;
       weightedCompletion += weight * completionOf(row);
     }
@@ -229,7 +266,7 @@ export class UserTasteService {
       const artist = normaliseArtist(primaryArtist(row.author));
       if (artist.length === 0) continue;
 
-      const weight = weightOf(row.playedAt);
+      const weight = weightOf(row);
       // A skip is a stronger statement than a slightly-short play, so it is
       // floored well below whatever the deviation alone would give.
       const deviation = completionOf(row) - completionRate;
@@ -306,6 +343,7 @@ export class UserTasteService {
           author: true,
           title: true,
           skipped: true,
+          origin: true,
           playedMs: true,
           durationMs: true,
         },
@@ -322,6 +360,10 @@ export class UserTasteService {
         artists: rows.map((row) => normaliseArtist(primaryArtist(row.author))),
         skipped: earlySkips.map((row) => row.identifier),
         skippedKeys: earlySkips.map((row) => trackKeyOf(row.author, row.title)),
+        anchorArtists: rows
+          .filter((row) => row.origin !== 'autoplay' && !row.skipped)
+          .map((row) => normaliseArtist(primaryArtist(row.author))),
+        skippedArtists: earlySkips.map((row) => normaliseArtist(primaryArtist(row.author))),
       };
     } catch (error) {
       logger.warn({ err: error, guildId }, 'Recent context read failed');
@@ -354,17 +396,21 @@ export class UserTasteService {
           title: true,
           playedMs: true,
           durationMs: true,
+          origin: true,
           playedAt: true,
         },
       });
 
       // Aggregate per canonical song: total plays, best completion, last heard.
+      // A play the user chose counts double a completed autoplay play — both
+      // are positive signals, but an explicit choice is the stronger one.
       const bySong = new Map<
         string,
         { title: string; artist: string; identifier: string; plays: number; lastPlayedAt: Date }
       >();
       for (const row of rows) {
         if (completionOf(row) < 0.85) continue;
+        const playWeight = row.origin === 'autoplay' ? 1 : 2;
         const key = trackKeyOf(row.author, row.title);
         const existing = bySong.get(key);
         if (existing === undefined) {
@@ -372,11 +418,11 @@ export class UserTasteService {
             title: row.title,
             artist: row.author,
             identifier: row.identifier,
-            plays: 1,
+            plays: playWeight,
             lastPlayedAt: row.playedAt,
           });
         } else {
-          existing.plays += 1;
+          existing.plays += playWeight;
           if (row.playedAt > existing.lastPlayedAt) existing.lastPlayedAt = row.playedAt;
         }
       }
@@ -484,6 +530,7 @@ export class UserTasteService {
         durationMs: true,
         playedMs: true,
         skipped: true,
+        origin: true,
         playedAt: true,
       },
     });

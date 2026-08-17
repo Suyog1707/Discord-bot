@@ -193,11 +193,17 @@ export function scoreCandidate(candidate: Candidate, context: ScoringContext): S
   // Novelty rewards what this guild has not played recently.
   const novelty = playedIndex !== -1 ? 0 : context.avoidRecent === true ? 1 : 0.7;
 
-  // Recent behaviour: the artists of the last few tracks are what the session
-  // currently sounds like, and staying adjacent to them is the point of a radio.
-  const recentIndex = recent.artists.indexOf(artistKey);
+  // Recent behaviour: what the session sounds like — measured against the
+  // artists the USER put on, when origin data is available. Reading the full
+  // recent list here rewarded proximity to autoplay's own previous picks,
+  // which is the drift feedback loop in one line.
+  const behaviourArtists =
+    recent.anchorArtists !== undefined && recent.anchorArtists.length > 0
+      ? recent.anchorArtists
+      : recent.artists;
+  const recentIndex = behaviourArtists.indexOf(artistKey);
   const recentBehaviour =
-    recentIndex === -1 ? 0.4 : clamp01(1 - recentIndex / Math.max(1, recent.artists.length));
+    recentIndex === -1 ? 0.4 : clamp01(1 - recentIndex / Math.max(1, behaviourArtists.length));
 
   const positive =
     weights.similarity * similarity +
@@ -221,17 +227,23 @@ export function scoreCandidate(candidate: Candidate, context: ScoringContext): S
   // artists play); the history-position fallback covers callers without one.
   const fatigue = context.artistFatigue?.get(artistKey);
   const artistIndex = recent.artists.indexOf(artistKey);
-  const positionPenalty =
-    artistIndex === -1 ? 0 : 0.25 * (1 - Math.min(artistIndex, 10) / 10);
+  const positionPenalty = artistIndex === -1 ? 0 : 0.25 * (1 - Math.min(artistIndex, 10) / 10);
   const artistPenalty =
     fatigue === undefined ? positionPenalty : Math.max(positionPenalty, 0.3 * clamp01(fatigue));
 
-  // An early skip is an explicit rejection. Nothing outweighs it.
-  const skipPenalty =
+  // An early skip is an explicit rejection. Nothing outweighs it. Beyond the
+  // track itself, repeated skips of one ARTIST escalate: one skip is mood and
+  // costs the artist's other songs almost nothing, but a pattern of rejection
+  // is taste and pushes the whole catalogue down — without banning anyone
+  // forever, since the skip window slides.
+  const trackSkipped =
     (candidate.identifier !== undefined && recent.skipped.includes(candidate.identifier)) ||
-    recent.skippedKeys.includes(trackKey)
-      ? 0.5
-      : 0;
+    recent.skippedKeys.includes(trackKey);
+  const artistSkipCount = (recent.skippedArtists ?? []).filter(
+    (skippedArtist) => skippedArtist === artistKey,
+  ).length;
+  const artistSkipPenalty = artistSkipCount >= 3 ? 0.35 : artistSkipCount === 2 ? 0.2 : 0;
+  const skipPenalty = trackSkipped ? 0.5 : artistSkipPenalty;
 
   // A candidate whose tags confidently name a DIFFERENT language than the
   // session's is near-disqualified, not nudged. Folded into moodFit alone it
@@ -241,15 +253,11 @@ export function scoreCandidate(candidate: Candidate, context: ScoringContext): S
   const sessionLanguage = context.desiredLanguage ?? dominantLanguage(profile);
   const candidateLanguage = languageFromTags(tags);
   const languagePenalty =
-    sessionLanguage !== null &&
-    candidateLanguage !== null &&
-    candidateLanguage !== sessionLanguage
+    sessionLanguage !== null && candidateLanguage !== null && candidateLanguage !== sessionLanguage
       ? 0.35
       : 0;
 
-  const final = clamp01(
-    positive - recencyPenalty - artistPenalty - skipPenalty - languagePenalty,
-  );
+  const final = clamp01(positive - recencyPenalty - artistPenalty - skipPenalty - languagePenalty);
 
   return {
     candidate,

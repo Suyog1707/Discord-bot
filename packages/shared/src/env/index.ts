@@ -231,8 +231,13 @@ export const botEnvSchema = requireInProduction(
       RECOMMENDATION_POOL_SIZE: z.coerce.number().int().min(20).max(2_000).default(400),
       /** Bounded parallelism for turning ranked candidates into playable tracks. */
       RECOMMENDATION_CONCURRENCY: z.coerce.number().int().min(1).max(32).default(8),
-      /** Autoplay keeps this many vetted tracks ready before the current one ends. */
-      AUTOPLAY_PREFETCH_SIZE: z.coerce.number().int().min(1).max(50).default(15),
+      /**
+       * Autoplay keeps this many vetted tracks ready before the current one
+       * ends. Small by design (Smart-Shuffle-style just-in-time batches): each
+       * batch is regenerated from the taste anchors plus fresh feedback, and a
+       * large buffer would lock in picks made before that feedback existed.
+       */
+      AUTOPLAY_PREFETCH_SIZE: z.coerce.number().int().min(1).max(50).default(2),
     }),
   ['REDIS_URL', 'LAVALINK_HOST', 'LAVALINK_PASSWORD'],
 );

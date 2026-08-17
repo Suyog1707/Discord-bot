@@ -392,6 +392,11 @@ model SongHistory {
   /// How much of the track actually played before skip/stop.
   playedMs   Int         @default(0)
   skipped    Boolean     @default(false)
+  /// "user" for tracks a person chose; "autoplay" for recommendation-generated
+  /// plays. The taste profile weights these differently — autoplay plays must
+  /// never carry the same authority as explicit user selections, or the
+  /// recommender's own output becomes its dominant input (taste drift).
+  origin     String      @default("user")
   playedAt   DateTime    @default(now()) @db.Timestamptz(3)
 
   guild Guild @relation(fields: [guildId], references: [id], onDelete: Cascade)

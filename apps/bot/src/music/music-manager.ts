@@ -28,9 +28,11 @@ import {
   type Track as LavalinkTrack,
 } from 'shoukaku';
 
+import { selectAutoplaySeeds, type AnchorHistoryEntry } from '../ai/anchors.js';
 import type { AutoplayEngine } from '../ai/autoplay.js';
 import { identityOf } from '../ai/identity.js';
 import type { MusicOrchestrator } from '../ai/orchestrator.js';
+import type { TrackSeed } from '../ai/recommender.js';
 import type { AutoplaySessionStore, SessionEntry } from '../ai/session.js';
 import type { LavalinkNode } from '../config/env.js';
 import { getEnv } from '../config/env.js';
@@ -53,6 +55,7 @@ import {
   buildSearchQuery,
   fromLavalinkTrack,
   isPlausibleAlternative,
+  trackOrigin,
   type QueuedTrack,
 } from './track.js';
 
@@ -62,8 +65,15 @@ const logger = getLogger('music');
 const RECONNECT_PROBE_INTERVAL_MS = 30_000;
 /** A reachability probe should answer immediately or not at all. */
 const PROBE_TIMEOUT_MS = 2_000;
-/** How many tracks one autoplay top-up adds. */
-const AUTOPLAY_PICK_TARGET = 5;
+/**
+ * How many tracks one autoplay top-up adds. Deliberately tiny — Smart-Shuffle
+ * style just-in-time batches: each pair is generated fresh from the taste
+ * anchors plus the feedback on the pair before it, so a mediocre pick costs
+ * two songs, not a queue. Large batches also drift structurally: fifteen picks
+ * from one generation wholesale replace the "recent listening" context the
+ * next generation reads.
+ */
+const AUTOPLAY_PICK_TARGET = 2;
 
 export interface ResolveResult {
   readonly tracks: readonly QueuedTrack[];
@@ -381,23 +391,22 @@ export class MusicManager {
             );
           }
         }
-        // Seed window: the track that just started plus the last few played,
-        // straight from the in-memory queue. A window (rather than one seed)
-        // is what lets the engine recognise an existing buffer as "still
-        // following this session" instead of regenerating on every track.
-        const player = this.#players.get(guildId);
-        const played =
-          player === undefined
-            ? []
-            : player.queue.tracks.slice(0, Math.max(0, player.queue.currentIndex)).slice(-3);
-        this.#autoplay?.prefetch(guildId, [
-          { title: track.title, artist: track.author, identifier: track.identifier },
-          ...played.reverse().map((entry) => ({
-            title: entry.title,
-            artist: entry.author,
-            identifier: entry.identifier,
-          })),
-        ]);
+        // Warm the buffer from the TASTE ANCHORS, not from whatever happens
+        // to be playing. The old seed window here — the current track plus
+        // the last few played, origin-blind — was the drift engine: once a
+        // batch of recommendations played, they became the seeds, and every
+        // subsequent batch orbited the previous one instead of the listener.
+        // Anchor seeds come from history (user-originated plays as anchors),
+        // with the current track joining as anchor or discounted context
+        // according to who chose it. Async and fire-and-forget: the playback
+        // path never waits on the history read.
+        if (this.#autoplay !== undefined) {
+          void this.#anchorSeeds(guildId, track)
+            .then((seeds) => {
+              if (seeds.length > 0) this.#autoplay?.prefetch(guildId, seeds);
+            })
+            .catch(() => undefined);
+        }
       },
       // Learning: completions and early skips of autoplay picks are the
       // recommendation outcomes future scoring feeds on.
@@ -576,10 +585,15 @@ export class MusicManager {
     const raw = await this.#searchOne(node, `${candidate.artist} ${candidate.title}`);
     if (raw === null) return null;
 
-    const track = fromLavalinkTrack(raw, {
-      id: this.#client.user?.id ?? '0',
-      name: 'Autoplay',
-    });
+    const track: QueuedTrack = {
+      ...fromLavalinkTrack(raw, {
+        id: this.#client.user?.id ?? '0',
+        name: 'Autoplay',
+      }),
+      // Recommendation-generated: history and future generations must treat
+      // this play as context, never as user taste.
+      origin: 'autoplay',
+    };
 
     // Live streams and radio rips are not songs; long uploads are usually full
     // albums or hour-long mixes that would swallow the queue.
@@ -608,6 +622,30 @@ export class MusicManager {
   /** Drop a guild's prefetched autoplay buffer — on stop or disconnect. */
   clearAutoplayBuffer(guildId: string): void {
     this.#autoplay?.clear(guildId);
+  }
+
+  /**
+   * Anchor-based seeds for one guild, optionally with the track that just
+   * started prepended (it is not in history yet — its row is written when it
+   * ends). One indexed query; the anchor selection itself is pure.
+   */
+  async #anchorSeeds(guildId: string, current?: QueuedTrack): Promise<readonly TrackSeed[]> {
+    const history = await this.#store.recentHistory(guildId, 40);
+    const entries: AnchorHistoryEntry[] = [
+      ...(current === undefined
+        ? []
+        : [
+            {
+              title: current.title,
+              author: current.author,
+              identifier: current.identifier,
+              origin: trackOrigin(current),
+              skipped: false,
+            },
+          ]),
+      ...history,
+    ];
+    return selectAutoplaySeeds(entries);
   }
 
   /** One Lavalink search, served from the short-lived result cache when possible. */
@@ -905,11 +943,11 @@ export class MusicManager {
       // The session's queued-set must be current BEFORE generation reads it:
       // this is the hard "already in the queue" exclusion.
       this.#syncSessionQueue(guildId);
-      const seeds = history.slice(0, 4).map((entry) => ({
-        title: entry.title,
-        artist: entry.author,
-        identifier: entry.identifier,
-      }));
+      // Anchor-based seeds: user-originated plays anchor the generation, the
+      // newest autoplay play joins only as discounted context. Seeding from
+      // the raw last-4 plays here — origin-blind — was the primary source of
+      // taste drift.
+      const seeds = selectAutoplaySeeds(history);
 
       const recommended = await engine.take(guildId, AUTOPLAY_PICK_TARGET, seeds);
       if (recommended.length > 0) {
@@ -945,7 +983,15 @@ export class MusicManager {
     const cleanAuthor = (author: string): string =>
       author.replace(/\s*-\s*Topic$/iu, '').replace(/VEVO$/iu, '');
 
-    const seedAuthors = [...new Set(history.slice(0, 8).map((entry) => cleanAuthor(entry.author)))]
+    // Last-resort artist search seeds from the artists the USER played.
+    const authorPool = history.filter((entry) => entry.origin === 'user' && !entry.skipped);
+    const seedAuthors = [
+      ...new Set(
+        (authorPool.length > 0 ? authorPool : history)
+          .slice(0, 8)
+          .map((entry) => cleanAuthor(entry.author)),
+      ),
+    ]
       .filter((author) => author.length > 0)
       .slice(0, 3);
 
@@ -956,7 +1002,7 @@ export class MusicManager {
     /** Keep a candidate only if it is fresh, playable and not over-represented. */
     const consider = (raw: LavalinkTrack): void => {
       if (picks.length >= AUTOPLAY_PICK_TARGET) return;
-      const track = fromLavalinkTrack(raw, requester);
+      const track: QueuedTrack = { ...fromLavalinkTrack(raw, requester), origin: 'autoplay' };
 
       const trackKey = identityOf(track.author, track.title).key;
       if (playedIdentifiers.has(track.identifier)) return;
@@ -983,10 +1029,14 @@ export class MusicManager {
 
     // YouTube mixes are keyed by video id, so only sources whose identifier is
     // one can seed them. Spotify qualifies: its queue entries carry the id of
-    // the YouTube match that actually played.
-    const mixSeeds = history
-      .filter((entry) => entry.source === 'youtube' || entry.source === 'spotify')
-      .slice(0, 2);
+    // the YouTube match that actually played. User-originated plays seed the
+    // mix when any exist in the window — a mix spun off an autoplay pick is
+    // the same drift chain in fallback clothing.
+    const mixable = history.filter(
+      (entry) => entry.source === 'youtube' || entry.source === 'spotify',
+    );
+    const userMixable = mixable.filter((entry) => entry.origin === 'user' && !entry.skipped);
+    const mixSeeds = (userMixable.length > 0 ? userMixable : mixable).slice(0, 2);
 
     for (const seed of mixSeeds) {
       if (picks.length >= AUTOPLAY_PICK_TARGET) break;

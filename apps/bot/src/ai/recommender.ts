@@ -66,6 +66,13 @@ export interface TrackSeed {
   readonly title: string;
   readonly artist: string;
   readonly identifier?: string;
+  /**
+   * How much this seed's similarity expansions are trusted, in (0, 1].
+   * Absent means 1 — a full taste anchor. Autoplay-originated context seeds
+   * carry a fraction, which discounts every candidate they generate: the
+   * previous recommendation may inform the next batch, never dominate it.
+   */
+  readonly weight?: number;
 }
 
 /**
@@ -228,8 +235,7 @@ export class RecommendationService {
     // The session's language, resolved before the pool is built so it can
     // both anchor a language tag-chart (supply) and gate the ranking (demand).
     // An explicitly requested language needs no lookup at all.
-    const seedLanguage =
-      request.intent?.language ?? (await this.#seedLanguage(request.seeds));
+    const seedLanguage = request.intent?.language ?? (await this.#seedLanguage(request.seeds));
 
     const candidateStart = Date.now();
     const { candidates, strategies, excludedCount } = await this.#generateCandidates(
@@ -385,9 +391,7 @@ export class RecommendationService {
     // Reservations for picks that did not become tracks go back immediately.
     if (request.release !== undefined) {
       const kept = new Set(resolved.map((entry) => entry.trackKey));
-      const unused = reservedPicks
-        .map((pick) => pick.trackKey)
-        .filter((key) => !kept.has(key));
+      const unused = reservedPicks.map((pick) => pick.trackKey).filter((key) => !kept.has(key));
       if (unused.length > 0) await request.release(unused).catch(() => undefined);
     }
 
@@ -454,10 +458,7 @@ export class RecommendationService {
     };
   }
 
-  #scoringContext(
-    request: RecommendationRequest,
-    seedLanguage: string | null,
-  ): ScoringContext {
+  #scoringContext(request: RecommendationRequest, seedLanguage: string | null): ScoringContext {
     const intent = request.intent;
     const desiredTags = [...(intent?.mood ?? []), ...(intent?.genre ?? [])].map((tag) =>
       tag.toLowerCase(),
@@ -477,9 +478,7 @@ export class RecommendationService {
         normaliseArtist(primaryArtist(artist)),
       ),
       ...(intent === undefined ? {} : { avoidRecent: intent.avoidRecent }),
-      ...(request.session === undefined
-        ? {}
-        : { artistFatigue: request.session.artistFatigue }),
+      ...(request.session === undefined ? {} : { artistFatigue: request.session.artistFatigue }),
     };
   }
 
@@ -530,8 +529,11 @@ export class RecommendationService {
 
     const tasks: Promise<readonly Candidate[]>[] = [];
 
-    // Similar tracks: the strongest signal, one call per seed.
+    // Similar tracks: the strongest signal, one call per seed. Each seed's
+    // weight multiplies into its candidates' match, so a low-weight autoplay
+    // context seed contributes options without steering the ranking.
     for (const seed of seeds) {
+      const seedWeight = seed.weight ?? 1;
       tasks.push(
         this.#lastfm
           .similarTracks(seed.artist, seed.title, 60)
@@ -540,7 +542,7 @@ export class RecommendationService {
               title: track.name,
               artist: track.artist,
               origin: 'similar-track',
-              match: track.match,
+              match: track.match * seedWeight,
             })),
           )
           .catch(() => []),
@@ -550,7 +552,10 @@ export class RecommendationService {
 
     // Similar artists widen a pool that similar-tracks left thin — a niche seed
     // can return almost nothing, and its neighbours' catalogues will not.
-    for (const seed of seeds.slice(0, 2)) {
+    // Anchors only: expanding an artist NEIGHBOURHOOD from an autoplay pick is
+    // precisely the drift chain this pipeline exists to prevent.
+    const anchorSeeds = seeds.filter((seed) => (seed.weight ?? 1) >= 1);
+    for (const seed of (anchorSeeds.length > 0 ? anchorSeeds : seeds).slice(0, 2)) {
       tasks.push(
         this.#lastfm
           .similarArtists(seed.artist, 15)
@@ -590,14 +595,12 @@ export class RecommendationService {
         this.#lastfm
           .artistTopTracks(artist, 12)
           .then((tracks) =>
-            tracks.map(
-              (track): Candidate => ({
-                title: track.name,
-                artist: track.artist,
-                origin: 'taste-artist',
-                match: track.match,
-              }),
-            ),
+            tracks.map((track): Candidate => ({
+              title: track.name,
+              artist: track.artist,
+              origin: 'taste-artist',
+              match: track.match,
+            })),
           )
           .catch(() => []),
       );
@@ -621,14 +624,12 @@ export class RecommendationService {
                 const tracks = await this.#lastfm
                   .artistTopTracks(neighbour.name, 6)
                   .catch(() => []);
-                return tracks.map(
-                  (track): Candidate => ({
-                    title: track.name,
-                    artist: track.artist,
-                    origin: 'discovery',
-                    match: track.match * neighbour.match,
-                  }),
-                );
+                return tracks.map((track): Candidate => ({
+                  title: track.name,
+                  artist: track.artist,
+                  origin: 'discovery',
+                  match: track.match * neighbour.match,
+                }));
               }),
             );
             return perArtist.flat();

@@ -218,6 +218,44 @@ describe('scoreCandidate — penalties', () => {
     expect(skipped.breakdown.skipPenalty).toBe(0.5);
   });
 
+  // Repeated rejection of an ARTIST escalates without banning anyone forever:
+  // one skip is mood, a pattern is taste.
+  it('escalates the penalty as skips of one artist accumulate', () => {
+    const skipsOf = (count: number) => ({
+      ...EMPTY_RECENT_CONTEXT,
+      skippedArtists: Array<string>(count).fill('rejected act'),
+    });
+    const at = (count: number) =>
+      scoreCandidate(candidate({ artist: 'Rejected Act', title: 'Another Song' }), {
+        ...context({ recent: skipsOf(count) }),
+      }).breakdown.skipPenalty;
+
+    expect(at(1)).toBe(0);
+    expect(at(2)).toBeGreaterThan(0);
+    expect(at(3)).toBeGreaterThan(at(2));
+  });
+
+  // Anti-drift: "the session sounds like this" must be measured against what
+  // the USER put on. When anchor artists are known, adjacency to an artist
+  // only autoplay played earns no recent-behaviour reward.
+  it('reads session adjacency from user-originated artists only', () => {
+    const recent = {
+      ...EMPTY_RECENT_CONTEXT,
+      artists: ['autoplay act', 'user act'],
+      anchorArtists: ['user act'],
+    };
+
+    const userAdjacent = scoreCandidate(candidate({ artist: 'User Act' }), context({ recent }));
+    const autoplayAdjacent = scoreCandidate(
+      candidate({ artist: 'Autoplay Act' }),
+      context({ recent }),
+    );
+
+    expect(userAdjacent.breakdown.recentBehaviour).toBeGreaterThan(
+      autoplayAdjacent.breakdown.recentBehaviour,
+    );
+  });
+
   it('applies session artist fatigue over the history-position fallback', () => {
     const tired = scoreCandidate(
       candidate({ artist: 'Tired Act' }),
@@ -234,7 +272,12 @@ describe('scoreCandidate — penalties', () => {
 
   it('never produces a score outside [0, 1]', () => {
     const punishing = context({
-      recent: { ...EMPTY_RECENT_CONTEXT, identifiers: ['x'], artists: ['some artist'], skipped: ['x'] },
+      recent: {
+        ...EMPTY_RECENT_CONTEXT,
+        identifiers: ['x'],
+        artists: ['some artist'],
+        skipped: ['x'],
+      },
       profile: profile({ artistAffinity: { 'some artist': -1 } }),
     });
     const scored = scoreCandidate(candidate({ identifier: 'x', match: 0 }), punishing);
@@ -298,8 +341,8 @@ describe('selectSequence', () => {
     const favouriteCount = picked.filter((p) => p.artistKey === 'favourite').length;
     expect(favouriteCount).toBeGreaterThanOrEqual(2);
     for (let index = 1; index < picked.length; index += 1) {
-      const both = picked[index]?.artistKey === 'favourite' &&
-        picked[index - 1]?.artistKey === 'favourite';
+      const both =
+        picked[index]?.artistKey === 'favourite' && picked[index - 1]?.artistKey === 'favourite';
       expect(both).toBe(false);
     }
   });

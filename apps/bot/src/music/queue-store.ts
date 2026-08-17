@@ -14,7 +14,7 @@ import {
 import type { LoopMode, MusicSource } from '@discord-music/shared';
 
 import { getLogger } from '../lib/logger.js';
-import type { QueuedTrack } from './track.js';
+import { trackOrigin, type QueuedTrack } from './track.js';
 import type { TrackQueue } from './track-queue.js';
 
 const logger = getLogger('queue-store');
@@ -65,6 +65,10 @@ export interface HistorySeed {
    * is a YouTube video id it can seed a mix with — SoundCloud ids are not.
    */
   readonly source: MusicSource;
+  /** Who put it on: a person or the recommender. Anchors are 'user' only. */
+  readonly origin: 'user' | 'autoplay';
+  /** Whether the listener skipped it. Skips never become anchors. */
+  readonly skipped: boolean;
 }
 
 export class QueueStore {
@@ -198,13 +202,22 @@ export class QueueStore {
         where: { guild: { discordId: discordGuildId } },
         orderBy: { playedAt: 'desc' },
         take: limit,
-        select: { identifier: true, author: true, title: true, source: true },
+        select: {
+          identifier: true,
+          author: true,
+          title: true,
+          source: true,
+          origin: true,
+          skipped: true,
+        },
       });
       return rows.map((row) => ({
         identifier: row.identifier,
         author: row.author,
         title: row.title,
         source: FROM_DB_SOURCE[row.source],
+        origin: row.origin === 'autoplay' ? ('autoplay' as const) : ('user' as const),
+        skipped: row.skipped,
       }));
     } catch (error) {
       logger.warn({ err: error, guildId: discordGuildId }, 'History read failed');
@@ -288,6 +301,7 @@ export class QueueStore {
           source: TO_DB_SOURCE[track.source],
           playedMs: Math.max(0, Math.round(outcome.playedMs)),
           skipped: outcome.skipped,
+          origin: trackOrigin(track),
         },
       });
     } catch (error) {

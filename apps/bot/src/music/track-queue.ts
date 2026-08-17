@@ -8,7 +8,7 @@
  */
 import { LIMITS, type LoopMode } from '@discord-music/shared';
 
-import type { QueuedTrack } from './track.js';
+import { trackOrigin, type QueuedTrack } from './track.js';
 
 export class QueueFullError extends Error {
   constructor(readonly capacity: number) {
@@ -78,6 +78,12 @@ export class TrackQueue {
   /**
    * Append tracks (or insert right after the current one with `next: true`).
    *
+   * Explicit user requests always take priority over pending autoplay: a
+   * user-originated batch is inserted BEFORE any not-yet-played autoplay
+   * track, so the person's music plays first and the radio resumes only once
+   * the explicit queue is exhausted. An autoplay track that is already
+   * playing is never interrupted — insertion starts after the cursor.
+   *
    * @returns The queue position (0-based) of the first added track.
    * @throws {QueueFullError} When the batch would exceed capacity.
    */
@@ -90,6 +96,22 @@ export class TrackQueue {
       const insertAt = this.#currentIndex + 1;
       this.#tracks.splice(insertAt, 0, ...tracks);
       return insertAt;
+    }
+
+    const userBatch =
+      tracks.length > 0 && tracks.every((track) => trackOrigin(track) !== 'autoplay');
+    if (userBatch) {
+      for (
+        let index = Math.max(this.#currentIndex + 1, 0);
+        index < this.#tracks.length;
+        index += 1
+      ) {
+        const queued = this.#tracks[index];
+        if (queued !== undefined && trackOrigin(queued) === 'autoplay') {
+          this.#tracks.splice(index, 0, ...tracks);
+          return index;
+        }
+      }
     }
 
     this.#tracks.push(...tracks);

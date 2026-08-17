@@ -30,6 +30,10 @@ function tracks(...ids: string[]): QueuedTrack[] {
   return ids.map((id) => makeTrack(id));
 }
 
+function autoplayTrack(id: string): QueuedTrack {
+  return makeTrack(id, { origin: 'autoplay', requestedByName: 'Autoplay' });
+}
+
 describe('TrackQueue', () => {
   describe('add', () => {
     it('appends and reports the insert position', () => {
@@ -37,6 +41,41 @@ describe('TrackQueue', () => {
       expect(queue.add(tracks('a', 'b'))).toBe(0);
       expect(queue.add(tracks('c'))).toBe(2);
       expect(queue.size).toBe(3);
+    });
+
+    // The explicit user queue always outranks pending autoplay: with E/F
+    // waiting from the radio, a user queueing D/X must hear D/X first.
+    it('inserts user tracks before pending autoplay tracks', () => {
+      const queue = new TrackQueue();
+      queue.add(tracks('a'));
+      queue.advance(); // playing 'a'
+      queue.add([autoplayTrack('e'), autoplayTrack('f')]);
+
+      const position = queue.add(tracks('d', 'x'));
+
+      expect(position).toBe(1);
+      expect(queue.upcoming.map((track) => track.identifier)).toEqual(['d', 'x', 'e', 'f']);
+    });
+
+    it('does not interrupt an autoplay track that is already playing', () => {
+      const queue = new TrackQueue();
+      queue.add([autoplayTrack('e'), autoplayTrack('f')]);
+      queue.advance(); // playing autoplay 'e'
+
+      queue.add(tracks('d'));
+
+      expect(queue.current?.identifier).toBe('e');
+      expect(queue.upcoming.map((track) => track.identifier)).toEqual(['d', 'f']);
+    });
+
+    it('appends autoplay batches at the end, never ahead of user tracks', () => {
+      const queue = new TrackQueue();
+      queue.add(tracks('a', 'b'));
+      queue.advance();
+
+      queue.add([autoplayTrack('e')]);
+
+      expect(queue.upcoming.map((track) => track.identifier)).toEqual(['b', 'e']);
     });
 
     it('inserts after the current track with next: true', () => {

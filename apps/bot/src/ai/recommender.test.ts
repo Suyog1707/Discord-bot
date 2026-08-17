@@ -536,7 +536,12 @@ describe('RecommendationService — rerank safety', () => {
         .mockResolvedValue({ text: JSON.stringify({ order }), model: 'test', latencyMs: 1 }),
     });
     const reranker = new ShortlistReranker(provider);
-    const recommender = new RecommendationService(service, new CacheService(), DEFAULT_TUNING, reranker);
+    const recommender = new RecommendationService(
+      service,
+      new CacheService(),
+      DEFAULT_TUNING,
+      reranker,
+    );
     const { resolve } = trackingResolver();
 
     const result = await recommender.recommend(
@@ -573,7 +578,12 @@ describe('RecommendationService — rerank safety', () => {
         .mockResolvedValue({ text: JSON.stringify({ order }), model: 'test', latencyMs: 1 }),
     });
     const reranker = new ShortlistReranker(provider);
-    const recommender = new RecommendationService(service, new CacheService(), DEFAULT_TUNING, reranker);
+    const recommender = new RecommendationService(
+      service,
+      new CacheService(),
+      DEFAULT_TUNING,
+      reranker,
+    );
     const { resolve } = trackingResolver();
 
     const result = await recommender.recommend(
@@ -593,9 +603,16 @@ describe('RecommendationService — rerank safety', () => {
 
   it('falls back to the deterministic ranking when the provider throws', async () => {
     const { service } = fakeLastFm();
-    const provider = fakeProvider({ complete: vi.fn().mockRejectedValue(new Error('provider exploded')) });
+    const provider = fakeProvider({
+      complete: vi.fn().mockRejectedValue(new Error('provider exploded')),
+    });
     const reranker = new ShortlistReranker(provider);
-    const recommender = new RecommendationService(service, new CacheService(), DEFAULT_TUNING, reranker);
+    const recommender = new RecommendationService(
+      service,
+      new CacheService(),
+      DEFAULT_TUNING,
+      reranker,
+    );
     const { resolve } = trackingResolver();
 
     const result = await recommender.recommend(
@@ -648,9 +665,7 @@ describe('RecommendationService — rerank safety', () => {
       ),
       similarArtists: vi.fn((): Promise<readonly SimilarArtist[]> => Promise.resolve([])),
       artistTags: vi.fn((artist: string): Promise<readonly LastFmTag[]> =>
-        Promise.resolve(
-          (tagsByArtist[artist] ?? []).map((name) => ({ name, count: 10 })),
-        ),
+        Promise.resolve((tagsByArtist[artist] ?? []).map((name) => ({ name, count: 10 }))),
       ),
       trackTags: vi.fn((): Promise<readonly LastFmTag[]> => Promise.resolve([])),
       tagTopTracks: vi.fn((): Promise<readonly SimilarTrack[]> => Promise.resolve([])),
@@ -672,6 +687,59 @@ describe('RecommendationService — rerank safety', () => {
     expect(result.tracks.length).toBeGreaterThan(0);
     for (const entry of result.tracks) {
       expect(entry.author).toMatch(/^Desi Artist/);
+    }
+  });
+
+  // Anti-drift at the candidate level: a low-weight autoplay context seed may
+  // contribute candidates, but its neighbourhood must rank below the anchors'
+  // and must never drive the similar-artist expansion.
+  it('lets anchor seeds dominate a low-weight autoplay context seed', async () => {
+    const similarArtists = vi.fn((_artist: string): Promise<readonly SimilarArtist[]> =>
+      Promise.resolve([]),
+    );
+    const service = {
+      enabled: true,
+      similarTracks: vi.fn((artist: string): Promise<readonly SimilarTrack[]> =>
+        Promise.resolve(
+          Array.from({ length: 8 }, (_, index) => ({
+            name: `${artist} Neighbour Song ${String(index)}`,
+            artist: `${artist} Neighbour ${String(index)}`,
+            match: 1,
+          })),
+        ),
+      ),
+      similarArtists,
+      artistTags: vi.fn((): Promise<readonly LastFmTag[]> => Promise.resolve([])),
+      trackTags: vi.fn((): Promise<readonly LastFmTag[]> => Promise.resolve([])),
+      tagTopTracks: vi.fn((): Promise<readonly SimilarTrack[]> => Promise.resolve([])),
+    } as unknown as LastFmService;
+
+    const recommender = new RecommendationService(service, new CacheService());
+    const { resolve } = trackingResolver();
+
+    const result = await recommender.recommend(
+      {
+        seeds: [
+          { title: 'Anchor Song', artist: 'Anchor' },
+          { title: 'Drift Song', artist: 'Drift', weight: 0.4 },
+        ],
+        count: 4,
+        profile: EMPTY_TASTE_PROFILE,
+        recent: EMPTY_RECENT_CONTEXT,
+      },
+      resolve,
+    );
+
+    // Every pick comes from the anchor's neighbourhood — identical raw match,
+    // but the context seed's candidates carry a discounted score.
+    expect(result.tracks.length).toBeGreaterThan(0);
+    for (const track of result.tracks) {
+      expect(track.author.startsWith('Anchor')).toBe(true);
+    }
+
+    // Artist-neighbourhood expansion never runs from the autoplay seed.
+    for (const call of similarArtists.mock.calls) {
+      expect(call[0]).toBe('Anchor');
     }
   });
 
