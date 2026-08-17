@@ -134,6 +134,62 @@ describe('pickBestSpotifyResult', () => {
     expect(ranked.map((hit) => hit.kind)).toEqual(['album', 'track', 'playlist']);
   });
 
+  // Spotify routinely returns the same song several times — the same track id
+  // through different ranking paths, and the same recording as single, album
+  // cut and remaster. The user must see one official result, once.
+  it('deduplicates the same track id returned twice', async () => {
+    const { rankSpotifyResults } = await import('./spotify-resolver.js');
+    const page: SpotifySearchPage = {
+      tracks: {
+        items: [
+          track('Blinding Lights', ['The Weeknd'], 95, 'same-id'),
+          track('Blinding Lights', ['The Weeknd'], 95, 'same-id'),
+        ],
+      },
+    };
+
+    const ranked = rankSpotifyResults('Blinding Lights', page);
+    expect(ranked).toHaveLength(1);
+    expect(ranked[0]?.url).toBe(url('track', 'same-id'));
+  });
+
+  it('collapses equivalent versions of one song to the most relevant', async () => {
+    const { rankSpotifyResults } = await import('./spotify-resolver.js');
+    const page: SpotifySearchPage = {
+      tracks: {
+        items: [
+          track('Blinding Lights', ['The Weeknd'], 96, 'official'),
+          track('Blinding Lights', ['The Weeknd'], 60, 'album-cut'),
+          track('Blinding Lights (Remastered)', ['The Weeknd'], 40, 'remaster'),
+        ],
+      },
+    };
+
+    const ranked = rankSpotifyResults('Blinding Lights', page);
+    const trackHits = ranked.filter((hit) => hit.kind === 'track');
+    // One song, one result — and the survivor is the top-ranked (most
+    // popular) version, not whichever the API listed first.
+    expect(trackHits).toHaveLength(1);
+    expect(trackHits[0]?.url).toBe(url('track', 'official'));
+  });
+
+  it('keeps genuinely different songs and kinds apart', async () => {
+    const { rankSpotifyResults } = await import('./spotify-resolver.js');
+    const page: SpotifySearchPage = {
+      tracks: {
+        items: [
+          track('Blinding Lights', ['The Weeknd'], 96, 't1'),
+          track('Blinding Lights', ['Some Cover Band'], 30, 't2'),
+        ],
+      },
+      albums: { items: [album('Blinding Lights', ['The Weeknd'], 'single', 'a1')] },
+    };
+
+    const ranked = rankSpotifyResults('Blinding Lights', page);
+    // Different artist = different song; an album is a different kind.
+    expect(ranked).toHaveLength(3);
+  });
+
   it('tolerates null rows and missing sections', () => {
     const page: SpotifySearchPage = {
       tracks: { items: [null, track('Parwana', ['Aditya Rikhari'], 50, 't1')] },

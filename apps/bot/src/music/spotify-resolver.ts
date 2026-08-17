@@ -677,6 +677,23 @@ function normalise(value: string): string {
 }
 
 /**
+ * Identity of one search result for deduplication.
+ *
+ * Two layers, both checked: the Spotify URL (which embeds the stable Spotify
+ * id — the same catalogue object surfacing through different result groups or
+ * ranking paths), and a normalised name+artist key per kind, which catches the
+ * same SONG published as several catalogue objects (single, album cut,
+ * re-release). Bracketed asides are stripped for the song key — "(Remastered)"
+ * and "(Official Video)" name the same recording — so search can never show
+ * "Song — Artist" twice.
+ */
+function resultIdentities(hit: SpotifySearchHit): readonly string[] {
+  const name = normalise(hit.name.replace(/[([{][^)\]}]*[)\]}]/gu, ' '));
+  const artist = hit.artist === null ? '' : normalise(hit.artist);
+  return [`url:${hit.url}`, `${hit.kind}:${name}|${artist}`];
+}
+
+/**
  * Match tiers, spaced far enough apart that no tiebreaker can cross tiers:
  * an exact name beats title+artist beats "all words present" beats a partial
  * overlap, no matter how popular the weaker match is.
@@ -803,7 +820,19 @@ export function rankSpotifyResults(
   }
 
   scored.sort((a, b) => b.score - a.score);
-  return scored.map(({ score: _score, ...hit }) => hit);
+
+  // Deduplicate AFTER ranking, so the survivor of each duplicate group is the
+  // most relevant (and, via the popularity tiebreak, most official) version —
+  // never merely the first one the API happened to return.
+  const seen = new Set<string>();
+  const unique: SpotifySearchHit[] = [];
+  for (const { score: _score, ...hit } of scored) {
+    const identities = resultIdentities(hit);
+    if (identities.some((identity) => seen.has(identity))) continue;
+    for (const identity of identities) seen.add(identity);
+    unique.push(hit);
+  }
+  return unique;
 }
 
 /** The single most relevant result, or null when nothing credibly matches. */
