@@ -122,7 +122,10 @@ export default defineCommand({
       };
       const hits = await searchSpotifySuggestions(query);
       const suggestions = hits
-        .filter((hit) => hit.url.length <= 100)
+        // Only concrete playables are suggested: tracks, albums, playlists.
+        // An artist row is ambiguous about what would actually play, so it
+        // stays out of the list (typed free text can still resolve to one).
+        .filter((hit) => hit.kind !== 'artist' && hit.url.length <= 100)
         .slice(0, 10)
         .map((hit) => ({
           name: clip(
