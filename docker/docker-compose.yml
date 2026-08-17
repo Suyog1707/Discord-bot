@@ -16,8 +16,10 @@
 # published ports, which are already held by the first. Export DOCKER_CONTEXT
 # yourself to override the pin.
 #
-# The apps themselves run on the host via `pnpm dev` so hot-reload stays fast.
-# Production deployment is Vercel (web) + VPS (bot/Lavalink) per docs/DEPLOYMENT.md.
+# The bot also runs here, in production mode, built from apps/bot/Dockerfile.
+# For fast hot-reload development, stop the bot container (`docker stop
+# dmp-bot`) and run `pnpm dev` on the host instead — both talk to the same
+# Lavalink. The web app runs on the host / Vercel per docs/DEPLOYMENT.md.
 
 name: discord-music
 
@@ -109,6 +111,32 @@ services:
       retries: 5
       # Cold starts download plugins before the port opens.
       start_period: 90s
+
+  # The bot, in production mode. Built from the repo root so the workspace
+  # lockfile is in the build context (see apps/bot/Dockerfile).
+  bot:
+    build:
+      context: ..
+      dockerfile: apps/bot/Dockerfile
+    container_name: dmp-bot
+    restart: unless-stopped
+    depends_on:
+      lavalink:
+        condition: service_healthy
+    # Real configuration (BOT_TOKEN, DATABASE_URL, REDIS_URL, …) comes from the
+    # repo-root .env; the entries below override it where the container's view
+    # of the world differs from the host's.
+    env_file:
+      - ../.env
+    environment:
+      NODE_ENV: production
+      # Inside the compose network Lavalink is reached by service name on its
+      # internal port — not the localhost:${LAVALINK_PORT} that .env points at
+      # for host-side `pnpm dev`.
+      LAVALINK_HOST: lavalink
+      LAVALINK_PORT: 2333
+      LAVALINK_SECURE: 'false'
+      LAVALINK_PASSWORD: ${LAVALINK_PASSWORD:-youshallnotpass}
 
 volumes:
   lavalink-plugins:

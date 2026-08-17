@@ -30,8 +30,19 @@ COPY . .
 RUN pnpm --filter @discord-music/database run generate \
  && pnpm --filter @discord-music/bot... run build
 
-# Drop dev dependencies from the tree that ships.
-RUN pnpm --filter @discord-music/bot... --prod deploy /output
+# Drop dev dependencies from the tree that ships. `deploy` accepts exactly one
+# project — its workspace dependencies are bundled in automatically, so the
+# `...` suffix (which selects bot+shared+database and makes pnpm bail with
+# ERR_PNPM_CANNOT_DEPLOY_MANY) must not be used here.
+RUN pnpm --filter @discord-music/bot --prod deploy --legacy /output
+
+# `prisma generate` writes the client into `.prisma` beside @prisma/client in
+# pnpm's virtual store, and `deploy` installs that package fresh — without this
+# copy the runtime resolves the ungenerated stub and crashes at import with
+# "Named export 'LoopMode' not found".
+RUN SRC="$(find /app/node_modules/.pnpm -maxdepth 3 -type d -name .prisma | head -n 1)" \
+ && DST="$(find /output/node_modules/.pnpm -maxdepth 1 -type d -name '@prisma+client@*' | head -n 1)/node_modules" \
+ && cp -R "$SRC" "$DST/"
 
 # --- Stage 3: runtime --------------------------------------------------------
 FROM node:22-alpine AS runner

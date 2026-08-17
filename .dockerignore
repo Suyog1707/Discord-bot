@@ -1,0 +1,24 @@
+# Keep the build context small and secrets out of the image.
+# apps/bot/Dockerfile builds from the repo root, so this applies to it.
+
+# Dependencies are installed inside the image from the lockfile.
+node_modules
+**/node_modules
+
+# Build artifacts are produced inside the image.
+**/dist
+**/.next
+**/.turbo
+*.tsbuildinfo
+
+# Secrets — the container gets its environment from compose, never baked in.
+.env
+.env.*
+
+# Not needed for a build.
+.git
+.husky
+docker
+docs
+**/coverage
+**/*.log
