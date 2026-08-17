@@ -5,6 +5,11 @@ import { LoadType } from 'shoukaku';
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import type { ResolveResult } from '../../music/music-manager.js';
+import {
+  isSpotifyConfigured,
+  searchSpotifySuggestions,
+  type SpotifySearchKind,
+} from '../../music/spotify-resolver.js';
 import { formatTrackDuration, trackLink } from '../../music/track.js';
 import { requireMusic, requireVoiceContext } from '../../music/voice-context.js';
 
@@ -83,8 +88,15 @@ export default defineCommand({
   /**
    * Search-as-you-type suggestions. URLs pass through untouched (suggesting
    * against them is noise), short inputs wait for more letters, and any
-   * Lavalink hiccup degrades to "no suggestions" — the command still accepts
+   * lookup hiccup degrades to "no suggestions" — the command still accepts
    * free text, so autocomplete failing costs nothing.
+   *
+   * Spotify is the canonical catalogue, so suggestions come from the same
+   * ranked Spotify search the command itself uses, with the Spotify URL as
+   * the value. This matters more than it looks: a suggestion's value is what
+   * actually gets played, and when these were YouTube search results, every
+   * tapped suggestion silently bypassed the Spotify-first pipeline — YouTube
+   * search, YouTube link, no Spotify identity anywhere.
    */
   async autocomplete({ interaction }) {
     const client = interaction.client as BotClient;
@@ -98,6 +110,33 @@ export default defineCommand({
     const cached = cachedSuggestions(query);
     if (cached !== null) {
       await interaction.respond(cached);
+      return;
+    }
+
+    if (isSpotifyConfigured()) {
+      const KIND_LABEL: Record<SpotifySearchKind, string> = {
+        track: '🎵',
+        album: '💿',
+        artist: '👤',
+        playlist: '📃',
+      };
+      const hits = await searchSpotifySuggestions(query);
+      const suggestions = hits
+        .filter((hit) => hit.url.length <= 100)
+        .slice(0, 10)
+        .map((hit) => ({
+          name: clip(
+            `${KIND_LABEL[hit.kind]} ${hit.name}${hit.artist === null ? '' : ` — ${hit.artist}`}`,
+          ),
+          // The Spotify URL as the value: playing a suggestion goes through
+          // the Spotify pipeline exactly like a pasted link.
+          value: hit.url,
+        }));
+      // Cached even when empty — a query Spotify cannot answer would otherwise
+      // re-query on every keystroke. No YouTube fallback here: suggesting
+      // provider URLs is how tapped suggestions escaped the Spotify catalogue.
+      cacheSuggestions(query, suggestions);
+      await interaction.respond(suggestions);
       return;
     }
 

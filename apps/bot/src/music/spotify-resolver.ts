@@ -739,16 +739,16 @@ function textScore(query: string, name: string, artist: string | null): number {
 }
 
 /**
- * The most relevant result across every kind Spotify returned, or null when
- * nothing credibly matches. Relevance is tiers of exactness first, kind and
- * popularity only as tiebreakers — never "blindly the first result".
+ * Every credible result across every kind Spotify returned, most relevant
+ * first. Relevance is tiers of exactness first, kind and popularity only as
+ * tiebreakers — never "blindly the first result".
  */
-export function pickBestSpotifyResult(
+export function rankSpotifyResults(
   query: string,
   page: SpotifySearchPage,
-): SpotifySearchHit | null {
+): readonly SpotifySearchHit[] {
   const normalisedQuery = normalise(query);
-  if (normalisedQuery.length === 0) return null;
+  if (normalisedQuery.length === 0) return [];
 
   const scored: ScoredHit[] = [];
   const consider = (
@@ -803,7 +803,21 @@ export function pickBestSpotifyResult(
   }
 
   scored.sort((a, b) => b.score - a.score);
-  return scored[0] ?? null;
+  return scored.map(({ score: _score, ...hit }) => hit);
+}
+
+/** The single most relevant result, or null when nothing credibly matches. */
+export function pickBestSpotifyResult(
+  query: string,
+  page: SpotifySearchPage,
+): SpotifySearchHit | null {
+  return rankSpotifyResults(query, page)[0] ?? null;
+}
+
+async function searchPage(query: string): Promise<SpotifySearchPage> {
+  return catalogueGet<SpotifySearchPage>(
+    `/search?type=track,album,artist,playlist&limit=10&q=${encodeURIComponent(query)}`,
+  );
 }
 
 /**
@@ -817,10 +831,7 @@ export async function searchSpotifyBest(query: string): Promise<SpotifySearchHit
   if (!isSpotifyConfigured()) return null;
 
   try {
-    const page = await catalogueGet<SpotifySearchPage>(
-      `/search?type=track,album,artist,playlist&limit=10&q=${encodeURIComponent(query)}`,
-    );
-    const best = pickBestSpotifyResult(query, page);
+    const best = pickBestSpotifyResult(query, await searchPage(query));
     logger.debug(
       best === null
         ? { query, matched: false }
@@ -831,5 +842,21 @@ export async function searchSpotifyBest(query: string): Promise<SpotifySearchHit
   } catch (error) {
     logger.debug({ err: error, query }, 'Spotify free-text search failed');
     return null;
+  }
+}
+
+/**
+ * Ranked Spotify suggestions for search-as-you-type. Empty on any failure —
+ * autocomplete is decoration, and the command accepts the raw text anyway.
+ */
+export async function searchSpotifySuggestions(
+  query: string,
+): Promise<readonly SpotifySearchHit[]> {
+  if (!isSpotifyConfigured()) return [];
+  try {
+    return rankSpotifyResults(query, await searchPage(query));
+  } catch (error) {
+    logger.debug({ err: error, query }, 'Spotify suggestion search failed');
+    return [];
   }
 }

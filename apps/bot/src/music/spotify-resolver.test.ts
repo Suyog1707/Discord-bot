@@ -122,6 +122,18 @@ describe('pickBestSpotifyResult', () => {
     expect(pickBestSpotifyResult('zxqv wmbtl kkjhg', page)).toBeNull();
   });
 
+  it('ranks the full suggestion list most-relevant first', async () => {
+    const { rankSpotifyResults } = await import('./spotify-resolver.js');
+    const page: SpotifySearchPage = {
+      tracks: { items: [track('Parwana', ['Aditya Rikhari'], 80, 't1')] },
+      albums: { items: [album('Parwana', ['Aditya Rikhari'], 'album', 'a1')] },
+      playlists: { items: [playlist('parwana vibes', 'p1')] },
+    };
+
+    const ranked = rankSpotifyResults('Parwana', page);
+    expect(ranked.map((hit) => hit.kind)).toEqual(['album', 'track', 'playlist']);
+  });
+
   it('tolerates null rows and missing sections', () => {
     const page: SpotifySearchPage = {
       tracks: { items: [null, track('Parwana', ['Aditya Rikhari'], 50, 't1')] },
