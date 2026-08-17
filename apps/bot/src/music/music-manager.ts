@@ -44,6 +44,7 @@ import {
   isSpotifyWebUrl,
   resolveSpotifyUrl,
   searchQueryFor,
+  searchSpotifyBest,
 } from './spotify-resolver.js';
 import type { SpotifyTrackMeta } from './spotify-resolver.js';
 import type { QueueStore } from './queue-store.js';
@@ -391,13 +392,11 @@ export class MusicManager {
             : player.queue.tracks.slice(0, Math.max(0, player.queue.currentIndex)).slice(-3);
         this.#autoplay?.prefetch(guildId, [
           { title: track.title, artist: track.author, identifier: track.identifier },
-          ...played
-            .reverse()
-            .map((entry) => ({
-              title: entry.title,
-              artist: entry.author,
-              identifier: entry.identifier,
-            })),
+          ...played.reverse().map((entry) => ({
+            title: entry.title,
+            artist: entry.author,
+            identifier: entry.identifier,
+          })),
         ]);
       },
       // Learning: completions and early skips of autoplay picks are the
@@ -406,9 +405,7 @@ export class MusicManager {
         const session = this.#autoplaySession;
         if (session === undefined || track.requestedByName !== 'Autoplay') return;
         const completed =
-          !outcome.skipped &&
-          track.durationMs > 0 &&
-          outcome.playedMs / track.durationMs >= 0.8;
+          !outcome.skipped && track.durationMs > 0 && outcome.playedMs / track.durationMs >= 0.8;
         const kind = outcome.skipped ? 'skipped' : completed ? 'completed' : null;
         if (kind !== null) {
           void session.recordOutcome(guildId, kind).catch(() => undefined);
@@ -675,12 +672,16 @@ export class MusicManager {
             const best = await this.#searchOne(node, searchQueryFor(meta), source);
             if (best === null) return null;
             const track = fromLavalinkTrack(best, requestedBy);
-            // Spotify is metadata-only: keep it for queue/display, play Lavalink's match.
+            // Spotify is metadata-only: its identity is what the listener sees
+            // (title, artist, artwork and — crucially — the URL), while the
+            // Lavalink match supplies only the audio. The playback provider's
+            // page must never become the public URL of a Spotify track.
             return {
               ...track,
               title: meta.title,
               author: meta.artist,
               artworkUrl: meta.artworkUrl ?? track.artworkUrl,
+              uri: meta.spotifyUrl ?? track.uri,
               source: 'spotify',
             };
           } catch (error) {
@@ -816,6 +817,22 @@ export class MusicManager {
   }
 
   /**
+   * Resolve known Spotify track metadata into playable tracks, batch by batch.
+   *
+   * The public face of `#matchSpotifyTracks`, for callers that already hold
+   * Spotify metadata (the `/spotify` playlist browser): each track keeps its
+   * Spotify identity — title, artist, artwork and URL — while the audio is
+   * matched separately, exactly like a pasted Spotify link.
+   */
+  async resolveSpotifyMetadata(
+    metadata: readonly SpotifyTrackMeta[],
+    requestedBy: { readonly id: string; readonly name: string },
+    onBatch: (tracks: readonly QueuedTrack[]) => Promise<void>,
+  ): Promise<SpotifyBackgroundResolution> {
+    return this.#matchSpotifyTracks(metadata, requestedBy, onBatch);
+  }
+
+  /**
    * Queue a mixed list of ready tracks and unresolved queries, in order.
    *
    * Stored playlists and Spotify mirrors hold one search per unresolved track,
@@ -913,9 +930,7 @@ export class MusicManager {
     // The mix fallback shares the recommender's exclusion state where it can:
     // history identifiers always, plus the session's queued/recent sets when
     // the AI stack is wired.
-    const sessionSnapshot = await this.#autoplaySession
-      ?.snapshot(guildId)
-      .catch(() => undefined);
+    const sessionSnapshot = await this.#autoplaySession?.snapshot(guildId).catch(() => undefined);
     const playedIdentifiers = new Set([
       ...history.map((entry) => entry.identifier),
       ...(sessionSnapshot?.recentIdentifiers ?? []),
@@ -1109,6 +1124,14 @@ export class MusicManager {
   /**
    * Resolve user input (URL or free text) into playable tracks.
    *
+   * `source: 'auto'` (what `/play` sends when the user picked nothing) makes
+   * Spotify the canonical catalogue for free text: the query is ranked against
+   * Spotify's tracks, albums, artists and playlists, and a credible match is
+   * resolved through the Spotify pipeline so its metadata — including the
+   * user-facing URL — stays Spotify's. Lavalink search remains the fallback
+   * when Spotify is unconfigured, unreachable, has no credible match, or the
+   * matched item yields nothing playable.
+   *
    * @throws {NotFoundError} Nothing matched.
    * @throws {ValidationError} Lavalink rejected the input.
    * @throws {UpstreamError} No node available or the node errored.
@@ -1116,25 +1139,46 @@ export class MusicManager {
   async resolve(
     input: string,
     requestedBy: { readonly id: string; readonly name: string },
-    source: 'youtube' | 'soundcloud' = 'youtube',
+    source: 'auto' | 'youtube' | 'soundcloud' = 'youtube',
   ): Promise<ResolveResult> {
     const node = this.shoukaku.getIdealNode();
     if (node === undefined) {
       throw new UpstreamError('The music server is not available right now. Try again shortly.');
     }
 
+    // An explicitly chosen source narrows the search; 'auto' searches Spotify
+    // first and falls back to YouTube below.
+    const searchSource: 'youtube' | 'soundcloud' =
+      source === 'soundcloud' ? 'soundcloud' : 'youtube';
+
     // Spotify links: metadata from the Web API, audio via search on the
     // playback sources — Spotify audio itself is never streamed.
     if (isSpotifyUrl(input)) {
-      return this.#resolveSpotify(input, requestedBy, source);
+      return this.#resolveSpotify(input, requestedBy, searchSource);
     }
     if (isSpotifyWebUrl(input)) {
       throw new ValidationError('Unsupported or invalid Spotify link.');
     }
 
+    if (source === 'auto' && !/^https?:\/\//iu.test(input.trim())) {
+      const hit = await searchSpotifyBest(input);
+      if (hit !== null) {
+        try {
+          return await this.#resolveSpotify(hit.url, requestedBy, searchSource);
+        } catch (error) {
+          // The catalogue had a match but nothing playable came of it — the
+          // plain provider search below still gets its chance.
+          logger.debug(
+            { err: error, query: input, kind: hit.kind, name: hit.name },
+            'Spotify-first resolution fell through to provider search',
+          );
+        }
+      }
+    }
+
     let response: LavalinkResponse | undefined;
     try {
-      response = await node.rest.resolve(buildSearchQuery(input, source));
+      response = await node.rest.resolve(buildSearchQuery(input, searchSource));
     } catch (error) {
       throw new UpstreamError('Track lookup failed. Try again shortly.', { cause: error });
     }

@@ -22,7 +22,6 @@ import {
 import { getEnv } from '../../config/env.js';
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
-import { searchQueryFor } from '../../music/spotify-resolver.js';
 import type { UserPlaylist } from '../../services/spotify-service.js';
 import { requireMusic, requireVoiceContext } from '../../music/voice-context.js';
 
@@ -234,8 +233,11 @@ async function browsePlaylists(
             // Searches run in parallel batches; each finished batch is appended
             // in original order, so playback starts on the first few tracks
             // instead of after every one has been looked up.
-            const queued = await music.resolveEach(
-              tracks.map((track) => searchQueryFor(track)),
+            // Metadata straight into the Spotify matching pipeline: every
+            // queued track keeps its Spotify identity (title, artist, URL)
+            // instead of degrading into a plain provider search result.
+            const { resolvedTrackCount: queued } = await music.resolveSpotifyMetadata(
+              tracks,
               requester,
               async (resolved) => {
                 await player.enqueue(resolved, playNow ? { next: false } : {});

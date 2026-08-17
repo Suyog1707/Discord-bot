@@ -109,6 +109,9 @@ export interface UserTrack extends SpotifyTrackMeta {
 }
 
 function toUserTrack(track: RawTrack): UserTrack {
+  const spotifyUrl =
+    track.external_urls?.spotify ??
+    (track.id === null ? null : `https://open.spotify.com/track/${track.id}`);
   return {
     spotifyId: track.id,
     title: track.name,
@@ -116,7 +119,8 @@ function toUserTrack(track: RawTrack): UserTrack {
     durationMs: track.duration_ms,
     artworkUrl: track.album?.images?.[0]?.url ?? null,
     isrc: null,
-    uri: track.external_urls?.spotify ?? null,
+    spotifyUrl,
+    uri: spotifyUrl,
   };
 }
 
@@ -197,7 +201,10 @@ export class SpotifyService {
     }
 
     if (account.expiresAt.getTime() - Date.now() > EXPIRY_SKEW_MS) {
-      this.#tokenCache.set(discordId, { value: accessToken, expiresAt: account.expiresAt.getTime() });
+      this.#tokenCache.set(discordId, {
+        value: accessToken,
+        expiresAt: account.expiresAt.getTime(),
+      });
       return accessToken;
     }
 
@@ -219,10 +226,14 @@ export class SpotifyService {
         signal: AbortSignal.timeout(TIMEOUT_MS),
       });
     } catch (error) {
-      throw new UpstreamError('Spotify did not respond in time. Try again shortly.', { cause: error });
+      throw new UpstreamError('Spotify did not respond in time. Try again shortly.', {
+        cause: error,
+      });
     }
     if (response.status === 401 || response.status === 403) {
-      throw new UpstreamError('Your Spotify connection expired. Reconnect it on the dashboard and try again.');
+      throw new UpstreamError(
+        'Your Spotify connection expired. Reconnect it on the dashboard and try again.',
+      );
     }
     if (response.status === 429) {
       throw new UpstreamError('Spotify is rate limiting requests. Try again shortly.');
@@ -258,7 +269,9 @@ export class SpotifyService {
         signal: AbortSignal.timeout(TIMEOUT_MS),
       });
     } catch (error) {
-      throw new UpstreamError('Spotify did not respond in time. Try again shortly.', { cause: error });
+      throw new UpstreamError('Spotify did not respond in time. Try again shortly.', {
+        cause: error,
+      });
     }
     if (response.status === 401 || response.status === 403) {
       throw new UpstreamError('Spotify denied that request. Reconnect your account and try again.');

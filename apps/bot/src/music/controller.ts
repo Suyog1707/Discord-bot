@@ -184,18 +184,38 @@ function render(state: PlayerSnapshot | null): MessageEditOptions {
 
 export class ControllerMessage {
   readonly #client: Client;
+  readonly #guildId: string;
   readonly #channelId: string;
   readonly #logger: Logger;
 
+  /**
+   * The one music GUI message this guild's player owns right now. Scoped to
+   * this instance — the manager keeps one `ControllerMessage` per guild, so
+   * guilds never share a reference.
+   */
   #message: Message | null = null;
   #lastEditAt = 0;
   #pendingState: PlayerSnapshot | null = null;
+  /**
+   * A track started since the last applied update. The next apply must decide
+   * whether the tracked GUI is still the channel's latest message and repost
+   * a complete GUI when it is not, instead of editing a message the
+   * conversation has moved past.
+   */
+  #reanchorPending = false;
+  /**
+   * Applies run strictly one at a time. Without this, rapid track changes
+   * interleave the "is it still the latest? → send new" sequence and two
+   * passes both conclude they must send — the uncontrolled-duplicate bug.
+   */
+  #applyChain: Promise<void> = Promise.resolve();
   #trailingEdit: NodeJS.Timeout | undefined;
   #progressTick: NodeJS.Timeout | undefined;
   #destroyed = false;
 
   constructor(client: Client, guildId: string, channelId: string) {
     this.#client = client;
+    this.#guildId = guildId;
     this.#channelId = channelId;
     this.#logger = getLogger('controller').child({ guildId, channelId });
   }
@@ -218,7 +238,9 @@ export class ControllerMessage {
       this.#progressTick = undefined;
     }
 
-    // Track starts refresh immediately; everything else respects the throttle.
+    // Track starts refresh immediately and re-evaluate where the GUI lives;
+    // everything else edits the tracked message under the throttle.
+    if (type === 'TRACK_START') this.#reanchorPending = true;
     this.#scheduleEdit(type === 'TRACK_START');
   }
 
@@ -226,8 +248,10 @@ export class ControllerMessage {
     this.#destroyed = true;
     if (this.#trailingEdit !== undefined) clearTimeout(this.#trailingEdit);
     if (this.#progressTick !== undefined) clearInterval(this.#progressTick);
-    // Leave a final idle card rather than a stale "now playing".
-    await this.#applyEdit(null).catch(() => undefined);
+    // Leave a final idle card rather than a stale "now playing" — behind the
+    // chain so it cannot race an in-flight apply and lose.
+    this.#applyChain = this.#applyChain.then(() => this.#applyEdit(null)).catch(() => undefined);
+    await this.#applyChain;
   }
 
   #scheduleEdit(immediate = false): void {
@@ -245,16 +269,50 @@ export class ControllerMessage {
     this.#trailingEdit = timer;
   }
 
-  async #flush(): Promise<void> {
-    if (this.#destroyed) return;
+  #flush(): Promise<void> {
     this.#lastEditAt = Date.now();
-    await this.#applyEdit(this.#pendingState).catch((error: unknown) => {
-      this.#logger.debug({ err: error }, 'Controller update failed');
-    });
+    // `#pendingState` is read when the apply RUNS, not when it is queued, so a
+    // burst of track changes collapses into applies of the newest state.
+    this.#applyChain = this.#applyChain
+      .then(() => {
+        if (this.#destroyed) return;
+        return this.#applyEdit(this.#pendingState);
+      })
+      .catch((error: unknown) => {
+        this.#logger.debug({ err: error }, 'Controller update failed');
+      });
+    return this.#applyChain;
+  }
+
+  /**
+   * Whether the tracked GUI message is still the channel's most recent message
+   * — the only case where editing it in place reads as "the player updated"
+   * rather than "an old message quietly changed".
+   */
+  #isStillLatest(message: Message): boolean {
+    const channel = message.channel;
+    // Belongs to another channel or guild (music channel reconfigured, message
+    // reference gone stale) — never edit across that boundary.
+    if (channel.id !== this.#channelId) return false;
+    if (message.inGuild() && message.guildId !== this.#guildId) return false;
+
+    // `lastMessageId` is maintained by the gateway (GuildMessages intent).
+    // Unknown means no evidence anyone has spoken since — keep the GUI.
+    const lastId = channel.lastMessageId;
+    return lastId === null || lastId === message.id;
   }
 
   async #applyEdit(state: PlayerSnapshot | null): Promise<void> {
     const payload = render(state);
+
+    // A new song landing after other messages: abandon the old GUI (delete it,
+    // best-effort — never edit it) and send a fresh, complete one below.
+    if (this.#message !== null && this.#reanchorPending && !this.#isStillLatest(this.#message)) {
+      const stale = this.#message;
+      this.#message = null;
+      void stale.delete().catch(() => undefined);
+    }
+    this.#reanchorPending = false;
 
     if (this.#message !== null) {
       try {
@@ -266,6 +324,8 @@ export class ControllerMessage {
       }
     }
 
+    // The GUI a fresh message carries is always the complete interface —
+    // `render` returns the full embed and every control row.
     const channel = await this.#client.channels.fetch(this.#channelId);
     if (channel?.isSendable() !== true) return;
     this.#message = await channel.send({

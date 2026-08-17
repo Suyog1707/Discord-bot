@@ -32,6 +32,13 @@ export interface SpotifyTrackMeta {
   readonly durationMs: number;
   readonly artworkUrl: string | null;
   readonly isrc: string | null;
+  /**
+   * Canonical Spotify identity. This — not the playback provider's page — is
+   * what the listener sees everywhere a Spotify-originated track is shown.
+   * Null only for the public-embed fallback, which renders no track ids.
+   */
+  readonly spotifyId: string | null;
+  readonly spotifyUrl: string | null;
 }
 
 export interface SpotifyResolution {
@@ -180,22 +187,38 @@ async function catalogueGet<T>(path: string): Promise<T> {
 }
 
 interface RawTrack {
+  readonly id?: string;
   readonly name: string;
   readonly duration_ms: number;
   /** Absent on podcast episodes, which a playlist is allowed to contain. */
   readonly artists?: readonly { readonly name: string }[];
   readonly album?: { readonly images?: readonly { readonly url: string }[] };
   readonly external_ids?: { readonly isrc?: string };
+  readonly external_urls?: { readonly spotify?: string };
+  /** `spotify:track:<id>` — how the embed's state JSON identifies a track. */
+  readonly uri?: string;
   readonly is_local?: boolean;
 }
 
+/** The track id, from whichever field this payload carries it in. */
+function spotifyIdOf(track: RawTrack): string | null {
+  if (track.id !== undefined && track.id.length > 0) return track.id;
+  const fromUri = /^spotify:track:([A-Za-z0-9]+)$/u.exec(track.uri ?? '');
+  return fromUri?.[1] ?? null;
+}
+
 function toMeta(track: RawTrack, artworkFallback: string | null = null): SpotifyTrackMeta {
+  const spotifyId = spotifyIdOf(track);
   return {
     title: track.name,
     artist: (track.artists ?? []).map((artist) => artist.name).join(', '),
     durationMs: track.duration_ms,
     artworkUrl: track.album?.images?.[0]?.url ?? artworkFallback,
     isrc: track.external_ids?.isrc ?? null,
+    spotifyId,
+    spotifyUrl:
+      track.external_urls?.spotify ??
+      (spotifyId === null ? null : `https://open.spotify.com/track/${spotifyId}`),
   };
 }
 
@@ -214,7 +237,7 @@ interface PlaylistPage {
 }
 
 const PLAYLIST_ITEM_FIELDS =
-  'items(track(name,duration_ms,artists(name),album(images),external_ids,is_local)),next,total';
+  'items(track(id,name,duration_ms,artists(name),album(images),external_ids,external_urls,is_local)),next,total';
 
 function playablePlaylistTracks(page: PlaylistPage): RawTrack[] {
   if (page.items === undefined) {
@@ -334,7 +357,15 @@ function embedTracks(html: string, limit: number, artworkUrl: string | null): Sp
     const artist = htmlText(match[2] ?? '');
     const duration = durationMs(match[3] ?? '');
     if (title.length === 0 || artist.length === 0 || duration === null) continue;
-    tracks.push({ title, artist, durationMs: duration, artworkUrl, isrc: null });
+    tracks.push({
+      title,
+      artist,
+      durationMs: duration,
+      artworkUrl,
+      isrc: null,
+      spotifyId: null,
+      spotifyUrl: null,
+    });
     if (tracks.length >= limit) break;
   }
   return tracks;
@@ -589,4 +620,216 @@ export async function searchSpotifyTrack(title: string, artist: string): Promise
 export function searchQueryFor(meta: SpotifyTrackMeta): string {
   logger.debug({ title: meta.title, artist: meta.artist }, 'Spotify → search');
   return `${meta.title} ${meta.artist}`;
+}
+
+/* ---------------------------------------------------- free-text search --- */
+
+export type SpotifySearchKind = 'track' | 'album' | 'artist' | 'playlist';
+
+/** The winner of a ranked Spotify search — always addressed by its own URL. */
+export interface SpotifySearchHit {
+  readonly kind: SpotifySearchKind;
+  readonly url: string;
+  readonly name: string;
+  readonly artist: string | null;
+}
+
+/** The slice of a `/search` response the ranking needs. */
+export interface SpotifySearchPage {
+  readonly tracks?: {
+    readonly items?: readonly ({
+      readonly name?: string;
+      readonly artists?: readonly { readonly name?: string }[];
+      readonly popularity?: number;
+      readonly external_urls?: { readonly spotify?: string };
+    } | null)[];
+  };
+  readonly albums?: {
+    readonly items?: readonly ({
+      readonly name?: string;
+      readonly artists?: readonly { readonly name?: string }[];
+      readonly album_type?: string;
+      readonly external_urls?: { readonly spotify?: string };
+    } | null)[];
+  };
+  readonly artists?: {
+    readonly items?: readonly ({
+      readonly name?: string;
+      readonly popularity?: number;
+      readonly external_urls?: { readonly spotify?: string };
+    } | null)[];
+  };
+  readonly playlists?: {
+    readonly items?: readonly ({
+      readonly name?: string;
+      readonly external_urls?: { readonly spotify?: string };
+    } | null)[];
+  };
+}
+
+/** Lowercase, punctuation to spaces, whitespace collapsed. */
+function normalise(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+}
+
+/**
+ * Match tiers, spaced far enough apart that no tiebreaker can cross tiers:
+ * an exact name beats title+artist beats "all words present" beats a partial
+ * overlap, no matter how popular the weaker match is.
+ */
+const TIER_EXACT = 400;
+const TIER_TITLE_AND_ARTIST = 300;
+const TIER_ALL_WORDS = 200;
+const TIER_PARTIAL = 100;
+
+/**
+ * Kind preference *within* a tier. A full album named exactly what was typed
+ * outranks the identically-named track — "/play Parwana" queueing the album
+ * (which contains its title track anyway) is the asked-for behaviour — while
+ * everywhere below the exact tier a concrete track is the safer guess.
+ * Playlists rank last throughout: they are the loosest match for a bare
+ * phrase and should only win when nothing better exists.
+ */
+function kindBonus(kind: SpotifySearchKind, albumType: string | undefined, exact: boolean): number {
+  switch (kind) {
+    case 'album':
+      return albumType === 'album' ? (exact ? 30 : 15) : 10;
+    case 'track':
+      return 20;
+    case 'artist':
+      return exact ? 25 : 5;
+    case 'playlist':
+      return 0;
+  }
+}
+
+interface ScoredHit extends SpotifySearchHit {
+  readonly score: number;
+}
+
+/**
+ * Score one candidate's text against the query.
+ *
+ * @returns The tier score, or 0 when the candidate is not a credible match.
+ */
+function textScore(query: string, name: string, artist: string | null): number {
+  const normalisedName = normalise(name);
+  if (normalisedName.length === 0) return 0;
+  if (normalisedName === query) return TIER_EXACT;
+
+  const normalisedArtist = artist === null ? '' : normalise(artist);
+
+  // "Parwana Arijit Singh": the name covers the query's head, the artist
+  // covers everything after it.
+  if (normalisedArtist.length > 0 && `${query} `.startsWith(`${normalisedName} `)) {
+    const rest = query.slice(normalisedName.length).trim().split(' ');
+    if (rest.every((word) => normalisedArtist.includes(word))) return TIER_TITLE_AND_ARTIST;
+  }
+
+  const haystack = `${normalisedName} ${normalisedArtist}`;
+  const words = query.split(' ');
+  const hits = words.filter((word) => haystack.includes(word)).length;
+  if (hits === words.length) return TIER_ALL_WORDS;
+  const overlap = hits / words.length;
+  return overlap >= 0.6 ? TIER_PARTIAL * overlap : 0;
+}
+
+/**
+ * The most relevant result across every kind Spotify returned, or null when
+ * nothing credibly matches. Relevance is tiers of exactness first, kind and
+ * popularity only as tiebreakers — never "blindly the first result".
+ */
+export function pickBestSpotifyResult(
+  query: string,
+  page: SpotifySearchPage,
+): SpotifySearchHit | null {
+  const normalisedQuery = normalise(query);
+  if (normalisedQuery.length === 0) return null;
+
+  const scored: ScoredHit[] = [];
+  const consider = (
+    kind: SpotifySearchKind,
+    name: string | undefined,
+    artist: string | null,
+    url: string | undefined,
+    popularity: number,
+    albumType?: string,
+  ): void => {
+    if (name === undefined || name.length === 0 || url === undefined) return;
+    const text = textScore(normalisedQuery, name, artist);
+    if (text === 0) return;
+    scored.push({
+      kind,
+      url,
+      name,
+      artist,
+      score:
+        text + kindBonus(kind, albumType, text === TIER_EXACT) + Math.min(popularity, 100) / 100,
+    });
+  };
+
+  for (const track of page.tracks?.items ?? []) {
+    if (track == null) continue;
+    consider(
+      'track',
+      track.name,
+      (track.artists ?? []).map((entry) => entry.name ?? '').join(', ') || null,
+      track.external_urls?.spotify,
+      track.popularity ?? 0,
+    );
+  }
+  for (const album of page.albums?.items ?? []) {
+    if (album == null) continue;
+    consider(
+      'album',
+      album.name,
+      (album.artists ?? []).map((entry) => entry.name ?? '').join(', ') || null,
+      album.external_urls?.spotify,
+      0,
+      album.album_type,
+    );
+  }
+  for (const artist of page.artists?.items ?? []) {
+    if (artist == null) continue;
+    consider('artist', artist.name, null, artist.external_urls?.spotify, artist.popularity ?? 0);
+  }
+  for (const playlist of page.playlists?.items ?? []) {
+    if (playlist == null) continue;
+    consider('playlist', playlist.name, null, playlist.external_urls?.spotify, 0);
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0] ?? null;
+}
+
+/**
+ * Search the Spotify catalogue for whatever `query` most plausibly names —
+ * a track, an album, an artist or a playlist.
+ *
+ * Returns null when Spotify is unconfigured, unreachable, or has no credible
+ * match, so the caller can always fall back to a plain provider search.
+ */
+export async function searchSpotifyBest(query: string): Promise<SpotifySearchHit | null> {
+  if (!isSpotifyConfigured()) return null;
+
+  try {
+    const page = await catalogueGet<SpotifySearchPage>(
+      `/search?type=track,album,artist,playlist&limit=10&q=${encodeURIComponent(query)}`,
+    );
+    const best = pickBestSpotifyResult(query, page);
+    logger.debug(
+      best === null
+        ? { query, matched: false }
+        : { query, matched: true, kind: best.kind, name: best.name },
+      'Spotify free-text search',
+    );
+    return best;
+  } catch (error) {
+    logger.debug({ err: error, query }, 'Spotify free-text search failed');
+    return null;
+  }
 }

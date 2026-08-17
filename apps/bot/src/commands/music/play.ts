@@ -61,7 +61,7 @@ export default defineCommand({
     .addStringOption((option) =>
       option
         .setName('source')
-        .setDescription('Where to search when the query is not a URL (default: YouTube)')
+        .setDescription('Where to search when the query is not a URL (default: Spotify)')
         .addChoices(
           { name: 'YouTube', value: 'youtube' },
           { name: 'SoundCloud', value: 'soundcloud' },
@@ -139,8 +139,11 @@ export default defineCommand({
     // response below is an editReply/followUp.
 
     const query = interaction.options.getString('query', true);
-    const source = (interaction.options.getString('source') ?? 'youtube') as
-      'youtube' | 'soundcloud';
+    // No explicit source means 'auto': Spotify is the canonical catalogue for
+    // free text, with YouTube as the search fallback. Choosing a source keeps
+    // the old direct-provider behaviour.
+    const source =
+      (interaction.options.getString('source') as 'youtube' | 'soundcloud' | null) ?? 'auto';
     const insertNext = interaction.options.getBoolean('next') ?? false;
 
     // Whether the bot was already in voice decides how a failed lookup is
