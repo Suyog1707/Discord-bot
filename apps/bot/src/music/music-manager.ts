@@ -45,9 +45,16 @@ import {
   isSpotifyUrl,
   isSpotifyWebUrl,
   resolveSpotifyUrl,
-  searchQueryFor,
   searchSpotifyBest,
 } from './spotify-resolver.js';
+import {
+  isConfident,
+  queryPlan,
+  rankCandidates,
+  REJECT_BELOW,
+  type MatchCandidate,
+  type ScoredCandidate,
+} from './youtube-match.js';
 import type { SpotifyTrackMeta } from './spotify-resolver.js';
 import type { QueueStore } from './queue-store.js';
 import { resolvePlatformLinks, type PlatformLinks } from './platform-links.js';
@@ -114,6 +121,8 @@ export interface SpotifyExpansion {
  */
 const SEARCH_CACHE_TTL_MS = 30 * 60_000;
 const SEARCH_CACHE_MAX_ENTRIES = 2_000;
+/** Results kept per search for ranking. Beyond this the tail is never the release. */
+const SEARCH_CANDIDATE_LIMIT = 10;
 
 export interface JoinOptions {
   readonly guildId: string;
@@ -145,7 +154,15 @@ export class MusicManager {
   readonly #publishEvent: ((payload: string) => void) | undefined;
   readonly #controllers = new Map<string, ControllerMessage>();
   /** Insertion-ordered so the oldest entry is the one evicted at capacity. */
-  readonly #searchCache = new Map<string, { track: LavalinkTrack; expiresAt: number }>();
+  /**
+   * Whole result lists, not just the winner. Ranking needs the alternatives,
+   * and caching only the first result would have meant a second network round
+   * trip for the same query the moment anything wanted to compare candidates.
+   */
+  readonly #searchCache = new Map<
+    string,
+    { candidates: readonly LavalinkTrack[]; expiresAt: number }
+  >();
 
   constructor(options: {
     readonly client: Client;
@@ -648,32 +665,159 @@ export class MusicManager {
     return selectAutoplaySeeds(entries);
   }
 
-  /** One Lavalink search, served from the short-lived result cache when possible. */
-  async #searchOne(
+  /**
+   * One Lavalink search, whole result list, cached.
+   *
+   * Capped at {@link SEARCH_CANDIDATE_LIMIT}: YouTube's relevance ordering is
+   * poor at picking the release but perfectly good at keeping it near the top,
+   * so scoring the tail costs work without changing outcomes.
+   */
+  async #searchMany(
     node: Node,
     query: string,
     source: 'youtube' | 'soundcloud' = 'youtube',
-  ): Promise<LavalinkTrack | null> {
+  ): Promise<readonly LavalinkTrack[]> {
     // The prefix is part of the key: the same title on SoundCloud and YouTube
     // are different recordings, and a shared key would serve one for the other.
     const prefixed = buildSearchQuery(query, source);
     const cached = this.#searchCache.get(prefixed);
     if (cached !== undefined) {
-      if (cached.expiresAt > Date.now()) return cached.track;
+      if (cached.expiresAt > Date.now()) return cached.candidates;
       this.#searchCache.delete(prefixed);
     }
 
     const response = await node.rest.resolve(prefixed);
-    if (response?.loadType !== LoadType.SEARCH) return null;
-    const [best] = response.data;
-    if (best === undefined) return null;
+    if (response?.loadType !== LoadType.SEARCH) return [];
+    const candidates = response.data.slice(0, SEARCH_CANDIDATE_LIMIT);
 
     if (this.#searchCache.size >= SEARCH_CACHE_MAX_ENTRIES) {
       const oldest = this.#searchCache.keys().next();
       if (!(oldest.done ?? false)) this.#searchCache.delete(oldest.value);
     }
-    this.#searchCache.set(prefixed, { track: best, expiresAt: Date.now() + SEARCH_CACHE_TTL_MS });
-    return best;
+    this.#searchCache.set(prefixed, { candidates, expiresAt: Date.now() + SEARCH_CACHE_TTL_MS });
+    return candidates;
+  }
+
+  /**
+   * Lavalink's own first choice.
+   *
+   * Kept for the callers that want relevance order rather than a ranked match:
+   * the SoundCloud re-source, which applies its own `isPlausibleAlternative`
+   * check afterwards, and autoplay, whose candidates were already chosen by the
+   * recommender before they got here.
+   */
+  async #searchOne(
+    node: Node,
+    query: string,
+    source: 'youtube' | 'soundcloud' = 'youtube',
+  ): Promise<LavalinkTrack | null> {
+    const [best] = await this.#searchMany(node, query, source);
+    return best ?? null;
+  }
+
+  /**
+   * The best playable upload for one Spotify recording.
+   *
+   * Runs {@link queryPlan} in order and stops the moment a candidate clears
+   * {@link CONFIDENT_SCORE}, so an unambiguous track costs exactly the one
+   * search the old code made. Only tracks whose first query fails to produce an
+   * obvious winner — the soundtracks, the collaborations, the songs whose name
+   * is also a film — pay for the extra attempts.
+   *
+   * Candidates accumulate across queries and are deduplicated by identifier, so
+   * a result that appears in three searches is scored once and the later
+   * queries only widen the field.
+   *
+   * @returns The winning Lavalink track, or null when nothing scored above
+   *   {@link REJECT_BELOW} — which leaves the caller free to try another source
+   *   rather than queue a reaction video.
+   */
+  async #findBestMatch(
+    node: Node,
+    meta: SpotifyTrackMeta,
+    source: 'youtube' | 'soundcloud',
+  ): Promise<LavalinkTrack | null> {
+    const wanted = {
+      title: meta.title,
+      artist: meta.artist,
+      durationMs: meta.durationMs,
+      album: meta.album,
+    };
+
+    const seen = new Set<string>();
+    const pool: LavalinkTrack[] = [];
+    // The scorer works on plain fields; `track` rides along so the winner can
+    // be handed back as the Lavalink object the caller needs.
+    let ranked: readonly ScoredCandidate<MatchCandidate & { track: LavalinkTrack }>[] = [];
+    let queriesRun = 0;
+
+    for (const query of queryPlan(wanted)) {
+      queriesRun += 1;
+      const results = await this.#searchMany(node, query, source);
+      for (const result of results) {
+        if (seen.has(result.info.identifier)) continue;
+        seen.add(result.info.identifier);
+        pool.push(result);
+      }
+      if (pool.length === 0) continue;
+
+      ranked = rankCandidates(
+        wanted,
+        pool.map((track) => ({
+          title: track.info.title,
+          author: track.info.author,
+          durationMs: track.info.length,
+          isStream: track.info.isStream,
+          identifier: track.info.identifier,
+          track,
+        })),
+      );
+      if (isConfident(ranked[0])) break;
+    }
+
+    const winner = ranked[0];
+    if (winner === undefined) {
+      logger.debug({ title: meta.title, artist: meta.artist, queriesRun }, 'No search results');
+      return null;
+    }
+
+    // One line per resolved track at debug, so a thousand-track playlist does
+    // not narrate itself at info while still being fully explainable when the
+    // wrong thing plays. The runners-up are the useful part: "why that one"
+    // is only answerable next to what it beat.
+    logger.debug(
+      {
+        want: `${meta.artist} — ${meta.title}`,
+        wantMs: meta.durationMs,
+        queriesRun,
+        considered: pool.length,
+        picked: `${winner.candidate.author} — ${winner.candidate.title}`,
+        pickedMs: winner.candidate.durationMs,
+        score: winner.score,
+        why: winner.reasons.join(' '),
+        runnersUp: ranked.slice(1, 4).map((entry) => ({
+          track: `${entry.candidate.author} — ${entry.candidate.title}`,
+          score: entry.score,
+          why: entry.reasons.slice(0, 4).join(' '),
+        })),
+      },
+      'Spotify → YouTube match',
+    );
+
+    if (winner.score < REJECT_BELOW) {
+      logger.info(
+        {
+          want: `${meta.artist} — ${meta.title}`,
+          best: `${winner.candidate.author} — ${winner.candidate.title}`,
+          score: winner.score,
+          why: winner.reasons.join(' '),
+        },
+        'Rejected every candidate as not the song',
+      );
+      return null;
+    }
+
+    return winner.candidate.track;
   }
 
   /**
@@ -707,7 +851,7 @@ export class MusicManager {
       const matched = await Promise.all(
         batch.map(async (meta): Promise<QueuedTrack | null> => {
           try {
-            const best = await this.#searchOne(node, searchQueryFor(meta), source);
+            const best = await this.#findBestMatch(node, meta, source);
             if (best === null) return null;
             const track = fromLavalinkTrack(best, requestedBy);
             // Spotify is metadata-only: its identity is what the listener sees

@@ -88,7 +88,10 @@ interface RawTrack {
   readonly name: string;
   readonly duration_ms: number;
   readonly artists: readonly { readonly name: string }[];
-  readonly album?: { readonly images?: readonly { readonly url: string }[] };
+  readonly album?: {
+    readonly name?: string;
+    readonly images?: readonly { readonly url: string }[];
+  };
   readonly external_urls?: { readonly spotify?: string };
   readonly is_local?: boolean;
 }
@@ -119,6 +122,7 @@ function toUserTrack(track: RawTrack): UserTrack {
     durationMs: track.duration_ms,
     artworkUrl: track.album?.images?.[0]?.url ?? null,
     isrc: null,
+    album: track.album?.name ?? null,
     spotifyUrl,
     uri: spotifyUrl,
   };

@@ -33,6 +33,13 @@ export interface SpotifyTrackMeta {
   readonly artworkUrl: string | null;
   readonly isrc: string | null;
   /**
+   * Album name, when the source supplies one. A weak but real matching signal:
+   * a soundtrack album name appearing in a YouTube channel or title is
+   * evidence the upload is the release rather than a scene from the film.
+   * Null for the public-embed fallback, which renders no album names.
+   */
+  readonly album: string | null;
+  /**
    * Canonical Spotify identity. This — not the playback provider's page — is
    * what the listener sees everywhere a Spotify-originated track is shown.
    * Null only for the public-embed fallback, which renders no track ids.
@@ -192,7 +199,10 @@ interface RawTrack {
   readonly duration_ms: number;
   /** Absent on podcast episodes, which a playlist is allowed to contain. */
   readonly artists?: readonly { readonly name: string }[];
-  readonly album?: { readonly images?: readonly { readonly url: string }[] };
+  readonly album?: {
+    readonly name?: string;
+    readonly images?: readonly { readonly url: string }[];
+  };
   readonly external_ids?: { readonly isrc?: string };
   readonly external_urls?: { readonly spotify?: string };
   /** `spotify:track:<id>` — how the embed's state JSON identifies a track. */
@@ -215,6 +225,7 @@ function toMeta(track: RawTrack, artworkFallback: string | null = null): Spotify
     durationMs: track.duration_ms,
     artworkUrl: track.album?.images?.[0]?.url ?? artworkFallback,
     isrc: track.external_ids?.isrc ?? null,
+    album: track.album?.name ?? null,
     spotifyId,
     spotifyUrl:
       track.external_urls?.spotify ??
@@ -237,7 +248,7 @@ interface PlaylistPage {
 }
 
 const PLAYLIST_ITEM_FIELDS =
-  'items(track(id,name,duration_ms,artists(name),album(images),external_ids,external_urls,is_local)),next,total';
+  'items(track(id,name,duration_ms,artists(name),album(name,images),external_ids,external_urls,is_local)),next,total';
 
 function playablePlaylistTracks(page: PlaylistPage): RawTrack[] {
   if (page.items === undefined) {
@@ -363,6 +374,9 @@ function embedTracks(html: string, limit: number, artworkUrl: string | null): Sp
       durationMs: duration,
       artworkUrl,
       isrc: null,
+      // The embed renders no album name; the matcher treats null as "unknown"
+      // rather than "no album", so this costs a signal and never misleads.
+      album: null,
       spotifyId: null,
       spotifyUrl: null,
     });
@@ -614,12 +628,6 @@ export async function searchSpotifyTrack(title: string, artist: string): Promise
     logger.debug({ err: error, title }, 'Spotify link lookup failed');
     return null;
   }
-}
-
-/** The search string most likely to find the same recording elsewhere. */
-export function searchQueryFor(meta: SpotifyTrackMeta): string {
-  logger.debug({ title: meta.title, artist: meta.artist }, 'Spotify → search');
-  return `${meta.title} ${meta.artist}`;
 }
 
 /* ---------------------------------------------------- free-text search --- */
