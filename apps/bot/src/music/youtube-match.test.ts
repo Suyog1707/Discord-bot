@@ -362,6 +362,47 @@ describe('movie-scene veto', () => {
   });
 });
 
+describe('lyrics video as the standalone fallback', () => {
+  const wanted: WantedTrack = {
+    title: 'Tum Hi Ho',
+    artist: 'Arijit Singh, Mithoon',
+    durationMs: 261_974,
+    album: 'Aashiqui 2',
+  };
+
+  it('plays a lyrics video when the only alternatives are scenes', () => {
+    // The scenes are vetoed; without this the track would fail outright. A
+    // lyrics video carries the actual recording, so it is the right answer.
+    const winner = winnerOf(wanted, [
+      candidate('Aashiqui 2 - Tum Hi Ho Scene', 'Bolly Clips', 265_000),
+      candidate('Aashiqui 2 Movie Scene - Tum Hi Ho', 'Bolly Clips', 265_000),
+      candidate('Tum Hi Ho (Lyrics) | Arijit Singh', 'Sankalp', 262_000),
+    ]);
+    expect(winner).toBe('Tum Hi Ho (Lyrics) | Arijit Singh');
+  });
+
+  it('prefers a lyrics video to the picturised film cut', () => {
+    const winner = winnerOf(wanted, [
+      candidate('Aashiqui 2: Tum Hi Ho Full Video Song', 'T-Series', 300_000),
+      candidate('Tum Hi Ho Lyric Video - Arijit Singh', 'LyricNation', 262_000),
+    ]);
+    expect(winner).toBe('Tum Hi Ho Lyric Video - Arijit Singh');
+  });
+
+  it('still loses to the official upload when one exists', () => {
+    const winner = winnerOf(wanted, [
+      candidate('Tum Hi Ho (Lyrics) | Arijit Singh', 'Sankalp', 262_000),
+      candidate('Tum Hi Ho (Official Audio)', 'Arijit Singh - Topic', 262_000),
+    ]);
+    expect(winner).toBe('Tum Hi Ho (Official Audio)');
+  });
+
+  it('searches for lyrics as the final query', () => {
+    const plan = queryPlan(wanted);
+    expect(plan[plan.length - 1]).toContain('lyrics');
+  });
+});
+
 describe('queryPlan', () => {
   const wanted: WantedTrack = {
     title: 'Sunflower',

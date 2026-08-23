@@ -212,8 +212,12 @@ const QUALITY_TIERS: readonly (readonly [string, number, string])[] = [
   // reupload win a coin toss.
   ['audio', 10, 'audio'],
   ['official', 9, 'official'],
-  ['lyric video', 5, 'lyric-video'],
-  ['lyrics', 4, 'lyrics'],
+  // A lyrics video is the recording with text over it: standalone song
+  // content, never a scene, and the right answer when no official upload
+  // surfaces. Kept just under `audio` so a label's audio cut still wins the
+  // head-to-head, but well clear of an untitled reupload.
+  ['lyric video', 9, 'lyric-video'],
+  ['lyrics', 8, 'lyrics'],
 ];
 
 /**
@@ -564,5 +568,10 @@ export function queryPlan(wanted: WantedTrack): readonly string[] {
   // A distinct lead artist is worth one more attempt: collaborations are often
   // uploaded under the lead alone, and the joined string matches nothing.
   if (flat(lead) !== flat(wanted.artist)) plans.push(`${wanted.title} ${lead}`);
+  // Last resort before failing, and it has to be last. A search that returns
+  // nothing but scenes leaves every candidate vetoed and the track unplayable;
+  // a lyrics video is the reliable standalone alternative — it carries the
+  // actual recording — so playing one beats skipping the song.
+  plans.push(`${wanted.title} ${lead} lyrics`);
   return [...new Set(plans.map((plan) => plan.trim()).filter((plan) => plan.length > 0))];
 }
