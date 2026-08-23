@@ -38,7 +38,18 @@ lavalink:
     # check for a release above 1.18.2 periodically and move back to one.
     - dependency: 'dev.lavalink.youtube:youtube-plugin:f45bbb7aebfcbc1c553769e04af6cd43afa8b7c3'
       repository: 'https://maven.lavalink.dev/snapshots'
-    - dependency: 'com.github.topi314.lavasrc:lavasrc-plugin:4.7.3'
+    # 4.8.3 carries the Spotify playlist endpoint move from /tracks to /items,
+    # which newly created Spotify apps require — worth having before this app's
+    # credentials are ever reissued.
+    #
+    # Not fixed by the upgrade, and pre-dating it: `spsearch:` and Spotify album
+    # lookups answer 403 here on 4.7.3 and 4.8.3 alike. LavaSrc reaches those
+    # through Spotify's anonymous tokens rather than the client credentials
+    # configured below, and since 4.7.3 those need `spotify.customTokenEndpoint`
+    # set to work at all. Direct Spotify *track* URLs are unaffected, and the
+    # bot resolves Spotify through its own API client, so this path is a rarely
+    # used fallback — but it is broken, not merely unused.
+    - dependency: 'com.github.topi314.lavasrc:lavasrc-plugin:4.8.3'
       repository: 'https://maven.lavalink.dev/releases'
   server:
     password: '${LAVALINK_SERVER_PASSWORD:youshallnotpass}'
