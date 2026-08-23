@@ -23,12 +23,13 @@ import { getEnv } from '../../config/env.js';
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import type { UserPlaylist } from '../../services/spotify-service.js';
+import { queuedKeys, withoutQueued } from '../../music/queue-dedupe.js';
 import { requireMusic, requireVoiceContext } from '../../music/voice-context.js';
 
 const EMBED_COLOR = 0x1db954; // Spotify green
 const PAGE_SIZE = 10;
-/** Tracks resolved per play/queue action — each one is a Lavalink search. */
-const PLAY_BATCH = 25;
+/** Above this many tracks, warn that matching will take a while before it does. */
+const PROGRESS_NOTICE_THRESHOLD = 50;
 /** How long the browser stays interactive. */
 const BROWSE_TTL_MS = 5 * 60_000;
 
@@ -216,10 +217,14 @@ async function browsePlaylists(
             const context = requireVoiceContext(interaction);
             await component.deferUpdate();
 
+            // The whole playlist, bounded only by SPOTIFY_PLAYLIST_MAX_TRACKS —
+            // which is itself capped at the queue's capacity. This used to be a
+            // hardcoded 25, which silently truncated every playlist longer than
+            // that while the configured limit sat unread.
             const tracks = await spotify.playlistTracks(
               interaction.user.id,
               selected.spotifyId,
-              PLAY_BATCH,
+              getEnv().SPOTIFY_PLAYLIST_MAX_TRACKS,
             );
             const player = await music.getOrCreatePlayer({
               guildId: context.guildId,
@@ -227,6 +232,35 @@ async function browsePlaylists(
               textChannelId: interaction.channelId,
               shardId: interaction.guild?.shardId ?? 0,
             });
+
+            // Anything already queued is dropped before resolution rather than
+            // after: a duplicate that reaches the matcher has cost a Lavalink
+            // search to produce a track that gets thrown away.
+            const { keep: fresh, skipped: duplicates } = withoutQueued(
+              tracks,
+              queuedKeys(player.queue.tracks),
+            );
+
+            const room = player.queue.capacity - player.queue.size;
+            const queueable = fresh.slice(0, Math.max(room, 0));
+            // Stopping here beats letting `add` throw partway through: the
+            // batch is appended incrementally, so a QueueFullError mid-flight
+            // would leave an arbitrary prefix queued and report a failure.
+            const overflow = fresh.length - queueable.length;
+
+            // One Lavalink search per track, a few at a time, so a long
+            // playlist takes minutes of wall clock. Playback starts on the
+            // first resolved batch, but the reply below does not land until the
+            // last one — say so up front rather than leaving a big queue
+            // looking like a hung command.
+            if (queueable.length > PROGRESS_NOTICE_THRESHOLD) {
+              await component
+                .followUp({
+                  content: `🔎 Matching **${String(queueable.length)}** track(s) from **${selected.name}** — playback starts as soon as the first few are ready.`,
+                  flags: MessageFlags.Ephemeral,
+                })
+                .catch(() => undefined);
+            }
 
             const requester = { id: interaction.user.id, name: interaction.user.username };
             const playNow = component.customId === 'spl:play';
@@ -237,7 +271,7 @@ async function browsePlaylists(
             // queued track keeps its Spotify identity (title, artist, URL)
             // instead of degrading into a plain provider search result.
             const { resolvedTrackCount: queued } = await music.resolveSpotifyMetadata(
-              tracks,
+              queueable,
               requester,
               async (resolved) => {
                 await player.enqueue(resolved, playNow ? { next: false } : {});
@@ -248,11 +282,23 @@ async function browsePlaylists(
               const offset = player.queue.upcoming.length - queued + 1;
               await player.jumpTo(player.queue.currentIndex + offset);
             }
+            // Every track that did not make it is accounted for by name.
+            // "Queued 12" against a 300-track playlist is alarming without the
+            // reason, and each of these has a different remedy.
+            const notes: string[] = [];
+            if (duplicates > 0) notes.push(`${String(duplicates)} already in the queue`);
+            if (overflow > 0) notes.push(`${String(overflow)} over the queue limit`);
+            const unmatched = queueable.length - queued;
+            if (unmatched > 0) notes.push(`${String(unmatched)} could not be matched`);
+            const suffix = notes.length > 0 ? ` (skipped ${notes.join(', ')})` : '';
+
             await component.followUp({
               content:
                 queued === 0
-                  ? 'None of those tracks could be matched right now.'
-                  : `${playNow ? '▶️ Playing' : '➕ Queued'} **${String(queued)}** track(s) from **${selected.name}**.`,
+                  ? duplicates > 0 && fresh.length === 0
+                    ? `Every track in **${selected.name}** is already queued.`
+                    : `None of those tracks could be matched right now.${suffix}`
+                  : `${playNow ? '▶️ Playing' : '➕ Queued'} **${String(queued)}** track(s) from **${selected.name}**${suffix}.`,
               flags: MessageFlags.Ephemeral,
             });
             return;
