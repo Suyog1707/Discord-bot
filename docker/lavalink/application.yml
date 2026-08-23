@@ -20,8 +20,24 @@ lavalink:
   # it. Bump `youtube-plugin` whenever the startup log reports a newer release;
   # YouTube breaks old versions regularly and only the current one is supported.
   plugins:
-    - dependency: 'dev.lavalink.youtube:youtube-plugin:1.18.2'
-      repository: 'https://maven.lavalink.dev/releases'
+    # Pinned to a snapshot, not a release, and deliberately.
+    #
+    # 1.18.2 is the newest tagged release and it could not play anything here:
+    # YouTube answered every client with formats carrying no `url` and no
+    # `signatureCipher` — its SABR migration, where stream URLs are withheld —
+    # and the plugin skips formats it cannot address, reporting the empty
+    # "No supported audio streams available, available types:". yt-dlp streamed
+    # the same videos from this same host, which is what ruled out an IP ban.
+    #
+    # Four commits landed after that release and before this one, all aimed at
+    # this: a client-version bump to 21.02.35, a PlayStation 4 User-Agent for
+    # the TV client, recovery of the total length for formats that omit
+    # contentLength, and "make IOS playable".
+    #
+    # The cost of a commit pin is that nothing tells you when it is stale, so
+    # check for a release above 1.18.2 periodically and move back to one.
+    - dependency: 'dev.lavalink.youtube:youtube-plugin:f45bbb7aebfcbc1c553769e04af6cd43afa8b7c3'
+      repository: 'https://maven.lavalink.dev/snapshots'
     - dependency: 'com.github.topi314.lavasrc:lavasrc-plugin:4.7.3'
       repository: 'https://maven.lavalink.dev/releases'
   server:
@@ -68,6 +84,10 @@ plugins:
     # dead track into a retry. Order puts the cheapest first — ANDROID_VR needs
     # no player script at all — so the common case never pays for the fallbacks.
     clients:
+      # Do not add IOS here. The snapshot above makes it playable, but its
+      # search is broken, and as the first search-capable client in the list it
+      # captures every `ytsearch:` and answers "empty" — which silently breaks
+      # Spotify resolution, since lavasrc reaches YouTube through ytsearch.
       - MUSIC # ytmsearch only — this client cannot play.
       - ANDROID_VR # Plays most videos without touching the player script.
       - TVHTML5_SIMPLY # Added in 1.18.0; covers videos ANDROID_VR is refused.
