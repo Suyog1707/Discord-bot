@@ -52,6 +52,7 @@ export function createAiStack(options: {
           apiKey: env.GROQ_API_KEY,
           model: env.GROQ_MODEL,
           timeoutMs: env.GROQ_TIMEOUT_MS,
+          reasoningEffort: env.GROQ_REASONING_EFFORT,
         });
 
   const lastfm = new LastFmService(cache, env.LASTFM_API_KEY);

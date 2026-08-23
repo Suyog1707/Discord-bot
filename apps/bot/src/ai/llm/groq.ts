@@ -17,10 +17,18 @@ const logger = getLogger('groq');
 
 const API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
+export type GroqReasoningEffort = 'none' | 'low' | 'medium' | 'high';
+
 export interface GroqOptions {
   readonly apiKey: string;
   readonly model: string;
   readonly timeoutMs: number;
+  /**
+   * `none` omits the parameter entirely rather than sending a low value.
+   * Models without a reasoning mode answer `reasoning_effort` with a 400, so
+   * "don't think" and "can't think" are not the same request.
+   */
+  readonly reasoningEffort: GroqReasoningEffort;
 }
 
 interface ChatCompletionBody {
@@ -46,7 +54,7 @@ export class GroqProvider implements LLMProvider {
 
   async complete(request: LLMRequest): Promise<LLMResult> {
     const startedAt = Date.now();
-    const { apiKey, model, timeoutMs } = this.#options;
+    const { apiKey, model, timeoutMs, reasoningEffort } = this.#options;
 
     const response = await fetch(API_URL, {
       method: 'POST',
@@ -62,6 +70,10 @@ export class GroqProvider implements LLMProvider {
           { role: 'user', content: request.user },
         ],
         max_tokens: request.maxTokens ?? 512,
+        // A reasoning model spends `max_tokens` on its own thinking before it
+        // writes a word of the reply, so left unbounded it can exhaust the
+        // budget and hand back an empty completion.
+        ...(reasoningEffort === 'none' ? {} : { reasoning_effort: reasoningEffort }),
         // Intent extraction should be reproducible: the same sentence must not
         // resolve to a different mood on a retry.
         temperature: 0,

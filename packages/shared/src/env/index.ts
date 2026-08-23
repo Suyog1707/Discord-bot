@@ -209,11 +209,36 @@ export const botEnvSchema = requireInProduction(
       /** Groq — fast intent parsing. Without it `/ask` uses the heuristic parser. */
       GROQ_API_KEY: optional(z.string().min(1)),
       /**
-       * Groq model id. Defaults to Llama 3.3 70B Versatile: the latency here is
-       * user-facing (someone is waiting on a slash command), and this is the
-       * strongest model Groq serves at conversational speed.
+       * Groq model id. The latency here is user-facing — someone is waiting on
+       * a slash command — so this wants the strongest model Groq serves at
+       * conversational speed.
+       *
+       * Was `llama-3.3-70b-versatile` until Groq decommissioned it; the API
+       * then answered every request with 404 "does not exist or you do not have
+       * access to it" and every intent parse silently fell back to the
+       * heuristic parser. Groq retires model ids on its own schedule, so when
+       * that warning reappears in the logs, check
+       * https://console.groq.com/docs/deprecations and move this default on.
        */
-      GROQ_MODEL: z.string().min(1).default('llama-3.3-70b-versatile'),
+      GROQ_MODEL: z.string().min(1).default('openai/gpt-oss-120b'),
+      /**
+       * How much of the token budget a reasoning model may spend thinking
+       * before it answers.
+       *
+       * Reasoning models bill their private reasoning against the same
+       * `max_tokens` as the reply, so an unconstrained one can think its way
+       * through the entire budget and return an empty completion. `low` is the
+       * default because intent parsing is a short extraction task with a
+       * user waiting on it, not a problem that rewards deliberation.
+       *
+       * Set this to an empty string for a model that has no reasoning mode:
+       * Groq rejects the parameter outright with a 400 rather than ignoring
+       * it, so it has to be omitted rather than merely turned down.
+       */
+      GROQ_REASONING_EFFORT: z.preprocess(
+        (value) => (typeof value === 'string' && value.trim() === '' ? 'none' : value),
+        z.enum(['none', 'low', 'medium', 'high']).default('low'),
+      ),
       /** Hard ceiling on one intent parse. Past this the heuristic parser wins anyway. */
       GROQ_TIMEOUT_MS: z.coerce.number().int().min(500).max(30_000).default(6_000),
 
