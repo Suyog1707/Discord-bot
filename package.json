@@ -29,6 +29,7 @@
     "db:pull": "pnpm --filter @discord-music/database run pull",
     "db:studio": "pnpm --filter @discord-music/database run studio",
     "db:seed": "pnpm --filter @discord-music/database run seed",
+    "pot:refresh": "node scripts/refresh-pot.mjs",
     "docker:up": "DOCKER_CONTEXT=${DOCKER_CONTEXT:-default} docker compose --env-file .env -f docker/docker-compose.yml up -d --build",
     "docker:down": "DOCKER_CONTEXT=${DOCKER_CONTEXT:-default} docker compose --env-file .env -f docker/docker-compose.yml down",
     "docker:logs": "DOCKER_CONTEXT=${DOCKER_CONTEXT:-default} docker compose --env-file .env -f docker/docker-compose.yml logs -f",

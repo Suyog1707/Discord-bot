@@ -86,31 +86,49 @@ plugins:
     remoteCipher:
       url: '${YT_CIPHER_URL:http://yt-cipher:8001}'
       password: '${YT_CIPHER_PASSWORD:}'
-    # A separate failure from the cipher one above: YouTube sometimes decides
-    # the requesting IP is a bot and answers "This video requires login" /
-    # "Sign in to confirm you're not a bot" / 403 on every client at once. A
-    # proof-of-origin token is upstream's remedy, and it applies to the WEB and
-    # WEBEMBEDDED clients. Generate a pair with
-    # https://github.com/iv-org/youtube-trusted-session-generator, put them in
-    # the environment, and uncomment. Both are tied to the IP that produced
-    # them, so they must be regenerated when the host changes.
-    # Some videos — label-owned music in particular — are answered with "This
-    # video requires login" / "Sign in to confirm you're not a bot" on every
-    # anonymous client, no matter how many are configured. Nothing in this file
-    # fixes that: YouTube wants a signed-in session, and OAuth is how
-    # youtube-source provides one. Off by default because it means attaching a
-    # Google account — use a burner, never a primary; upstream warns the account
-    # can be terminated. Turn it on with YT_OAUTH_ENABLED=true, watch the
-    # Lavalink log for the device code, authorise it, then put the refresh token
-    # it prints into YT_OAUTH_REFRESH_TOKEN so restarts skip the flow.
+    # A separate failure from the cipher one above, and the one that actually
+    # breaks playback here: YouTube decides the requesting IP is a bot and
+    # answers "This video requires login" / "Sign in to confirm you're not a
+    # bot" / 403 on every client at once. The WEB client's version of the same
+    # refusal is quieter and easy to misread — "No supported audio streams
+    # available, available types:" with an *empty* type list, meaning YouTube
+    # returned the video with every format withheld rather than returning an
+    # error.
+    #
+    # A proof-of-origin token is upstream's remedy, and it is not a silver
+    # bullet: it applies only to the WEB and WEBEMBEDDED clients, which is why
+    # those two stay in the client list above even though they are the slowest.
+    # Every other client is refused or accepted on YouTube's mood alone.
+    #
+    # Mint a pair with `pnpm run pot:refresh`, which also restarts this server —
+    # the values below are read once, at startup. Do not reach for
+    # quay.io/invidious/youtube-trusted-session-generator, which the earlier
+    # version of this comment recommended: it no longer works, and fails with
+    # "[potoken] failed to extract token" on every run.
+    #
+    # A token lasts about six hours and is bound to the egress IP that minted
+    # it, so it goes stale on a timer and again on any move between networks.
+    # Empty values mean "no token", which is a supported state — playback works
+    # without one whenever YouTube is not currently flagging this host.
+    pot:
+      token: '${YT_PO_TOKEN:}'
+      visitorData: '${YT_VISITOR_DATA:}'
+    # Some videos — label-owned music in particular — are refused the same way
+    # on every anonymous client no matter how many are configured, and no
+    # poToken changes that: YouTube wants a signed-in session, and OAuth is how
+    # youtube-source provides one. This is the only remedy that reaches the TV
+    # client, and the TV client is the only one that plays sign-in-gated videos.
+    #
+    # Off by default because it means attaching a Google account — use a burner,
+    # never a primary; upstream warns the account can be terminated. Turn it on
+    # with YT_OAUTH_ENABLED=true, watch the Lavalink log for the device code,
+    # authorise it at google.com/device, then put the refresh token it prints
+    # into YT_OAUTH_REFRESH_TOKEN so restarts skip the flow.
     oauth:
       enabled: ${YT_OAUTH_ENABLED:false}
       # Left unset rather than empty: an empty string is a value, and a blank
       # token is not the same as "no token" to the plugin.
       # refreshToken: '${YT_OAUTH_REFRESH_TOKEN:}'
-    # pot:
-    #   token: '${YT_PO_TOKEN:}'
-    #   visitorData: '${YT_VISITOR_DATA:}'
 
   lavasrc:
     providers:

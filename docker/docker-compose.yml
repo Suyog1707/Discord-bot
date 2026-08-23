@@ -86,6 +86,12 @@ services:
       # source configured with credentials it cannot see is a trap.
       SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
       SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
+      # YouTube proof-of-origin token (application.yml: plugins.youtube.pot).
+      # Without it YouTube treats this host as a bot and refuses playback on
+      # every client at once. Both values are bound to the egress IP that
+      # generated them — see the application.yml comment for how to make a pair.
+      YT_PO_TOKEN: ${YT_PO_TOKEN:-}
+      YT_VISITOR_DATA: ${YT_VISITOR_DATA:-}
       # YouTube OAuth (application.yml: plugins.youtube.oauth) — the only way to
       # play sign-in-gated videos. Off unless YT_OAUTH_ENABLED is set.
       YT_OAUTH_ENABLED: ${YT_OAUTH_ENABLED:-false}
