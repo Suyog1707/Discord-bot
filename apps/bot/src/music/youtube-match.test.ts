@@ -287,6 +287,81 @@ describe('ranking picks the release', () => {
   });
 });
 
+describe('movie-scene veto', () => {
+  const wanted: WantedTrack = {
+    title: 'Tum Hi Ho',
+    artist: 'Arijit Singh, Mithoon',
+    durationMs: 261_974,
+    album: 'Aashiqui 2',
+  };
+
+  // Every one of these carries the exact song title and a plausible runtime,
+  // so scoring alone left them only slightly negative — and slightly negative
+  // still wins when the real release is missing from the results.
+  const invalid: readonly string[] = [
+    'Aashiqui 2 - Tum Hi Ho Scene',
+    'Aashiqui 2 Movie Scene - Tum Hi Ho',
+    'Tum Hi Ho Movie Scene',
+    'Movie Clip: Tum Hi Ho',
+    'Best Movie Scenes - Tum Hi Ho',
+    'Tum Hi Ho Full Scene',
+    'Aashiqui 2 - Tum Hi Ho Dialogue Scene Part 1',
+    'Tum Hi Ho - Aashiqui 2 | Full Movie',
+    'Tum Hi Ho #shorts',
+    'Aashiqui 2 Trailer - Tum Hi Ho',
+  ];
+
+  for (const title of invalid) {
+    it(`vetoes "${title}"`, () => {
+      const { score } = scoreCandidate(wanted, candidate(title, 'Bolly Clips', 265_000));
+      expect(score).toBeLessThan(REJECT_BELOW);
+    });
+  }
+
+  it('picks the standalone release over every scene upload', () => {
+    const winner = winnerOf(wanted, [
+      ...invalid.map((title) => candidate(title, 'Bolly Clips', 265_000)),
+      candidate('Tum Hi Ho', 'Arijit Singh', 263_000),
+    ]);
+    expect(winner).toBe('Tum Hi Ho');
+  });
+
+  it('does not veto a song whose own title contains a vetoed word', () => {
+    // Spotify says the track is called "Scene", so the word in a candidate is
+    // expected rather than evidence of a clip.
+    const sceneSong: WantedTrack = {
+      title: 'Love Scene',
+      artist: 'Some Artist',
+      durationMs: 200_000,
+      album: null,
+    };
+    const { score } = scoreCandidate(
+      sceneSong,
+      candidate('Love Scene', 'Some Artist - Topic', 200_000),
+    );
+    expect(score).toBeGreaterThan(CONFIDENT_SCORE);
+  });
+
+  it('does not veto an artist whose name contains a vetoed word', () => {
+    const clipse: WantedTrack = {
+      title: 'Grindin',
+      artist: 'Clipse',
+      durationMs: 210_000,
+      album: null,
+    };
+    const { score } = scoreCandidate(clipse, candidate('Grindin', 'Clipse - Topic', 210_000));
+    expect(score).toBeGreaterThan(0);
+  });
+
+  it('ranks a standalone audio above the picturised video cut', () => {
+    const winner = winnerOf(wanted, [
+      candidate('Aashiqui 2: Tum Hi Ho Full Video Song', 'T-Series', 300_000),
+      candidate('Tum Hi Ho (Audio)', 'T-Series', 262_000),
+    ]);
+    expect(winner).toBe('Tum Hi Ho (Audio)');
+  });
+});
+
 describe('queryPlan', () => {
   const wanted: WantedTrack = {
     title: 'Sunflower',

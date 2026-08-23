@@ -145,13 +145,33 @@ const JUNK_PATTERNS: readonly (readonly [string, number])[] = [
   // specific phrasings carry the weight and the bare word stays mild.
   ['movie scene', -55],
   ['film scene', -55],
+  ['tv scene', -55],
+  ['movie clip', -55],
+  ['film clip', -55],
   ['best scene', -50],
   ['scene from', -50],
+  ['full scene', -55],
   ['full movie', -55],
   ['full episode', -50],
   ['episode', -30],
-  ['scene', -14],
-  ['clip', -18],
+  ['dialogue', -45],
+  // Bare "scene" and "clip" are the shapes that actually appear — "<Film> -
+  // <Song> Scene", "Movie Clip: <Song>" — and at a token penalty they still
+  // scored positive, so whenever the real release was missing from the results
+  // one of them won. The wanted-title exemption below is what keeps a song
+  // called "Love Scene" from being punished for its own name.
+  ['scene', -45],
+  ['clip', -40],
+  // Serialised uploads: a song is not published in parts.
+  ['part 1', -35],
+  ['part 2', -35],
+  ['part 3', -35],
+  // The picturised cut. In Indian releases especially this is the version that
+  // opens on dialogue and reaches the song half a minute in — exactly the
+  // "scene first, song later" complaint — while the standalone audio or music
+  // video of the same track sits alongside it.
+  ['full video', -22],
+  ['video song', -22],
   // Compilations and mixes: real audio, wrong object.
   ['compilation', -40],
   ['jukebox', -40],
@@ -182,15 +202,60 @@ const QUALITY_TIERS: readonly (readonly [string, number, string])[] = [
   ['official audio', 22, 'official-audio'],
   ['official visualizer', 20, 'official-visualiser'],
   ['official video song', 18, 'official-video-song'],
-  ['official music video', 18, 'official-music-video'],
+  ['official music video', 20, 'official-music-video'],
   ['official video', 16, 'official-video'],
   ['official song', 16, 'official-song'],
-  ['full video song', 12, 'full-video-song'],
   ['full song', 12, 'full-song'],
+  // Above the lyric tiers and matched before them. A bare "(Audio)" upload is
+  // the standalone recording by definition, which is exactly what is wanted
+  // here, while a lyrics channel tying with the label's audio cut let the
+  // reupload win a coin toss.
+  ['audio', 10, 'audio'],
   ['official', 9, 'official'],
-  ['lyric video', 6, 'lyric-video'],
-  ['lyrics', 5, 'lyrics'],
-  ['audio', 5, 'audio'],
+  ['lyric video', 5, 'lyric-video'],
+  ['lyrics', 4, 'lyrics'],
+];
+
+/**
+ * Markers that disqualify a candidate outright rather than merely cost it
+ * points.
+ *
+ * Scoring alone was not enough. A scene upload carries the exact song title and
+ * the right runtime, so it collects the title and duration bonuses and lands
+ * only slightly negative — and "slightly negative" still wins when the real
+ * release is missing from the results, which is how a movie scene ends up
+ * playing. These are the shapes that are never a song release under any
+ * reading, so they are removed from consideration instead.
+ *
+ * Word boundaries throughout: `\bclip\b` must not fire on the artist Clipse,
+ * and `\bscene\b` must not fire on "scenery". The wanted-title exemption still
+ * applies on top — a track Spotify calls "Love Scene" vetoes nothing.
+ */
+const VETO_TITLE: readonly RegExp[] = [
+  /\bscene\b/iu,
+  /\bscenes\b/iu,
+  /\bclip\b/iu,
+  /\bclips\b/iu,
+  /\bdialogue\b/iu,
+  /\bshorts\b/iu,
+  /\btrailer\b/iu,
+  /\bteaser\b/iu,
+  /\breaction\b/iu,
+  /\breacts\b/iu,
+  /\binterview\b/iu,
+];
+
+/** Phrases disqualifying wherever they appear, title or channel. */
+const VETO_ANYWHERE: readonly RegExp[] = [
+  /\bmovie\s+scenes?\b/iu,
+  /\bfilm\s+scenes?\b/iu,
+  /\btv\s+scenes?\b/iu,
+  /\bmovie\s+clips?\b/iu,
+  /\bfilm\s+clips?\b/iu,
+  /\bfull\s+scene\b/iu,
+  /\bfull\s+movie\b/iu,
+  /\bfull\s+episode\b/iu,
+  /\bbest\s+scenes?\b/iu,
 ];
 
 /** Variants that mean a different recording rather than a different master. */
@@ -273,6 +338,25 @@ export function scoreCandidate<T extends MatchCandidate>(
   // A livestream is never a track release, and it has no duration to compare.
   if (candidate.isStream) {
     return { candidate, score: REJECT_BELOW - 100, reasons: ['stream'], authoritative: false };
+  }
+
+  // Disqualification happens before scoring: no combination of title, runtime
+  // and channel should be able to rehabilitate a movie scene. Exempted when the
+  // Spotify metadata carries the same word, so the release is never rejected
+  // for matching its own name.
+  const wantedRaw = `${wanted.title} ${wanted.artist} ${wanted.album ?? ''}`;
+  const vetoed =
+    VETO_TITLE.find((rule) => rule.test(candidate.title) && !rule.test(wantedRaw)) ??
+    VETO_ANYWHERE.find(
+      (rule) => rule.test(`${candidate.title} ${candidate.author}`) && !rule.test(wantedRaw),
+    );
+  if (vetoed !== undefined) {
+    return {
+      candidate,
+      score: REJECT_BELOW - 100,
+      reasons: [`vetoed:${vetoed.source.replace(/\\b|\\s\+/gu, ' ').trim()}`],
+      authoritative: false,
+    };
   }
 
   const wantedId = identityOf(wanted.artist, wanted.title);
@@ -419,7 +503,13 @@ export function scoreCandidate<T extends MatchCandidate>(
   }
 
   /* --- junk -------------------------------------------------------------- */
+  // A phrase the Spotify metadata itself contains is not evidence of anything:
+  // songs are called "Love Scene", albums are called "Part 2", and a soundtrack
+  // album is named after its film. Penalising those would reject the release
+  // for matching its own title, which is the opposite of the intent.
+  const wantedText = flat(`${wanted.title} ${wanted.artist} ${wanted.album ?? ''}`);
   for (const [phrase, penalty] of JUNK_PATTERNS) {
+    if (hasPhrase(wantedText, phrase)) continue;
     if (hasPhrase(candidateText, phrase)) add(penalty, `junk:${phrase.replace(/\s+/gu, '-')}`);
   }
 
@@ -467,8 +557,9 @@ export function queryPlan(wanted: WantedTrack): readonly string[] {
   const plans = [
     plain,
     `${wanted.title} ${lead} official audio`,
-    `${wanted.title} ${lead} topic`,
     `${wanted.title} ${lead} official music video`,
+    `${wanted.title} ${lead} topic`,
+    `${wanted.title} ${lead} official song`,
   ];
   // A distinct lead artist is worth one more attempt: collaborations are often
   // uploaded under the lead alone, and the joined string matches nothing.
