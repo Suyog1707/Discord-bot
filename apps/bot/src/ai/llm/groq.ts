@@ -17,6 +17,9 @@ const logger = getLogger('groq');
 
 const API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
+/** Case-insensitive: Groq accepts "JSON" as readily as "json". */
+const JSON_MENTIONED = /json/i;
+
 export type GroqReasoningEffort = 'none' | 'low' | 'medium' | 'high';
 
 export interface GroqOptions {
@@ -56,6 +59,17 @@ export class GroqProvider implements LLMProvider {
     const startedAt = Date.now();
     const { apiKey, model, timeoutMs, reasoningEffort } = this.#options;
 
+    // Groq rejects `response_format: json_object` unless the word "json"
+    // appears somewhere in the messages — a 400, not a warning. The constraint
+    // travels with the response format rather than with any one prompt, so it
+    // is enforced here instead of being left as a rule every caller has to
+    // remember: `rerank` asked for JSON while describing the shape as a literal
+    // object and never saying the word, and every call it made failed.
+    const system =
+      request.json === true && !JSON_MENTIONED.test(`${request.system} ${request.user}`)
+        ? `${request.system}\n\nRespond with a single JSON object.`
+        : request.system;
+
     const response = await fetch(API_URL, {
       method: 'POST',
       headers: {
@@ -66,7 +80,7 @@ export class GroqProvider implements LLMProvider {
       body: JSON.stringify({
         model,
         messages: [
-          { role: 'system', content: request.system },
+          { role: 'system', content: system },
           { role: 'user', content: request.user },
         ],
         max_tokens: request.maxTokens ?? 512,
