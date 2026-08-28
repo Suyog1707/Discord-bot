@@ -187,6 +187,47 @@ export const botEnvSchema = requireInProduction(
         .default(LIMITS.QUEUE_MAX_TRACKS),
       /** Bounded parallel Lavalink searches for Spotify collection playback. */
       SPOTIFY_RESOLVE_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(8),
+
+      /* ---------------------------------------------------------------- */
+      /* Track resolution                                                  */
+      /*                                                                   */
+      /* The metadata layer (Spotify / Apple Music / Deezer) identifies    */
+      /* the recording; the playback layer (SoundCloud / YouTube / HTTP)   */
+      /* finds an upload that IS it. These tune the second half — see      */
+      /* music/match-config.ts for what each weight actually does.         */
+      /* ---------------------------------------------------------------- */
+
+      /**
+       * Playback provider priority. SoundCloud first by design: its catalogue
+       * is only music, so its worst wrong answer is a bootleg remix, whereas
+       * YouTube's index holds the film the song is from and everything anyone
+       * ever said about it. Flip this to fall back the other way without a
+       * deploy when SoundCloud coverage is the bigger problem for a workload.
+       */
+      PLAYBACK_PROVIDER_ORDER: z
+        .enum(['soundcloud,youtube', 'youtube,soundcloud', 'soundcloud', 'youtube'])
+        .default('soundcloud,youtube'),
+      /**
+       * How far a candidate's runtime may sit from the canonical runtime and
+       * still count as a match. The ±10-15s band covers fade-outs, silent tails
+       * and the half-second disagreements between catalogues; widen it for
+       * catalogues that habitually pad, and never so far that a 6-minute
+       * picturised cut passes for a 3:48 song.
+       */
+      MATCH_DURATION_TOLERANCE_MS: z.coerce.number().int().min(1_000).max(120_000).default(12_000),
+      /** Minimum score a SoundCloud candidate must reach before it is played. */
+      MATCH_SOUNDCLOUD_MIN_SCORE: z.coerce.number().int().min(0).max(200).default(55),
+      /** Minimum score a YouTube candidate must reach. Deliberately no lower than SoundCloud's. */
+      MATCH_YOUTUBE_MIN_SCORE: z.coerce.number().int().min(0).max(200).default(55),
+      /**
+       * Extra uploader-name tokens that mark a rights-holder, comma-separated.
+       *
+       * The built-in list is generic ("records", "recordings", "label") rather
+       * than a roster of company names, because a fixed roster is wrong the
+       * moment the bot plays music from a market nobody listed. This is where
+       * an operator adds the labels that matter to their listeners.
+       */
+      MATCH_OFFICIAL_CHANNELS: optional(z.string().min(1)),
       /**
        * Same value as the web app's NEXTAUTH_SECRET. Lets the bot decrypt the
        * Spotify tokens the dashboard stored, enabling `/spotify playlists`.

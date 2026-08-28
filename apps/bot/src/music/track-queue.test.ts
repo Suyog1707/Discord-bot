@@ -34,6 +34,20 @@ function autoplayTrack(id: string): QueuedTrack {
   return makeTrack(id, { origin: 'autoplay', requestedByName: 'Autoplay' });
 }
 
+describe('QueuedTrack shape', () => {
+  it('carries the playback source through the queue unchanged', () => {
+    // The queue is storage, not policy: adding a field to the track model must
+    // not change how anything is ordered, skipped or restored.
+    const queue = new TrackQueue();
+    const track = makeTrack('a', { source: 'spotify', playbackSource: 'soundcloud' });
+    queue.add([track]);
+
+    expect(queue.upcoming[0]?.playbackSource).toBe('soundcloud');
+    expect(queue.upcoming[0]?.source).toBe('spotify');
+    expect(queue.size).toBe(1);
+  });
+});
+
 describe('TrackQueue', () => {
   describe('add', () => {
     it('appends and reports the insert position', () => {

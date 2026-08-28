@@ -58,7 +58,7 @@ export default defineCommand({
     .addStringOption((option) =>
       option
         .setName('query')
-        .setDescription('A URL (YouTube, Spotify, SoundCloud, Deezer) or a search term')
+        .setDescription('A URL (Spotify, YouTube, SoundCloud, Apple Music) or a search term')
         .setRequired(true)
         .setAutocomplete(true)
         .setMaxLength(500),
@@ -66,7 +66,7 @@ export default defineCommand({
     .addStringOption((option) =>
       option
         .setName('source')
-        .setDescription('Where to search when the query is not a URL (default: Spotify)')
+        .setDescription('Pin playback to one provider (default: SoundCloud, then YouTube)')
         .addChoices(
           { name: 'YouTube', value: 'youtube' },
           { name: 'SoundCloud', value: 'soundcloud' },

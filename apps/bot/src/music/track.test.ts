@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { isPlausibleAlternative } from './track.js';
+import { isPlausibleAlternative, playbackSourceOf } from './track.js';
 
 /**
  * The cases here are real: SoundCloud answers both "Banda Kaam Ka" and
@@ -81,5 +81,27 @@ describe('isPlausibleAlternative', () => {
         durationMs: 0,
       }),
     ).toBe(true);
+  });
+});
+
+describe('playbackSourceOf', () => {
+  it('reports where the audio actually came from, not what the track displays as', () => {
+    // A Spotify-identified track streamed from SoundCloud. The re-source path
+    // must flip to YouTube, not away from "spotify" — which names no provider.
+    expect(playbackSourceOf({ source: 'spotify', playbackSource: 'soundcloud' })).toBe('soundcloud');
+    expect(playbackSourceOf({ source: 'spotify', playbackSource: 'youtube' })).toBe('youtube');
+  });
+
+  it('falls back to the display source for a track that predates the field', () => {
+    // Restored queues written before `playbackSource` existed.
+    expect(playbackSourceOf({ source: 'soundcloud' })).toBe('soundcloud');
+    expect(playbackSourceOf({ source: 'youtube' })).toBe('youtube');
+  });
+
+  it('reads a metadata-only source as YouTube', () => {
+    // Spotify and Deezer cannot stream anything, so a track recorded against
+    // one of them came from the old single-provider pipeline.
+    expect(playbackSourceOf({ source: 'spotify' })).toBe('youtube');
+    expect(playbackSourceOf({ source: 'deezer' })).toBe('youtube');
   });
 });

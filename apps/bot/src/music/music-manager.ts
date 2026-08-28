@@ -48,20 +48,31 @@ import {
   searchSpotifyBest,
 } from './spotify-resolver.js';
 import {
-  isConfident,
-  queryPlan,
-  rankCandidates,
-  REJECT_BELOW,
+  canonicalTrack,
+  describeCanonical,
+  joinedArtists,
+  type CanonicalTrack,
+} from './canonical-track.js';
+import {
+  requestedVariantsOf,
   type MatchCandidate,
-  type ScoredCandidate,
-} from './youtube-match.js';
+  type PlaybackProvider,
+} from './candidate-matcher.js';
+import { AUTOPLAY_WEIGHTS } from './match-config.js';
+import { identifyCanonicalTrack } from './metadata-providers.js';
+import {
+  resolvePlayback,
+  ResolutionCache,
+  type ResolvedPlayback,
+} from './playback-resolver.js';
+import { getResolutionSettings } from './resolution-settings.js';
 import type { SpotifyTrackMeta } from './spotify-resolver.js';
 import type { QueueStore } from './queue-store.js';
 import { resolvePlatformLinks, type PlatformLinks } from './platform-links.js';
 import {
   buildSearchQuery,
   fromLavalinkTrack,
-  isPlausibleAlternative,
+  playbackSourceOf,
   trackOrigin,
   type QueuedTrack,
 } from './track.js';
@@ -124,6 +135,66 @@ const SEARCH_CACHE_MAX_ENTRIES = 2_000;
 /** Results kept per search for ranking. Beyond this the tail is never the release. */
 const SEARCH_CANDIDATE_LIMIT = 10;
 
+/**
+ * Accept threshold when no catalogue could identify the query.
+ *
+ * Three of the strongest signals — a canonical runtime, a known artist and an
+ * ISRC — are simply absent on this path, so scores land far lower than they do
+ * for an identified track and the full threshold would reject everything. The
+ * vetoes, the ranking and the version rules are unchanged: this lowers the bar
+ * for evidence, not the standard for what counts as a song.
+ */
+const UNIDENTIFIED_ACCEPT_SCORE = 28;
+
+/**
+ * Where a caller wants the audio to come from.
+ *
+ * `auto` is the architecture's default and means "ask the metadata layer what
+ * this song is, then try the playback providers in priority order". The two
+ * explicit values pin resolution to one provider, which is what `/play
+ * source:` has always done and what the alternative-source recovery needs.
+ */
+export type PlaybackPreference = 'auto' | PlaybackProvider;
+
+/**
+ * A Lavalink result wearing the matcher's interface.
+ *
+ * The scorer works on plain fields; the Lavalink object rides along so the
+ * winner can be handed back as the thing the player actually needs.
+ */
+interface LavalinkCandidate extends MatchCandidate {
+  readonly track: LavalinkTrack;
+}
+
+function toCandidate(track: LavalinkTrack): LavalinkCandidate {
+  return {
+    title: track.info.title,
+    author: track.info.author,
+    durationMs: track.info.length,
+    isStream: track.info.isStream,
+    identifier: track.info.identifier,
+    // Lavalink v4 surfaces the ISRC when the source manager knows one. It is
+    // the strongest signal the matcher has and costs nothing to carry.
+    isrc: track.info.isrc ?? null,
+    track,
+  };
+}
+
+/** Canonical identity for a Spotify recording. */
+function canonicalFromSpotify(meta: SpotifyTrackMeta): CanonicalTrack {
+  return canonicalTrack({
+    title: meta.title,
+    artist: meta.artist,
+    album: meta.album,
+    durationMs: meta.durationMs,
+    isrc: meta.isrc,
+    provider: 'spotify',
+    providerId: meta.spotifyId,
+    url: meta.spotifyUrl,
+    artworkUrl: meta.artworkUrl,
+  });
+}
+
 export interface JoinOptions {
   readonly guildId: string;
   readonly voiceChannelId: string;
@@ -163,6 +234,14 @@ export class MusicManager {
     string,
     { candidates: readonly LavalinkTrack[]; expiresAt: number }
   >();
+
+  /**
+   * Accepted resolutions, keyed by canonical identity (ISRC where there is
+   * one). Replaying a playlist, or two guilds asking for the same song, skips
+   * the whole provider walk. Only confident matches are ever stored — see
+   * `ResolutionCache`.
+   */
+  readonly #resolutionCache = new ResolutionCache<LavalinkCandidate>();
 
   constructor(options: {
     readonly client: Client;
@@ -470,13 +549,23 @@ export class MusicManager {
   }
 
   /**
-   * The same recording from a source other than the one that just failed.
+   * The same recording from a provider other than the one that just failed.
    *
-   * YouTube refuses to stream some videos to anonymous clients — label-owned
-   * music especially — and until now that turned into "skipping" even when the
-   * song was sitting on SoundCloud. Metadata sources (Spotify, Apple Music)
-   * cannot supply audio, so they are never a target: for those the *display*
-   * source stays put and only the underlying stream is swapped.
+   * Streams die for reasons that are provider-specific — YouTube refuses
+   * label-owned music to anonymous clients, a SoundCloud upload gets taken
+   * down — and until this existed that turned into "skipping" even when the
+   * song was sitting on the other provider.
+   *
+   * The failed provider is read from `playbackSource`, not `source`: a track
+   * the metadata layer identified displays as Spotify while its audio came from
+   * SoundCloud or YouTube, and flipping away from "spotify" would pick a
+   * provider at random. Metadata sources are never a target — they cannot
+   * supply audio at all — so only the underlying stream is swapped and the
+   * listener-facing identity stays exactly where it was.
+   *
+   * The replacement goes through the full matcher, not a bare search: the
+   * fallback provider returns *something* for any query, and a remix or a
+   * different song by the same artist is worse than admitting defeat.
    */
   async findAlternativeSource(
     track: QueuedTrack,
@@ -485,38 +574,47 @@ export class MusicManager {
     const node = this.shoukaku.getIdealNode();
     if (node === undefined) return null;
 
-    // Whatever just failed, try the other streaming source. A Spotify-sourced
-    // track failed on YouTube (that is where its audio came from), so it too
-    // falls through to SoundCloud.
-    const alternative: 'youtube' | 'soundcloud' =
-      failedSource === 'soundcloud' ? 'youtube' : 'soundcloud';
+    const failed = playbackSourceOf({
+      source: failedSource,
+      ...(track.playbackSource === undefined ? {} : { playbackSource: track.playbackSource }),
+    });
+    const alternative: PlaybackProvider = failed === 'soundcloud' ? 'youtube' : 'soundcloud';
 
-    const query = `${track.title} ${track.author}`.trim();
-    const match = await this.#searchOne(node, query, alternative).catch(() => null);
-    if (match === null) return null;
+    // Everything already known about the track becomes the canonical identity
+    // the alternative is held to — including the runtime, which is the signal
+    // that stops a fifteen-minute "full album" upload standing in for a song.
+    const wanted = canonicalTrack({
+      title: track.title,
+      artist: track.author,
+      durationMs: track.durationMs,
+      provider: track.source === 'youtube' || track.source === 'soundcloud' ? 'query' : track.source,
+      url: track.uri,
+      artworkUrl: track.artworkUrl,
+    });
 
-    const replacement = fromLavalinkTrack(match, {
+    const resolved = await this.#resolvePlayable(node, wanted, {
+      preference: alternative,
+      bypassCache: true,
+    }).catch((error: unknown) => {
+      logger.debug({ err: error, title: track.title, provider: alternative }, 'Re-source failed');
+      return null;
+    });
+    if (resolved === null) return null;
+
+    const replacement = fromLavalinkTrack(resolved.candidate.track, {
       id: track.requestedById,
       name: track.requestedByName,
     });
-
-    // Search on the fallback source returns *something* for any query — often a
-    // remix, or a different song by the same artist. Playing the wrong track is
-    // worse than admitting we could not play this one.
-    if (!isPlausibleAlternative(track, replacement)) {
-      logger.debug(
-        { wanted: track.title, got: replacement.title, source: alternative },
-        'Rejected implausible alternative',
-      );
-      return null;
-    }
     return {
       ...replacement,
       // Keep the listener-facing identity of the track they queued; only the
       // stream behind it changed.
       title: track.title,
       author: track.author,
+      source: track.source,
+      playbackSource: resolved.provider,
       artworkUrl: track.artworkUrl ?? replacement.artworkUrl,
+      ...(track.origin === undefined ? {} : { origin: track.origin }),
     };
   }
 
@@ -587,10 +685,22 @@ export class MusicManager {
   /**
    * Turn a recommended `artist — title` into something Lavalink can play.
    *
-   * The plausibility guard matters more here than anywhere else: a search for a
-   * track YouTube does not have returns *something* regardless, and without the
-   * check autoplay would confidently queue a lyric video, a cover, or an
-   * unrelated song that merely shares a word with the request.
+   * Runs the same matcher as a user request, so the vetoes that keep movie
+   * scenes and reaction videos out of `/play` keep them out of autoplay too —
+   * previously this took whichever result came back first and applied a much
+   * weaker plausibility check.
+   *
+   * Two deliberate differences from the user-request path:
+   *
+   *   - **Duration is unknown.** A recommendation is a title and an artist,
+   *     nothing more, so the single largest positive signal is unavailable and
+   *     every score lands correspondingly lower. `AUTOPLAY_WEIGHTS` moves the
+   *     threshold with it; the vetoes and filters are unchanged.
+   *   - **YouTube, not the SoundCloud-first order.** The mix-based autoplay
+   *     fallback in `pickAutoplayTracks` seeds from YouTube video ids carried
+   *     on played tracks, so resolving recommendations elsewhere would quietly
+   *     starve it. Recommendations are also generated from a YouTube-shaped
+   *     vocabulary to begin with.
    */
   async resolveCandidate(candidate: {
     readonly title: string;
@@ -599,39 +709,42 @@ export class MusicManager {
     const node = this.shoukaku.getIdealNode();
     if (node === undefined) return null;
 
-    const raw = await this.#searchOne(node, `${candidate.artist} ${candidate.title}`);
-    if (raw === null) return null;
+    const wanted = canonicalTrack({
+      title: candidate.title,
+      artist: candidate.artist,
+      // Zero, not a guess: the matcher reads a non-positive runtime as "nothing
+      // to compare" and skips the duration signal rather than scoring against a
+      // fabricated one.
+      durationMs: 0,
+      provider: 'query',
+    });
+
+    const resolved = await resolvePlayback<LavalinkCandidate>(wanted, this.#providerSearch(node), {
+      order: ['youtube'],
+      weights: { youtube: AUTOPLAY_WEIGHTS, soundcloud: AUTOPLAY_WEIGHTS },
+      duration: getResolutionSettings().duration,
+      officialChannelTokens: getResolutionSettings().officialChannelTokens,
+      cache: this.#resolutionCache,
+    }).then(({ result }) => result);
+    if (resolved === null) return null;
 
     const track: QueuedTrack = {
-      ...fromLavalinkTrack(raw, {
+      ...fromLavalinkTrack(resolved.candidate.track, {
         id: this.#client.user?.id ?? '0',
         name: 'Autoplay',
       }),
+      playbackSource: resolved.provider,
       // Recommendation-generated: history and future generations must treat
       // this play as context, never as user taste.
       origin: 'autoplay',
     };
 
     // Live streams and radio rips are not songs; long uploads are usually full
-    // albums or hour-long mixes that would swallow the queue.
+    // albums or hour-long mixes that would swallow the queue. The matcher
+    // cannot apply this itself — with no canonical runtime it has nothing to
+    // compare against — so autoplay keeps its own absolute bounds.
     if (track.isStream) return null;
     if (track.durationMs < 60_000 || track.durationMs > 900_000) return null;
-
-    // Duration 0 deliberately: a recommendation carries a title and an artist
-    // but no running time, and `isPlausibleAlternative` treats a non-positive
-    // duration as "nothing to compare" — so the word-overlap and variant checks
-    // still apply while the duration comparison is skipped rather than faked.
-    const wanted = { title: candidate.title, author: candidate.artist, durationMs: 0 };
-    if (!isPlausibleAlternative(wanted, track)) {
-      logger.debug(
-        {
-          wanted: `${candidate.artist} — ${candidate.title}`,
-          got: `${track.author} — ${track.title}`,
-        },
-        'Rejected an implausible recommendation match',
-      );
-      return null;
-    }
 
     return track;
   }
@@ -699,139 +812,106 @@ export class MusicManager {
   }
 
   /**
-   * Lavalink's own first choice.
+   * Search one playback provider, bound to a node.
    *
-   * Kept for the callers that want relevance order rather than a ranked match:
-   * the SoundCloud re-source, which applies its own `isPlausibleAlternative`
-   * check afterwards, and autoplay, whose candidates were already chosen by the
-   * recommender before they got here.
+   * This is the seam the resolver is built around: it knows how to ask
+   * Lavalink and nothing about which provider should be asked first or what
+   * makes an answer acceptable. Both of those live in `playback-resolver.ts`,
+   * where the canonical track is in scope.
    */
-  async #searchOne(
-    node: Node,
-    query: string,
-    source: 'youtube' | 'soundcloud' = 'youtube',
-  ): Promise<LavalinkTrack | null> {
-    const [best] = await this.#searchMany(node, query, source);
-    return best ?? null;
-  }
-
-  /**
-   * The best playable upload for one Spotify recording.
-   *
-   * Runs {@link queryPlan} in order and stops the moment a candidate clears
-   * {@link CONFIDENT_SCORE}, so an unambiguous track costs exactly the one
-   * search the old code made. Only tracks whose first query fails to produce an
-   * obvious winner — the soundtracks, the collaborations, the songs whose name
-   * is also a film — pay for the extra attempts.
-   *
-   * Candidates accumulate across queries and are deduplicated by identifier, so
-   * a result that appears in three searches is scored once and the later
-   * queries only widen the field.
-   *
-   * @returns The winning Lavalink track, or null when nothing scored above
-   *   {@link REJECT_BELOW} — which leaves the caller free to try another source
-   *   rather than queue a reaction video.
-   */
-  async #findBestMatch(
-    node: Node,
-    meta: SpotifyTrackMeta,
-    source: 'youtube' | 'soundcloud',
-  ): Promise<LavalinkTrack | null> {
-    const wanted = {
-      title: meta.title,
-      artist: meta.artist,
-      durationMs: meta.durationMs,
-      album: meta.album,
+  #providerSearch(node: Node): (query: string, provider: PlaybackProvider) => Promise<readonly LavalinkCandidate[]> {
+    return async (query, provider) => {
+      const results = await this.#searchMany(node, query, provider);
+      return results.map((track) => toCandidate(track));
     };
-
-    const seen = new Set<string>();
-    const pool: LavalinkTrack[] = [];
-    // The scorer works on plain fields; `track` rides along so the winner can
-    // be handed back as the Lavalink object the caller needs.
-    let ranked: readonly ScoredCandidate<MatchCandidate & { track: LavalinkTrack }>[] = [];
-    let queriesRun = 0;
-
-    for (const query of queryPlan(wanted)) {
-      queriesRun += 1;
-      const results = await this.#searchMany(node, query, source);
-      for (const result of results) {
-        if (seen.has(result.info.identifier)) continue;
-        seen.add(result.info.identifier);
-        pool.push(result);
-      }
-      if (pool.length === 0) continue;
-
-      ranked = rankCandidates(
-        wanted,
-        pool.map((track) => ({
-          title: track.info.title,
-          author: track.info.author,
-          durationMs: track.info.length,
-          isStream: track.info.isStream,
-          identifier: track.info.identifier,
-          track,
-        })),
-      );
-      if (isConfident(ranked[0])) break;
-    }
-
-    const winner = ranked[0];
-    if (winner === undefined) {
-      logger.debug({ title: meta.title, artist: meta.artist, queriesRun }, 'No search results');
-      return null;
-    }
-
-    // One line per resolved track at debug, so a thousand-track playlist does
-    // not narrate itself at info while still being fully explainable when the
-    // wrong thing plays. The runners-up are the useful part: "why that one"
-    // is only answerable next to what it beat.
-    logger.debug(
-      {
-        want: `${meta.artist} — ${meta.title}`,
-        wantMs: meta.durationMs,
-        queriesRun,
-        considered: pool.length,
-        picked: `${winner.candidate.author} — ${winner.candidate.title}`,
-        pickedMs: winner.candidate.durationMs,
-        score: winner.score,
-        why: winner.reasons.join(' '),
-        runnersUp: ranked.slice(1, 4).map((entry) => ({
-          track: `${entry.candidate.author} — ${entry.candidate.title}`,
-          score: entry.score,
-          why: entry.reasons.slice(0, 4).join(' '),
-        })),
-      },
-      'Spotify → YouTube match',
-    );
-
-    if (winner.score < REJECT_BELOW) {
-      logger.info(
-        {
-          want: `${meta.artist} — ${meta.title}`,
-          best: `${winner.candidate.author} — ${winner.candidate.title}`,
-          score: winner.score,
-          why: winner.reasons.join(' '),
-        },
-        'Rejected every candidate as not the song',
-      );
-      return null;
-    }
-
-    return winner.candidate.track;
   }
 
   /**
-   * Map Spotify tracks to playable matches via Lavalink search.
+   * The best playable upload for one canonical recording — SoundCloud first,
+   * YouTube as the fallback.
+   *
+   * All of the policy lives in {@link resolvePlayback}; this only supplies the
+   * node-bound search, the configured weights and the cache. A null return is a
+   * real answer and means every provider was asked and none of them produced a
+   * candidate worth playing.
+   */
+  async #resolvePlayable(
+    node: Node,
+    wanted: CanonicalTrack,
+    options: {
+      readonly preference?: PlaybackPreference;
+      readonly requestedVariants?: ReadonlySet<string> | undefined;
+      readonly acceptScore?: number | undefined;
+      /**
+       * Skip the resolution cache entirely. Set by stream recovery, which is by
+       * definition reacting to a result that turned out to be unplayable:
+       * reading the cache could hand back the dead entry, and writing to it
+       * would publish a recovery pick as the canonical answer for every future
+       * request.
+       */
+      readonly bypassCache?: boolean;
+    } = {},
+  ): Promise<ResolvedPlayback<LavalinkCandidate> | null> {
+    const settings = getResolutionSettings();
+    const preference = options.preference ?? 'auto';
+    const { result } = await resolvePlayback<LavalinkCandidate>(wanted, this.#providerSearch(node), {
+      // An explicitly chosen source pins the walk to that one provider; there
+      // is no silent fall-through to somewhere the user did not ask for.
+      order: preference === 'auto' ? settings.order : [preference],
+      weights: settings.weights,
+      duration: settings.duration,
+      officialChannelTokens: settings.officialChannelTokens,
+      requestedVariants: options.requestedVariants,
+      acceptScore: options.acceptScore,
+      ...(options.bypassCache === true ? {} : { cache: this.#resolutionCache }),
+    });
+    return result;
+  }
+
+  /**
+   * Turn one canonical recording into a queueable track.
+   *
+   * The metadata provider's identity is what the listener sees — title, artist,
+   * artwork and, crucially, the URL — while the playback provider supplies only
+   * the audio. A SoundCloud page must never become the public URL of a Spotify
+   * track, and the display source must not change just because the stream came
+   * from somewhere else. `playbackSource` records where the audio actually came
+   * from, which is what the re-source path needs when a stream later dies.
+   */
+  #queuedFromResolution(
+    resolved: ResolvedPlayback<LavalinkCandidate>,
+    wanted: CanonicalTrack,
+    requestedBy: { readonly id: string; readonly name: string },
+    displaySource: MusicSource,
+  ): QueuedTrack {
+    const track = fromLavalinkTrack(resolved.candidate.track, requestedBy);
+    return {
+      ...track,
+      title: wanted.title,
+      author: joinedArtists(wanted),
+      artworkUrl: wanted.artworkUrl ?? track.artworkUrl,
+      uri: wanted.url ?? track.uri,
+      source: displaySource,
+      playbackSource: resolved.provider,
+    };
+  }
+
+  /**
+   * Map canonical metadata to playable matches, batch by batch.
    *
    * Work is done in batches of `SPOTIFY_RESOLVE_CONCURRENCY`: parallel within a
    * batch for throughput, batch-by-batch so `onBatch` receives tracks in queue
    * order and the queue grows while the earlier tracks are already playing.
+   *
+   * A track that no provider can match confidently is simply absent from the
+   * batch. That is deliberate: a collection resolving 47 of 50 songs correctly
+   * is a better outcome than 50 of 50 where three are the wrong recording.
    */
   async #matchSpotifyTracks(
     metadata: readonly SpotifyTrackMeta[],
     requestedBy: { readonly id: string; readonly name: string },
     onBatch?: (tracks: readonly QueuedTrack[]) => Promise<void>,
-    source: 'youtube' | 'soundcloud' = 'youtube',
+    preference: PlaybackPreference = 'auto',
   ): Promise<SpotifyBackgroundResolution> {
     if (metadata.length === 0) {
       return { sourceTrackCount: 0, resolvedTrackCount: 0, failedTrackCount: 0 };
@@ -845,27 +925,18 @@ export class MusicManager {
     const startedAt = Date.now();
     const batchSize = Math.max(1, getEnv().SPOTIFY_RESOLVE_CONCURRENCY);
     let resolvedCount = 0;
+    const perProvider = new Map<PlaybackProvider, number>();
 
     for (let offset = 0; offset < metadata.length; offset += batchSize) {
       const batch = metadata.slice(offset, offset + batchSize);
       const matched = await Promise.all(
         batch.map(async (meta): Promise<QueuedTrack | null> => {
+          const wanted = canonicalFromSpotify(meta);
           try {
-            const best = await this.#findBestMatch(node, meta, source);
-            if (best === null) return null;
-            const track = fromLavalinkTrack(best, requestedBy);
-            // Spotify is metadata-only: its identity is what the listener sees
-            // (title, artist, artwork and — crucially — the URL), while the
-            // Lavalink match supplies only the audio. The playback provider's
-            // page must never become the public URL of a Spotify track.
-            return {
-              ...track,
-              title: meta.title,
-              author: meta.artist,
-              artworkUrl: meta.artworkUrl ?? track.artworkUrl,
-              uri: meta.spotifyUrl ?? track.uri,
-              source: 'spotify',
-            };
+            const resolved = await this.#resolvePlayable(node, wanted, { preference });
+            if (resolved === null) return null;
+            perProvider.set(resolved.provider, (perProvider.get(resolved.provider) ?? 0) + 1);
+            return this.#queuedFromResolution(resolved, wanted, requestedBy, 'spotify');
           } catch (error) {
             logger.debug({ err: error, title: meta.title }, 'Spotify track match failed');
             return null;
@@ -883,10 +954,14 @@ export class MusicManager {
         sourceTracks: metadata.length,
         resolved: resolvedCount,
         failed: metadata.length - resolvedCount,
+        // Which provider actually carried the collection. A sudden swing toward
+        // YouTube is the first sign SoundCloud coverage or search has degraded.
+        fromSoundcloud: perProvider.get('soundcloud') ?? 0,
+        fromYoutube: perProvider.get('youtube') ?? 0,
         durationMs: Date.now() - startedAt,
         batchSize,
       },
-      'Spotify Lavalink resolution complete',
+      'Canonical → playback resolution complete',
     );
     return {
       sourceTrackCount: metadata.length,
@@ -906,7 +981,7 @@ export class MusicManager {
   async #resolveSpotify(
     url: string,
     requestedBy: { readonly id: string; readonly name: string },
-    source: 'youtube' | 'soundcloud' = 'youtube',
+    preference: PlaybackPreference = 'auto',
   ): Promise<ResolveResult> {
     if (this.shoukaku.getIdealNode() === undefined) {
       throw new UpstreamError('The music server is not available right now. Try again shortly.');
@@ -938,11 +1013,11 @@ export class MusicManager {
     };
 
     let consumed = hasMore ? Math.min(1, firstPage.length) : firstPage.length;
-    await this.#matchSpotifyTracks(firstPage.slice(0, consumed), requestedBy, collect, source);
+    await this.#matchSpotifyTracks(firstPage.slice(0, consumed), requestedBy, collect, preference);
     // The very first track can be unmatchable; widen until something plays.
     while (headTracks.length === 0 && consumed < firstPage.length) {
       const batch = firstPage.slice(consumed, consumed + batchSize);
-      await this.#matchSpotifyTracks(batch, requestedBy, collect, source);
+      await this.#matchSpotifyTracks(batch, requestedBy, collect, preference);
       consumed += batch.length;
     }
 
@@ -960,12 +1035,12 @@ export class MusicManager {
           pending,
           requestedBy,
           onTracks,
-          source,
+          preference,
         );
         if (morePages === undefined) return fromFirstPage;
 
         const rest = await morePages;
-        const fromRest = await this.#matchSpotifyTracks(rest, requestedBy, onTracks, source);
+        const fromRest = await this.#matchSpotifyTracks(rest, requestedBy, onTracks, preference);
         return {
           sourceTrackCount: fromFirstPage.sourceTrackCount + fromRest.sourceTrackCount,
           resolvedTrackCount: fromFirstPage.resolvedTrackCount + fromRest.resolvedTrackCount,
@@ -1318,57 +1393,186 @@ export class MusicManager {
   /**
    * Resolve user input (URL or free text) into playable tracks.
    *
-   * `source: 'auto'` (what `/play` sends when the user picked nothing) makes
-   * Spotify the canonical catalogue for free text: the query is ranked against
-   * Spotify's tracks, albums, artists and playlists, and a credible match is
-   * resolved through the Spotify pipeline so its metadata — including the
-   * user-facing URL — stays Spotify's. Lavalink search remains the fallback
-   * when Spotify is unconfigured, unreachable, has no credible match, or the
-   * matched item yields nothing playable.
+   * Two questions, asked in that order, and the whole architecture is that
+   * order: *what song is this?*, then *which upload most accurately is it?*
    *
-   * @throws {NotFoundError} Nothing matched.
+   *   1. **Identity.** Spotify first (it alone can answer with an album, an
+   *      artist or a playlist), then Deezer, then Apple Music. The winner
+   *      becomes a `CanonicalTrack` — title, every credited artist, album,
+   *      runtime and, where the catalogue exposes one, an ISRC. The listener
+   *      keeps that identity: the catalogue's title, artwork and URL, never
+   *      the playback provider's page.
+   *   2. **Playback.** SoundCloud first, YouTube as the fallback, each with
+   *      multiple candidates filtered, scored and ranked against the canonical
+   *      track. Nothing plays unless it clears that provider's confidence
+   *      threshold.
+   *
+   * A URL bypasses step 1 entirely — the user already said which object they
+   * meant — which is what keeps YouTube, SoundCloud, Apple Music and direct
+   * HTTP links behaving exactly as before.
+   *
+   * `source` pins step 2 to one provider when the user chose one; step 1 still
+   * runs, because knowing what the song is makes the match better regardless of
+   * where it comes from.
+   *
+   * @throws {NotFoundError} No provider had a match good enough to play. This
+   *   is a real outcome, not a bug: a wrong song is worse than an honest miss.
    * @throws {ValidationError} Lavalink rejected the input.
    * @throws {UpstreamError} No node available or the node errored.
    */
   async resolve(
     input: string,
     requestedBy: { readonly id: string; readonly name: string },
-    source: 'auto' | 'youtube' | 'soundcloud' = 'youtube',
+    source: PlaybackPreference = 'auto',
   ): Promise<ResolveResult> {
     const node = this.shoukaku.getIdealNode();
     if (node === undefined) {
       throw new UpstreamError('The music server is not available right now. Try again shortly.');
     }
 
-    // An explicitly chosen source narrows the search; 'auto' searches Spotify
-    // first and falls back to YouTube below.
-    const searchSource: 'youtube' | 'soundcloud' =
-      source === 'soundcloud' ? 'soundcloud' : 'youtube';
-
-    // Spotify links: metadata from the Web API, audio via search on the
-    // playback sources — Spotify audio itself is never streamed.
+    // Spotify links: metadata from the Web API, audio via the playback layer —
+    // Spotify audio itself is never streamed.
     if (isSpotifyUrl(input)) {
-      return this.#resolveSpotify(input, requestedBy, searchSource);
+      return this.#resolveSpotify(input, requestedBy, source);
     }
     if (isSpotifyWebUrl(input)) {
       throw new ValidationError('Unsupported or invalid Spotify link.');
     }
 
-    if (source === 'auto' && !/^https?:\/\//iu.test(input.trim())) {
-      const hit = await searchSpotifyBest(input);
-      if (hit !== null) {
-        try {
-          return await this.#resolveSpotify(hit.url, requestedBy, searchSource);
-        } catch (error) {
-          // The catalogue had a match but nothing playable came of it — the
-          // plain provider search below still gets its chance.
-          logger.debug(
-            { err: error, query: input, kind: hit.kind, name: hit.name },
-            'Spotify-first resolution fell through to provider search',
-          );
-        }
+    // A URL names a specific object. There is no identity question to answer —
+    // the user already answered it — so it goes straight to Lavalink, which is
+    // what keeps YouTube links, SoundCloud links, Apple Music links (through
+    // LavaSrc) and plain HTTP audio working exactly as they always have.
+    if (/^https?:\/\//iu.test(input.trim())) {
+      return this.#resolveDirect(node, input, requestedBy, source);
+    }
+
+    // Free text. Identity first, playback second — see `canonical-track.ts`.
+    const requestedVariants = requestedVariantsOf(input);
+
+    // Spotify is the canonical catalogue and the only one of the three that
+    // can answer with an album, an artist or a playlist rather than a single
+    // track, so it keeps its own path.
+    const hit = await searchSpotifyBest(input);
+    if (hit !== null) {
+      try {
+        return await this.#resolveSpotify(hit.url, requestedBy, source);
+      } catch (error) {
+        // The catalogue had a match but nothing playable came of it. The other
+        // metadata providers still get their turn below.
+        logger.debug(
+          { err: error, query: input, kind: hit.kind, name: hit.name },
+          'Spotify-first resolution fell through',
+        );
       }
     }
+
+    // Deezer, then Apple Music. Deezer is asked first because it is the only
+    // one of the three that exposes an ISRC, and an identification carrying the
+    // strongest identifier is worth more than one that does not.
+    const identified = await identifyCanonicalTrack(input).catch((error: unknown) => {
+      logger.debug({ err: error, query: input }, 'Metadata identification failed');
+      return null;
+    });
+    if (identified !== null) {
+      const track = await this.#resolveIdentified(node, identified, requestedBy, {
+        preference: source,
+        requestedVariants,
+      });
+      if (track !== null) return { tracks: [track], playlistName: null };
+      logger.debug(
+        { query: input, identifiedAs: describeCanonical(identified) },
+        'Identified the track but no provider had a confident match',
+      );
+    }
+
+    // Nothing identified it. The query itself becomes the canonical identity —
+    // weaker evidence, so the threshold drops with it — but the candidates are
+    // still filtered, scored and ranked. "Whatever came back first" is not a
+    // fallback this architecture has.
+    const fromQuery = canonicalTrack({
+      title: input.trim(),
+      artist: '',
+      durationMs: 0,
+      provider: 'query',
+    });
+    const track = await this.#resolveIdentified(node, fromQuery, requestedBy, {
+      preference: source,
+      requestedVariants,
+      // No catalogue, no runtime and no artist: three of the strongest signals
+      // are simply absent, so holding this to the full threshold would reject
+      // everything. The vetoes and the ranking are unchanged.
+      acceptScore: UNIDENTIFIED_ACCEPT_SCORE,
+    });
+    if (track !== null) return { tracks: [track], playlistName: null };
+
+    throw new NotFoundError('No reliable playable version of that track was found.');
+  }
+
+  /**
+   * Resolve an identified recording to a single queueable track.
+   *
+   * @returns null when no playback provider produced a confident match. The
+   *   caller decides what that means — another metadata provider, or an honest
+   *   failure — but it never means "play the best of a bad set".
+   */
+  async #resolveIdentified(
+    node: Node,
+    wanted: CanonicalTrack,
+    requestedBy: { readonly id: string; readonly name: string },
+    options: {
+      readonly preference: PlaybackPreference;
+      readonly requestedVariants?: ReadonlySet<string> | undefined;
+      readonly acceptScore?: number | undefined;
+    },
+  ): Promise<QueuedTrack | null> {
+    const resolved = await this.#resolvePlayable(node, wanted, options);
+    if (resolved === null) return null;
+
+    // Which catalogue's identity the listener sees.
+    //
+    // Deezer has its own place in the source enum, so a Deezer-identified track
+    // displays as Deezer and links to its Deezer page. Apple Music does not —
+    // adding one is a database migration — so an Apple-identified track keeps
+    // the canonical title, artist and artwork but displays as, and links to,
+    // the provider that actually streamed it. A track labelled "youtube"
+    // carrying an Apple Music URL would be worse than either. The Apple link is
+    // not lost: `platform-links` surfaces it in the now-playing embed.
+    const identity: CanonicalTrack =
+      wanted.provider === 'query'
+        ? // Nothing identified this, so there is no catalogue identity to
+          // impose — the upload's own title and artist are the best available
+          // description of what is about to play.
+          {
+            ...wanted,
+            title: resolved.candidate.title,
+            primaryArtist: resolved.candidate.author,
+            artists: [resolved.candidate.author],
+            url: null,
+            artworkUrl: null,
+          }
+        : wanted.provider === 'apple-music'
+          ? { ...wanted, url: null }
+          : wanted;
+    const displaySource: MusicSource = wanted.provider === 'deezer' ? 'deezer' : resolved.provider;
+
+    return this.#queuedFromResolution(resolved, identity, requestedBy, displaySource);
+  }
+
+  /**
+   * A URL, handed to Lavalink unchanged.
+   *
+   * Untouched by the matcher on purpose: the user named the exact object, and
+   * second-guessing an explicit link is not this system's job. This is also the
+   * path that keeps direct HTTP audio playable.
+   */
+  async #resolveDirect(
+    node: Node,
+    input: string,
+    requestedBy: { readonly id: string; readonly name: string },
+    source: PlaybackPreference,
+  ): Promise<ResolveResult> {
+    const searchSource: PlaybackProvider = source === 'soundcloud' ? 'soundcloud' : 'youtube';
 
     let response: LavalinkResponse | undefined;
     try {

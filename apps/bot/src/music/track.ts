@@ -25,7 +25,22 @@ export interface QueuedTrack {
   readonly uri: string | null;
   readonly artworkUrl: string | null;
   readonly isStream: boolean;
+  /**
+   * The listener-facing identity of the track: the catalogue that named it.
+   * A Spotify-identified song stays `spotify` no matter which provider ended
+   * up streaming it, because that is what its title, artwork and URL are.
+   */
   readonly source: MusicSource;
+  /**
+   * Where the audio actually came from.
+   *
+   * Distinct from {@link source} and load-bearing for recovery: when a stream
+   * dies mid-track, "try the other provider" needs to know which one just
+   * failed, and `source` cannot answer that for anything the metadata layer
+   * identified. Absent on tracks resolved before this existed (restored
+   * queues), where {@link playbackSourceOf} falls back to `source`.
+   */
+  readonly playbackSource?: MusicSource;
   /** Discord user id of the requester. */
   readonly requestedById: string;
   /** Display name captured at request time (avoids a lookup at render time). */
@@ -53,6 +68,20 @@ export function trackOrigin(
   track: Pick<QueuedTrack, 'requestedByName'> & { readonly origin?: TrackOrigin },
 ): TrackOrigin {
   return track.origin ?? (track.requestedByName === 'Autoplay' ? 'autoplay' : 'user');
+}
+
+/**
+ * Which provider is actually streaming this track.
+ *
+ * Metadata sources cannot supply audio, so a track whose recorded playback
+ * source is one of them predates the field and is read as YouTube — what the
+ * old single-provider pipeline always used.
+ */
+export function playbackSourceOf(
+  track: Pick<QueuedTrack, 'source'> & { readonly playbackSource?: MusicSource },
+): MusicSource {
+  const recorded = track.playbackSource ?? track.source;
+  return recorded === 'spotify' || recorded === 'deezer' ? 'youtube' : recorded;
 }
 
 /** Lavalink `sourceName` → our source enum, defaulting unknowns to YouTube. */

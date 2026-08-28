@@ -1,8 +1,14 @@
 # Lavalink v4 configuration.
 #
-# Source support (docs/MUSIC_SYSTEM.md): YouTube, Spotify, SoundCloud, Deezer.
-# YouTube, Spotify and Deezer are served by plugins — Lavalink v4 removed
-# built-in YouTube support, and Spotify/Deezer always required LavaSrc.
+# Two layers, and this file only configures the second one (see
+# docs/MUSIC_SYSTEM.md). Spotify, Apple Music and Deezer identify what song was
+# asked for; SoundCloud, YouTube and HTTP supply the audio. SoundCloud is the
+# primary playback provider and YouTube the fallback — the bot enforces that
+# order itself, and the LavaSrc provider list below mirrors it so the rarely-used
+# plugin-side path does not disagree.
+#
+# YouTube is served by a plugin (Lavalink v4 removed built-in support);
+# Spotify and Apple Music by LavaSrc; SoundCloud and HTTP are built in.
 #
 # Plugins are downloaded on first start into the `lavalink-plugins` volume.
 
@@ -162,13 +168,25 @@ plugins:
       # refreshToken: '${YT_OAUTH_REFRESH_TOKEN:}'
 
   lavasrc:
+    # Only reached when LavaSrc itself resolves something — an Apple Music link,
+    # or the rarely-used Spotify fallback. The bot's own resolver (see
+    # docs/MUSIC_SYSTEM.md) does not come through here: it searches the playback
+    # providers directly so it can filter and score candidates, which LavaSrc
+    # cannot do. The order still mirrors the same policy so the two paths do not
+    # disagree about where audio should come from — ISRC first because it names
+    # the recording outright, then SoundCloud, then YouTube.
     providers:
+      - 'scsearch:%ISRC%'
       - 'ytsearch:"%ISRC%"'
-      - 'ytsearch:%QUERY%'
       - 'scsearch:%QUERY%'
+      - 'ytsearch:%QUERY%'
     sources:
-      # Spotify and Deezer resolve metadata, then stream via YouTube/SoundCloud.
-      # Spotify requires client credentials — see docs/MUSIC_SYSTEM.md (Phase 4).
+      # Metadata only: these resolve an identity and then stream through
+      # SoundCloud/YouTube per the provider list above. Deezer stays off here
+      # because streaming from it needs a master decryption key this deployment
+      # does not have — the bot reaches Deezer for *metadata* through its public
+      # HTTP API instead (music/metadata-providers.ts), which needs no key and
+      # is the only one of the three catalogues that exposes ISRCs.
       spotify: true
       applemusic: true
       deezer: false
