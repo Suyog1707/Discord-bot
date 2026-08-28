@@ -1246,13 +1246,19 @@ export class MusicManager {
       picks.push(track);
     };
 
-    // YouTube mixes are keyed by video id, so only sources whose identifier is
-    // one can seed them. Spotify qualifies: its queue entries carry the id of
-    // the YouTube match that actually played. User-originated plays seed the
-    // mix when any exist in the window — a mix spun off an autoplay pick is
-    // the same drift chain in fallback clothing.
+    // YouTube mixes are keyed by video id, so only plays whose identifier IS one
+    // can seed them. That is a question about the *playback* provider, not the
+    // catalogue: since SoundCloud became primary, a row displayed as Spotify
+    // usually carries a SoundCloud id, and seeding a radio URL with it produces
+    // a dead link. `playbackSource` answers it directly; rows predating that
+    // column fall back to `source`, which was correct while YouTube was the
+    // only provider — exactly the rows this is reading.
     const mixable = history.filter(
-      (entry) => entry.source === 'youtube' || entry.source === 'spotify',
+      (entry) =>
+        playbackSourceOf({
+          source: entry.source,
+          ...(entry.playbackSource === null ? {} : { playbackSource: entry.playbackSource }),
+        }) === 'youtube',
     );
     const userMixable = mixable.filter((entry) => entry.origin === 'user' && !entry.skipped);
     const mixSeeds = (userMixable.length > 0 ? userMixable : mixable).slice(0, 2);

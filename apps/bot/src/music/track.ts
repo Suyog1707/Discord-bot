@@ -34,11 +34,16 @@ export interface QueuedTrack {
   /**
    * Where the audio actually came from.
    *
-   * Distinct from {@link source} and load-bearing for recovery: when a stream
-   * dies mid-track, "try the other provider" needs to know which one just
-   * failed, and `source` cannot answer that for anything the metadata layer
-   * identified. Absent on tracks resolved before this existed (restored
-   * queues), where {@link playbackSourceOf} falls back to `source`.
+   * Distinct from {@link source} and load-bearing twice over. Stream recovery
+   * needs to know which provider just failed, and `source` cannot answer that
+   * for anything the metadata layer identified. Autoplay's mix fallback needs
+   * to know whether `identifier` is a YouTube video id before it builds a radio
+   * URL out of one.
+   *
+   * Persisted (`queue_tracks.playbackSource`, `song_history.playbackSource`),
+   * so it survives a restart. Absent only on rows written before that column
+   * existed, where {@link playbackSourceOf} falls back to `source` — which was
+   * correct then, since YouTube was the sole playback provider.
    */
   readonly playbackSource?: MusicSource;
   /** Discord user id of the requester. */
@@ -75,7 +80,10 @@ export function trackOrigin(
  *
  * Metadata sources cannot supply audio, so a track whose recorded playback
  * source is one of them predates the field and is read as YouTube — what the
- * old single-provider pipeline always used.
+ * old single-provider pipeline always used. That fallback is the reason the
+ * persisted column is nullable rather than backfilled: guessing YOUTUBE into
+ * every historical row would be almost always right and occasionally wrong, and
+ * a wrong recorded provider is worse than an absent one.
  */
 export function playbackSourceOf(
   track: Pick<QueuedTrack, 'source'> & { readonly playbackSource?: MusicSource },

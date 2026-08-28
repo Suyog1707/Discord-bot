@@ -60,11 +60,16 @@ export interface HistorySeed {
   readonly identifier: string;
   readonly author: string;
   readonly title: string;
-  /**
-   * Where the audio came from. Autoplay needs it to know whether `identifier`
-   * is a YouTube video id it can seed a mix with — SoundCloud ids are not.
-   */
+  /** The catalogue that named the track — what the listener saw it as. */
   readonly source: MusicSource;
+  /**
+   * Which provider actually supplied the audio. Autoplay needs it to know
+   * whether `identifier` is a YouTube video id it can seed a mix with —
+   * SoundCloud ids are not, and since SoundCloud became the primary provider
+   * `source` no longer answers that question. Null for rows written before the
+   * column existed.
+   */
+  readonly playbackSource: MusicSource | null;
   /** Who put it on: a person or the recommender. Anchors are 'user' only. */
   readonly origin: 'user' | 'autoplay';
   /** Whether the listener skipped it. Skips never become anchors. */
@@ -185,6 +190,10 @@ export class QueueStore {
                 artworkUrl: track.artworkUrl,
                 isStream: track.isStream,
                 source: TO_DB_SOURCE[track.source],
+                playbackSource:
+                  track.playbackSource === undefined
+                    ? null
+                    : TO_DB_SOURCE[track.playbackSource],
               })),
             }),
           ]
@@ -207,6 +216,7 @@ export class QueueStore {
           author: true,
           title: true,
           source: true,
+          playbackSource: true,
           origin: true,
           skipped: true,
         },
@@ -216,6 +226,7 @@ export class QueueStore {
         author: row.author,
         title: row.title,
         source: FROM_DB_SOURCE[row.source],
+        playbackSource: row.playbackSource === null ? null : FROM_DB_SOURCE[row.playbackSource],
         origin: row.origin === 'autoplay' ? ('autoplay' as const) : ('user' as const),
         skipped: row.skipped,
       }));
@@ -247,6 +258,9 @@ export class QueueStore {
         artworkUrl: track.artworkUrl,
         isStream: track.isStream,
         source: FROM_DB_SOURCE[track.source],
+        ...(track.playbackSource === null
+          ? {}
+          : { playbackSource: FROM_DB_SOURCE[track.playbackSource] }),
         requestedById: '0',
         requestedByName: 'Restored',
       })),
@@ -299,6 +313,8 @@ export class QueueStore {
           durationMs: track.durationMs,
           uri: track.uri,
           source: TO_DB_SOURCE[track.source],
+          playbackSource:
+            track.playbackSource === undefined ? null : TO_DB_SOURCE[track.playbackSource],
           playedMs: Math.max(0, Math.round(outcome.playedMs)),
           skipped: outcome.skipped,
           origin: trackOrigin(track),

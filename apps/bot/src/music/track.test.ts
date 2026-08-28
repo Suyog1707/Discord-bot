@@ -98,6 +98,18 @@ describe('playbackSourceOf', () => {
     expect(playbackSourceOf({ source: 'youtube' })).toBe('youtube');
   });
 
+  it('decides mix-seed eligibility for the rows autoplay actually reads', () => {
+    // YouTube mixes are keyed by video id. These are the three history-row
+    // shapes the mix fallback filters, and only the first two carry an
+    // identifier a radio URL can be built from.
+    const rows = [
+      { source: 'youtube' as const, playbackSource: 'youtube' as const },
+      { source: 'spotify' as const, playbackSource: 'youtube' as const },
+      { source: 'spotify' as const, playbackSource: 'soundcloud' as const },
+    ];
+    expect(rows.map((row) => playbackSourceOf(row) === 'youtube')).toEqual([true, true, false]);
+  });
+
   it('reads a metadata-only source as YouTube', () => {
     // Spotify and Deezer cannot stream anything, so a track recorded against
     // one of them came from the old single-provider pipeline.

@@ -250,23 +250,31 @@ model Queue {
 }
 
 model QueueTrack {
-  id            String      @id @default(cuid())
-  queueId       String
+  id             String       @id @default(cuid())
+  queueId        String
   /// Zero-based position. Unique per queue so reordering stays consistent.
-  position      Int
+  position       Int
   /// Opaque Lavalink encoded track, replayable without re-resolving the source.
-  encoded       String      @db.Text
-  identifier    String
-  title         String
-  author        String
+  encoded        String       @db.Text
+  identifier     String
+  title          String
+  author         String
   /// Track length in milliseconds.
-  durationMs    Int
-  uri           String?     @db.Text
-  artworkUrl    String?     @db.Text
-  isStream      Boolean     @default(false)
-  source        MusicSource
-  requestedById String?
-  createdAt     DateTime    @default(now()) @db.Timestamptz(3)
+  durationMs     Int
+  uri            String?      @db.Text
+  artworkUrl     String?      @db.Text
+  isStream       Boolean      @default(false)
+  /// The listener-facing identity: the catalogue that named the track. A
+  /// Spotify-identified song stays SPOTIFY however it was actually streamed.
+  source         MusicSource
+  /// Which provider actually supplied the audio, when it differs from `source`.
+  /// Null on rows written before the metadata/playback split, and on rows whose
+  /// two sources agree. Restoring a queue needs this: stream recovery switches
+  /// to "the other provider", and `source` cannot name one for a track the
+  /// metadata layer identified.
+  playbackSource MusicSource?
+  requestedById  String?
+  createdAt      DateTime     @default(now()) @db.Timestamptz(3)
 
   queue       Queue @relation(fields: [queueId], references: [id], onDelete: Cascade)
   requestedBy User? @relation(fields: [requestedById], references: [id], onDelete: SetNull)
@@ -380,24 +388,30 @@ model FavoriteTrack {
 
 /// Append-only playback log powering the Analytics feature.
 model SongHistory {
-  id         String      @id @default(cuid())
-  guildId    String
-  userId     String?
-  identifier String
-  title      String
-  author     String
-  durationMs Int
-  uri        String?     @db.Text
-  source     MusicSource
+  id             String       @id @default(cuid())
+  guildId        String
+  userId         String?
+  identifier     String
+  title          String
+  author         String
+  durationMs     Int
+  uri            String?      @db.Text
+  source         MusicSource
+  /// Which provider actually supplied the audio. Load-bearing for autoplay:
+  /// the mix fallback builds a YouTube radio URL out of `identifier`, which is
+  /// only valid when the audio genuinely came from YouTube. Reading `source`
+  /// for that was correct while YouTube was the sole playback provider and is
+  /// not any more — a SPOTIFY row now usually carries a SoundCloud id.
+  playbackSource MusicSource?
   /// How much of the track actually played before skip/stop.
-  playedMs   Int         @default(0)
-  skipped    Boolean     @default(false)
+  playedMs       Int          @default(0)
+  skipped        Boolean      @default(false)
   /// "user" for tracks a person chose; "autoplay" for recommendation-generated
   /// plays. The taste profile weights these differently — autoplay plays must
   /// never carry the same authority as explicit user selections, or the
   /// recommender's own output becomes its dominant input (taste drift).
-  origin     String      @default("user")
-  playedAt   DateTime    @default(now()) @db.Timestamptz(3)
+  origin         String       @default("user")
+  playedAt       DateTime     @default(now()) @db.Timestamptz(3)
 
   guild Guild @relation(fields: [guildId], references: [id], onDelete: Cascade)
   user  User? @relation(fields: [userId], references: [id], onDelete: SetNull)
