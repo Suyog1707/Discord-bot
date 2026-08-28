@@ -176,6 +176,7 @@ function toCandidate(track: LavalinkTrack): LavalinkCandidate {
     // Lavalink v4 surfaces the ISRC when the source manager knows one. It is
     // the strongest signal the matcher has and costs nothing to carry.
     isrc: track.info.isrc ?? null,
+    uri: track.info.uri ?? null,
     track,
   };
 }

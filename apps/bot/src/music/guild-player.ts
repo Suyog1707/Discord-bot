@@ -40,6 +40,51 @@ const CAUSE_LOG_LIMIT = 600;
  */
 const LINK_WAIT_MS = 2_500;
 
+/**
+ * How far short of its advertised runtime a "finished" track may fall before we
+ * stop believing it finished.
+ *
+ * Lavalink reports a stream that hit end-of-file as `finished`, and it cannot
+ * tell the difference between a song that ended and a source that stopped
+ * sending — from the decoder's side both are EOF. That is how a 30-second
+ * SoundCloud preview of a four-minute track, or a YouTube stream that dies
+ * after four seconds, arrived here as a natural completion and quietly advanced
+ * the queue. To the listener it looks exactly like an unexplained skip.
+ *
+ * Both bounds must be exceeded, so neither fires on its own: a track has to
+ * miss a real fraction of its length AND a meaningful number of seconds. That
+ * keeps ordinary end-of-file imprecision — a trailing silent frame, a container
+ * whose duration is rounded up — from being read as a failure.
+ */
+const TRUNCATION_RATIO = 0.9;
+const TRUNCATION_ABSOLUTE_MS = 15_000;
+
+/**
+ * Whether a track Lavalink called "finished" actually played through.
+ *
+ * Exported and pure because it is the load-bearing judgement in the whole
+ * failure path: get it wrong in one direction and broken streams keep being
+ * silently skipped past, get it wrong in the other and every normal song ending
+ * triggers a pointless re-source.
+ */
+export function isTruncatedPlayback(input: {
+  readonly reason: string;
+  readonly expectedMs: number;
+  readonly reachedMs: number;
+  readonly isStream?: boolean;
+}): boolean {
+  // Only a claimed completion can be a false completion. Every other reason
+  // already says what happened.
+  if (input.reason !== 'finished') return false;
+  // A livestream has no runtime to fall short of.
+  if (input.isStream === true) return false;
+  if (input.expectedMs <= 0) return false;
+  return (
+    input.reachedMs < input.expectedMs * TRUNCATION_RATIO &&
+    input.expectedMs - input.reachedMs > TRUNCATION_ABSOLUTE_MS
+  );
+}
+
 function truncate(value: string | undefined, limit: number): string | undefined {
   if (value === undefined || value.length <= limit) return value;
   return `${value.slice(0, limit)}… (truncated)`;
@@ -159,7 +204,12 @@ export class GuildPlayer {
    */
   readonly #reSourced = new Set<string>();
   /** Set by the exception handler so the following `end` can recover instead of skipping. */
-  #recoverCurrent = false;
+  /**
+   * A playback failure Lavalink reported *before* the 'end' event that follows
+   * it. Set by the exception and stuck handlers; read once by the end handler,
+   * which is the only place with the queue context to act on it.
+   */
+  #failureBeforeEnd: 'exception' | 'stuck' | null = null;
   /**
    * Set by `stop()` so the `end` it provokes does not start autoplay.
    *
@@ -458,6 +508,24 @@ export class GuildPlayer {
       const track = this.queue.current;
       if (track === null) return;
 
+      // The other half of the pair the TRACK_END line completes. Together they
+      // answer "what was playing, where did its audio come from, and how much
+      // of it actually arrived" without needing to correlate across services.
+      this.#logger.debug(
+        {
+          event: 'TRACK_START',
+          title: track.title,
+          author: track.author,
+          identifier: track.identifier,
+          source: track.source,
+          playbackSource: track.playbackSource ?? track.source,
+          uri: track.uri,
+          expectedMs: track.durationMs,
+          startedAt: new Date(this.#trackStartedAt).toISOString(),
+        },
+        'Track started',
+      );
+
       // Links are decoration: resolve them alongside the announcement rather
       // than in front of it, so a slow third party never delays the embed.
       this.#currentLinks = NO_PLATFORM_LINKS;
@@ -501,11 +569,26 @@ export class GuildPlayer {
       // and that is where we try another source — telling the channel the track
       // was skipped before we have tried to rescue it would be a lie half the
       // time.
-      this.#recoverCurrent = true;
+      this.#failureBeforeEnd = 'exception';
     });
 
     this.#player.on('stuck', (event) => {
-      this.#logger.warn({ thresholdMs: event.thresholdMs }, 'Track stuck; skipping');
+      const track = this.queue.current;
+      this.#logger.warn(
+        {
+          thresholdMs: event.thresholdMs,
+          title: track?.title,
+          identifier: track?.identifier,
+          playbackSource: track?.playbackSource ?? track?.source,
+          uri: track?.uri,
+        },
+        'Track stuck: the source stopped delivering audio',
+      );
+      // Stopping produces an 'end' with reason 'stopped', which is otherwise
+      // indistinguishable from a user pressing skip. Flagging it here is what
+      // lets the end handler treat it as the source failure it is and try
+      // another provider, rather than silently moving to the next song.
+      this.#failureBeforeEnd = 'stuck';
       void this.#player.stopTrack();
     });
 
@@ -530,13 +613,77 @@ export class GuildPlayer {
     this.#playing = false;
     const finished = this.queue.current;
 
-    // A source that refused to stream gets one chance to be replaced by another
+    const failureBefore = this.#failureBeforeEnd;
+    this.#failureBeforeEnd = null;
+
+    // How much audio actually reached the listener.
+    //
+    // Two clocks, and the larger wins, because each is wrong in a different
+    // direction and never both at once. Lavalink's `position` is authoritative
+    // after a seek but only refreshes on the player-update interval, so it
+    // still reads zero for a track that died in its first seconds. Wall-clock
+    // covers exactly that gap, but overstates playback across a pause. Taking
+    // the maximum means a pause or a seek can only ever make a track look MORE
+    // complete — the safe direction, since the consequence of being wrong here
+    // is calling a real completion a failure.
+    const elapsedMs = this.#trackStartedAt > 0 ? Date.now() - this.#trackStartedAt : 0;
+    const reachedMs = Math.max(elapsedMs, this.#player.position);
+    const expectedMs = finished?.durationMs ?? 0;
+    const shortfallMs = expectedMs - reachedMs;
+    const truncated = isTruncatedPlayback({
+      reason,
+      expectedMs,
+      reachedMs,
+      ...(finished === null ? {} : { isStream: finished.isStream }),
+    });
+
+    // Everything the next person debugging a bad playback needs, on one line,
+    // for every end — not only the failures, because "it ended normally" is
+    // itself the claim that has to be checkable.
+    const failureKind = failureBefore ?? (truncated ? 'truncated' : null);
+    this.#logger[failureKind === null ? 'debug' : 'warn'](
+      {
+        event: 'TRACK_END',
+        reason,
+        failure: failureKind,
+        title: finished?.title,
+        author: finished?.author,
+        identifier: finished?.identifier,
+        source: finished?.source,
+        playbackSource: finished?.playbackSource ?? finished?.source,
+        uri: finished?.uri,
+        expectedMs,
+        reachedMs,
+        shortfallMs: expectedMs > 0 ? shortfallMs : undefined,
+        startedAt: this.#trackStartedAt > 0 ? new Date(this.#trackStartedAt).toISOString() : undefined,
+        endedAt: new Date().toISOString(),
+        intent: this.#advanceIntent,
+      },
+      failureKind === null ? 'Track ended' : 'Track ended early: the source stopped delivering',
+    );
+
+    // A source that failed gets one chance to be replaced from another provider
     // before the track is written off. This runs here rather than in the
     // exception handler because 'end' arrives right behind the exception and
     // would otherwise advance the queue past the track we just rescued.
-    const recover = this.#recoverCurrent;
-    this.#recoverCurrent = false;
-    if (recover && reason === 'loadFailed' && finished !== null && !this.#destroyed) {
+    //
+    // Three shapes of failure land here, and none of them is a finished song:
+    //
+    //   - `loadFailed` after an exception — the source refused outright;
+    //   - `stopped` after a stuck event — the source went silent mid-stream;
+    //   - `finished` far short of the runtime — the source hit end-of-file
+    //     early, which Lavalink cannot distinguish from a song ending because
+    //     to the decoder the two are the same thing.
+    //
+    // The last one is why this check exists at all. Without it a 30-second
+    // preview stream, or a stream that dies after four seconds, advances the
+    // queue as though the track had played through.
+    const sourceFailed =
+      (failureBefore === 'exception' && reason === 'loadFailed') ||
+      (failureBefore === 'stuck' && reason !== 'replaced') ||
+      truncated;
+
+    if (sourceFailed && finished !== null && !this.#destroyed) {
       if (await this.#playFromAnotherSource(finished)) return;
       // Nothing playable anywhere — now the skip is real, so say so. Deferring
       // the message to here is what keeps a rescued track from being announced
@@ -557,7 +704,10 @@ export class GuildPlayer {
       finished !== null &&
       (reason === 'finished' || reason === 'stopped' || reason === 'loadFailed')
     ) {
-      const playedMs = this.#trackStartedAt > 0 ? Date.now() - this.#trackStartedAt : 0;
+      // The measured figure, not the wall clock: a track the source cut short
+      // must not be recorded as a full play, or the taste model reads a failed
+      // stream as an endorsement.
+      const playedMs = reachedMs;
       // Only an actual /skip is a rejection; /jump and /previous also stop the
       // track but are navigation, and labelling them skips taught the taste
       // model to avoid whatever song the listener happened to jump away from.

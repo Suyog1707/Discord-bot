@@ -61,7 +61,14 @@ export interface MatchCandidate {
   readonly author: string;
   readonly durationMs: number;
   readonly isStream: boolean;
+  /**
+   * Provider-scoped id. For SoundCloud this is the media URL itself, which is
+   * what makes {@link SNIPPET_STREAM} detectable before playback rather than
+   * four seconds into it.
+   */
   readonly identifier: string;
+  /** The upload's public page, when the provider gives one. */
+  readonly uri?: string | null;
   readonly isrc?: string | null;
   readonly album?: string | null;
   readonly description?: string | null;
@@ -69,7 +76,7 @@ export interface MatchCandidate {
 
 /** Why a candidate was removed from consideration entirely. */
 export interface Rejection {
-  readonly kind: 'stream' | 'non-music' | 'duration' | 'unrelated' | 'isrc-conflict';
+  readonly kind: 'stream' | 'snippet' | 'non-music' | 'duration' | 'unrelated' | 'isrc-conflict';
   /** Human-readable specifics, for the resolution log. */
   readonly detail: string;
 }
@@ -108,6 +115,28 @@ export interface MatchOptions {
 
 /** Score assigned to a vetoed candidate. Far below any real threshold. */
 export const REJECTED_SCORE = -1_000;
+
+/**
+ * A media URL that serves a snippet rather than the recording.
+ *
+ * SoundCloud publishes a 30-second `/preview/` stream instead of `/stream` for
+ * tracks it will not hand to an unauthenticated client — Go+ titles and
+ * some rights-restricted uploads. The track metadata is unaffected: it still
+ * advertises the full 258-second runtime, so every duration check passes and
+ * nothing looks wrong until the audio stops half a minute in.
+ *
+ * This is not a rare edge. It is specifically the ARTIST'S OWN uploads that are
+ * served as previews, while a stranger's reupload of the same song gets the
+ * full stream — so the matcher's own preference for attributed uploads walked
+ * straight into it, and the better the match looked, the more likely it was a
+ * snippet. Three or four of every ten SoundCloud results for a mainstream
+ * Western track are previews.
+ *
+ * Detected before playback because it is visible in the identifier, and vetoed
+ * rather than penalised: a snippet cannot become the song no matter how well
+ * everything else about it matches.
+ */
+const SNIPPET_STREAM = /\/preview\//iu;
 
 /* --------------------------------------------------------------- normalising */
 
@@ -457,6 +486,13 @@ export function scoreCandidate<T extends MatchCandidate>(
 
   // A livestream is never a track release, and it has no runtime to compare.
   if (candidate.isStream) return reject('stream', 'livestream');
+
+  // A snippet stream advertises the full runtime and delivers thirty seconds.
+  // Nothing later in this function can detect that, because every field it
+  // would inspect describes the complete recording.
+  if (SNIPPET_STREAM.test(candidate.identifier) || SNIPPET_STREAM.test(candidate.uri ?? '')) {
+    return reject('snippet', 'preview stream (not the full recording)');
+  }
 
   // Text a catalogue itself uses is not evidence of anything: songs are called
   // "Love Scene", albums are called "Part 2", and a soundtrack album is named

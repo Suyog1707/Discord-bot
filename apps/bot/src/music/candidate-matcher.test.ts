@@ -421,3 +421,62 @@ describe('requestedVariantsOf', () => {
     expect(requestedVariantsOf('blinding lights the weeknd').size).toBe(0);
   });
 });
+
+describe('snippet streams', () => {
+  const previewId =
+    'U:https://api-v2.soundcloud.com/media/soundcloud:tracks:1082222008/8608e303/preview/hls';
+  const fullId =
+    'U:https://api-v2.soundcloud.com/media/soundcloud:tracks:1258066084/8cfb9538/stream/hls';
+
+  it('vetoes a preview stream however well everything else matches', () => {
+    // The artist's own upload, exact title, exact runtime, full attribution —
+    // and thirty seconds of audio. Every other signal says play it.
+    const entry = scoreCandidate(
+      wanted,
+      candidate('Blinding Lights', 'The Weeknd', 200_000, { identifier: previewId }),
+      soundcloud,
+    );
+    expect(entry.rejected?.kind).toBe('snippet');
+    expect(isAcceptable(entry, SOUNDCLOUD_WEIGHTS)).toBe(false);
+  });
+
+  it('detects the snippet from the public uri too', () => {
+    const entry = scoreCandidate(
+      wanted,
+      candidate('Blinding Lights', 'The Weeknd', 200_000, { uri: previewId }),
+      soundcloud,
+    );
+    expect(entry.rejected?.kind).toBe('snippet');
+  });
+
+  it('leaves a full stream alone', () => {
+    const entry = scoreCandidate(
+      wanted,
+      candidate('Blinding Lights', 'The Weeknd', 200_000, { identifier: fullId }),
+      soundcloud,
+    );
+    expect(entry.rejected).toBeNull();
+    expect(isAcceptable(entry, SOUNDCLOUD_WEIGHTS)).toBe(true);
+  });
+
+  it('falls to the next candidate rather than playing the snippet', () => {
+    const winner = winnerOf(
+      wanted,
+      [
+        candidate('Blinding Lights', 'The Weeknd', 200_000, { identifier: previewId }),
+        candidate('Blinding Lights', 'Minh Prime', 200_000, { identifier: fullId }),
+      ],
+      soundcloud,
+    );
+    expect(winner).toBe('Blinding Lights');
+    const [best] = rankCandidates(
+      wanted,
+      [
+        candidate('Blinding Lights', 'The Weeknd', 200_000, { identifier: previewId }),
+        candidate('Blinding Lights', 'Minh Prime', 200_000, { identifier: fullId }),
+      ],
+      soundcloud,
+    );
+    expect(best?.candidate.author).toBe('Minh Prime');
+  });
+});
