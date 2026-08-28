@@ -215,9 +215,18 @@ export const botEnvSchema = requireInProduction(
        * picturised cut passes for a 3:48 song.
        */
       MATCH_DURATION_TOLERANCE_MS: z.coerce.number().int().min(1_000).max(120_000).default(12_000),
-      /** Minimum score a SoundCloud candidate must reach before it is played. */
-      MATCH_SOUNDCLOUD_MIN_SCORE: z.coerce.number().int().min(0).max(200).default(55),
-      /** Minimum score a YouTube candidate must reach. Deliberately no lower than SoundCloud's. */
+      /**
+       * Minimum score a SoundCloud candidate must reach before it is played.
+       *
+       * Higher than YouTube's on purpose: whatever SoundCloud refuses is asked
+       * of YouTube, where the official Topic and VEVO uploads are, so a
+       * demanding primary costs latency rather than coverage.
+       */
+      MATCH_SOUNDCLOUD_MIN_SCORE: z.coerce.number().int().min(0).max(200).default(70),
+      /**
+       * Minimum score a YouTube candidate must reach. Lower than SoundCloud's
+       * because there is nothing after it — below this, nothing plays at all.
+       */
       MATCH_YOUTUBE_MIN_SCORE: z.coerce.number().int().min(0).max(200).default(55),
       /**
        * Extra uploader-name tokens that mark a rights-holder, comma-separated.

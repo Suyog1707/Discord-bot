@@ -226,12 +226,24 @@ export const SOUNDCLOUD_WEIGHTS: MatchWeights = {
   variantMissing: -32,
   variantRequestedMissing: -65,
 
-  acceptScore: 55,
-  confidentScore: 78,
-  // SoundCloud has no platform-level attribution marker, so demanding one in a
-  // wide band would reject most of the catalogue. The uploader-name signals
-  // above already carry that weight.
-  attributionRequiredBelow: 62,
+  // Higher than YouTube's, which looks backwards until you notice what the
+  // fallback is. Anything SoundCloud refuses gets asked of YouTube, where the
+  // Topic and VEVO channels live — so a *demanding* primary does not cost
+  // coverage, it just routes the doubtful cases to the catalogue that has the
+  // official upload.
+  //
+  // Measured, not guessed. At 55, "Tum Hi Ho" resolved to a random SoundCloud
+  // account's rip (68, unattributed) and stopped there; at 70 it falls through
+  // and lands on the "Mithoon - Topic" upload (131). Meanwhile the artist's own
+  // SoundCloud uploads — the case this provider ordering exists for — score
+  // 96-126 and are untouched by the change.
+  acceptScore: 70,
+  confidentScore: 85,
+  // Between `acceptScore` and this, an upload must be attributable to the
+  // artist. SoundCloud has no platform-level marker like Topic, so this leans
+  // on the uploader-name signals above; anything that clears neither is better
+  // served by YouTube's official channels than by a stranger's reupload.
+  attributionRequiredBelow: 85,
 };
 
 /**

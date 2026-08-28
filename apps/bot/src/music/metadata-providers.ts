@@ -23,6 +23,7 @@
  * means the next one is asked; it never means a failed command.
  */
 import { canonicalTrack, normaliseIsrc, type CanonicalTrack } from './canonical-track.js';
+import { requestedVariantsOf } from './candidate-matcher.js';
 import { getLogger } from '../lib/logger.js';
 
 const logger = getLogger('metadata');
@@ -91,6 +92,13 @@ function normalise(value: string): string {
 }
 
 /**
+ * Penalty for a catalogue result that is a version of the song nobody asked
+ * for. Large enough to demote it beneath any plain match, small enough that it
+ * still wins when it is the only credible answer.
+ */
+const UNREQUESTED_VARIANT_PENALTY = 1;
+
+/**
  * How well a catalogue result answers the typed query.
  *
  * Deliberately simple, and deliberately not "the first result". These endpoints
@@ -99,9 +107,21 @@ function normalise(value: string): string {
  * actually appear in the title-plus-artist text is a low bar that the first
  * result nonetheless fails often enough to matter.
  *
+ * The variant check is the expensive lesson. Searching Apple Music for
+ * "Kesariya Arijit Singh" returns the Lost Frequencies remix above the original,
+ * and identifying THAT as the canonical track poisons everything downstream:
+ * the playback layer then does its job perfectly and finds an excellent match
+ * for the wrong recording. Identity has to be right first — a wrong canonical
+ * track is not something better matching can recover from.
+ *
  * @returns 0 when the result is not a credible answer to the query.
  */
-function relevance(query: string, title: string, artist: string): number {
+function relevance(
+  query: string,
+  title: string,
+  artist: string,
+  requested: ReadonlySet<string>,
+): number {
   const wanted = normalise(query).split(' ').filter(Boolean);
   if (wanted.length === 0) return 0;
 
@@ -113,7 +133,11 @@ function relevance(query: string, title: string, artist: string): number {
   // An exact title match outranks a merely complete word overlap: "Lights" as
   // the whole title beats "Blinding Lights" when "lights" is what was typed.
   const exact = normalise(title) === normalise(query) ? 1 : 0;
-  return overlap + exact;
+
+  const introduced = [...requestedVariantsOf(title)].filter((mark) => !requested.has(mark));
+  const penalty = introduced.length > 0 ? UNREQUESTED_VARIANT_PENALTY : 0;
+
+  return overlap + exact - penalty;
 }
 
 function bestOf<T>(
@@ -121,11 +145,15 @@ function bestOf<T>(
   items: readonly T[],
   describe: (item: T) => { readonly title: string; readonly artist: string },
 ): T | null {
+  // Read once: the query does not change across candidates, and this runs per
+  // result on every lookup.
+  const requested = requestedVariantsOf(query);
+
   let best: { item: T; score: number } | null = null;
   for (const item of items) {
     const { title, artist } = describe(item);
-    const score = relevance(query, title, artist);
-    if (score === 0) continue;
+    const score = relevance(query, title, artist, requested);
+    if (score <= 0) continue;
     if (best === null || score > best.score) best = { item, score };
   }
   return best?.item ?? null;
