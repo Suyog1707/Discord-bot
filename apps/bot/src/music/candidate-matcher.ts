@@ -167,6 +167,18 @@ const JUNK_PATTERNS: readonly (readonly [string, number])[] = [
   ['dialogue', -45],
   ['scene', -45],
   ['clip', -40],
+  // Bare "movie" and "film", handled as weights rather than vetoes precisely
+  // because they are generic. A soundtrack upload legitimately names its film,
+  // and the exemption below spares any candidate whose word the catalogue's own
+  // title, artist or album already contains — so "Kesariya | Brahmastra" is
+  // untouched while "Kesariya | Brahmastra Movie" pays. They also each add a
+  // point of suspicion, which is what actually removes the cinematic uploads
+  // that pair them with a wrong runtime and no attribution.
+  ['movie', -30],
+  ['film', -25],
+  ['cinematic', -30],
+  ['picturised', -30],
+  ['picturized', -30],
   // Serialised uploads: a song is not published in parts.
   ['part 1', -35],
   ['part 2', -35],
@@ -175,8 +187,8 @@ const JUNK_PATTERNS: readonly (readonly [string, number])[] = [
   // opens on dialogue and reaches the song half a minute in — exactly the
   // "scene first, song later" complaint — while the standalone audio or music
   // video of the same track sits alongside it.
-  ['full video', -22],
-  ['video song', -22],
+  ['full video', -35],
+  ['video song', -30],
   // Compilations and mixes: real audio, wrong object.
   ['compilation', -40],
   ['jukebox', -40],
@@ -768,6 +780,21 @@ export function isConfident(entry: ScoredCandidate | undefined, weights: MatchWe
  * track this costs exactly one search. The rest exist for the tracks that first
  * query gets wrong — the soundtracks, the collaborations, the songs whose name
  * is also a film — and are only paid for there.
+ *
+ * **YouTube asks for lyrics, not for "official".** This is the difference
+ * between the two providers' plans and it is the whole point of the fallback.
+ * Searching "<song> official" returns official music videos, official *movie*
+ * videos, picturised "full video" cuts and scene uploads — the entire class of
+ * cinematic content that must not reach a voice channel — because that is what
+ * all of them call themselves. A lyrics upload cannot be any of those: it is
+ * the recording with text over it. Asking for lyrics first means the cheapest,
+ * earliest queries return the cleanest candidates, and the broadening queries
+ * below only run when they do not.
+ *
+ * Queries are unquoted. YouTube honours phrase quotes, and quoting a title the
+ * uploader spelled slightly differently returns nothing at all — which on the
+ * first query would push every track down the plan for no gain. Precision here
+ * comes from scoring many candidates, not from constraining the search.
  */
 export function queryPlan(wanted: CanonicalTrack, provider: PlaybackProvider): readonly string[] {
   const lead = wanted.primaryArtist;
@@ -775,38 +802,44 @@ export function queryPlan(wanted: CanonicalTrack, provider: PlaybackProvider): r
   const plain = `${wanted.title} ${joined}`.trim();
   const plans: string[] = [];
 
-  // The ISRC names the recording outright. YouTube indexes it on auto-generated
-  // art tracks, so when a catalogue supplied one this is the query most likely
-  // to land on the Topic upload rather than on anything about the song.
-  if (provider === 'youtube' && wanted.isrc !== null) plans.push(wanted.isrc);
-
-  plans.push(plain);
-
-  if (provider === 'youtube') {
-    plans.push(
-      `${wanted.title} ${lead} official audio`,
-      `${wanted.title} ${lead} official music video`,
-      `${wanted.title} ${lead} topic`,
-      `${wanted.title} ${lead} official song`,
-    );
-  } else {
+  if (provider === 'soundcloud') {
     // SoundCloud's index is thinner and its titles are plainer, so decorating
     // the query mostly returns nothing. Widening — dropping to the lead artist,
-    // then to the bare title — is what finds the track there.
-    plans.push(`${wanted.title} ${lead} official`, wanted.title);
+    // then to the bare title — is what finds the track there. No lyrics tier:
+    // SoundCloud hosts audio, so every result is already "clean audio".
+    plans.push(plain, `${wanted.title} ${lead}`, wanted.title);
+    return dedupe(plans);
   }
 
-  // A distinct lead artist is worth one more attempt: collaborations are often
-  // uploaded under the lead alone, and the joined credit matches nothing.
-  if (flat(lead) !== flat(joined)) plans.push(`${wanted.title} ${lead}`);
+  // The ISRC names the recording outright, and an ISRC is only ever attached to
+  // an audio release — a scene upload cannot carry one. So this is both the
+  // most precise query available and, like the lyrics queries, one that cannot
+  // return cinematic content. It is not a keyword strategy and specifically not
+  // the word "official"; it is exact identification, and it is free when a
+  // catalogue supplied one.
+  if (wanted.isrc !== null) plans.push(wanted.isrc);
 
-  if (provider === 'youtube') {
-    // Last resort before failing, and it has to be last. A search that returns
-    // nothing but scenes leaves every candidate vetoed and the track
-    // unplayable; a lyrics video is the reliable standalone alternative — it
-    // carries the actual recording — so playing one beats skipping the song.
-    plans.push(`${wanted.title} ${lead} lyrics`);
-  }
+  // Lyrics-focused, in order of how specifically each phrasing names a lyrics
+  // upload.
+  plans.push(
+    `${wanted.title} ${lead} lyrics`,
+    `${wanted.title} ${lead} lyric video`,
+    `${wanted.title} ${lead} lyrics song`,
+  );
 
+  // Broadening, once the lyrics queries have not produced a confident match.
+  // The plain query is first because it is the most faithful to what was asked;
+  // "topic" targets YouTube's auto-generated art tracks, which are pure audio
+  // and the next cleanest thing after a lyrics cut.
+  plans.push(plain, `${wanted.title} ${lead} topic`);
+
+  // Widest: title alone. Runs only when artist-qualified searching has failed
+  // entirely, which usually means the upload credits somebody else.
+  plans.push(`${wanted.title} lyrics`, wanted.title);
+
+  return dedupe(plans);
+}
+
+function dedupe(plans: readonly string[]): readonly string[] {
   return [...new Set(plans.map((plan) => plan.trim()).filter((plan) => plan.length > 0))];
 }

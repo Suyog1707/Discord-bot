@@ -253,16 +253,96 @@ describe('rankCandidates — choosing between plausible uploads', () => {
     expect(best?.candidate.durationMs).toBe(200_500);
   });
 
-  it('prefers the attributed upload over a lyrics reupload cut to the exact runtime', () => {
+  it('prefers a lyrics upload over the official music video', () => {
+    // The inversion this policy is built on. "Official Video" is what a
+    // picturised cut, a movie video and a scene upload all call themselves; a
+    // lyrics video is the recording with text over it and cannot be any of
+    // them. So the lyrics cut wins even against a VEVO channel.
     const [best] = rankCandidates(
       wanted,
       [
-        candidate('Blinding Lights [Lyrics]', 'LyricVault', 200_000),
         candidate('Blinding Lights (Official Video)', 'TheWeekndVEVO', 240_000),
+        candidate('Blinding Lights [Lyrics]', 'LyricVault', 200_000),
       ],
       youtube,
     );
-    expect(best?.candidate.author).toBe('TheWeekndVEVO');
+    expect(best?.candidate.author).toBe('LyricVault');
+  });
+
+  it('still plays the music video when it is the only thing that exists', () => {
+    // A preference, not a prohibition: with no lyrics cut available, an
+    // attributed music video is a perfectly good answer.
+    const only = candidate('Blinding Lights (Official Video)', 'TheWeekndVEVO', 240_000);
+    const entry = scoreCandidate(wanted, only, youtube);
+    expect(entry.rejected).toBeNull();
+    expect(isAcceptable(entry, YOUTUBE_WEIGHTS)).toBe(true);
+  });
+
+  it('prefers a lyrics upload over a picturised "full video" cut', () => {
+    const winner = winnerOf(wanted, [
+      candidate('Blinding Lights Full Video Song', 'BigLabel', 205_000),
+      candidate('Blinding Lights (Lyrics)', 'LyricVault', 200_000),
+    ]);
+    expect(winner).toBe('Blinding Lights (Lyrics)');
+  });
+
+  it('does not let "lyrics" rescue a candidate that does not match', () => {
+    // The explicit guard: lyrics is a preference, never a bypass. Every one of
+    // these carries the word and none of them is the song.
+    const [wrongDuration, wrongSong, scene] = [
+      candidate('Blinding Lights (Lyrics)', 'LyricVault', 420_000),
+      candidate('Save Your Tears (Lyrics)', 'LyricVault', 200_000),
+      candidate('Blinding Lights Lyrics | Movie Scene', 'Film Clips HD', 200_000),
+    ];
+    expect(isAcceptable(scoreCandidate(wanted, wrongDuration, youtube), YOUTUBE_WEIGHTS)).toBe(false);
+    expect(isAcceptable(scoreCandidate(wanted, wrongSong, youtube), YOUTUBE_WEIGHTS)).toBe(false);
+    expect(scoreCandidate(wanted, scene, youtube).rejected?.kind).toBe('non-music');
+  });
+
+  it('ranks a clean audio cut above "official audio"', () => {
+    const [best] = rankCandidates(
+      wanted,
+      [
+        candidate('Blinding Lights (Official Audio)', 'SomeLabel Records', 200_000),
+        candidate('Blinding Lights (Audio)', 'SomeLabel Records', 200_000),
+      ],
+      youtube,
+    );
+    expect(best?.candidate.title).toBe('Blinding Lights (Audio)');
+  });
+});
+
+describe('contextual cinematic penalties', () => {
+  const kesariya = canonicalTrack({
+    title: 'Kesariya',
+    artist: 'Arijit Singh',
+    album: 'Brahmastra (Original Motion Picture Soundtrack)',
+    durationMs: 268_000,
+    provider: 'spotify',
+  });
+
+  it('leaves a soundtrack upload that merely names its film alone', () => {
+    const entry = scoreCandidate(
+      kesariya,
+      candidate('Kesariya | Brahmastra | Arijit Singh', 'Arijit Singh', 268_000),
+      youtube,
+    );
+    expect(entry.rejected).toBeNull();
+    expect(entry.reasons.join(' ')).not.toContain('junk:movie');
+  });
+
+  it('penalises the same upload once it calls itself a movie video', () => {
+    const plain = scoreCandidate(
+      kesariya,
+      candidate('Kesariya | Brahmastra | Arijit Singh', 'Arijit Singh', 268_000),
+      youtube,
+    );
+    const cinematic = scoreCandidate(
+      kesariya,
+      candidate('Kesariya Full Movie Video | Brahmastra', 'Arijit Singh', 268_000),
+      youtube,
+    );
+    expect(cinematic.score).toBeLessThan(plain.score);
   });
 });
 
@@ -299,9 +379,29 @@ describe('queryPlan', () => {
     expect(plan.some((query) => query.includes('topic'))).toBe(false);
   });
 
-  it('ends with a lyrics query on YouTube, never earlier', () => {
+  it('leads with lyrics queries on YouTube, before any broadening', () => {
+    // ISRC first (it names the recording and cannot return a scene), then the
+    // lyrics tier, and only then the plain query.
     const plan = queryPlan(wanted, 'youtube');
-    expect(plan[plan.length - 1]).toContain('lyrics');
+    expect(plan[0]).toBe('USUM71900028');
+    expect(plan[1]).toBe('Blinding Lights The Weeknd lyrics');
+    expect(plan[2]).toBe('Blinding Lights The Weeknd lyric video');
+    expect(plan[3]).toBe('Blinding Lights The Weeknd lyrics song');
+    // The unqualified query broadens only after the lyrics tier is exhausted.
+    expect(plan.indexOf('Blinding Lights The Weeknd')).toBeGreaterThan(3);
+  });
+
+  it('never asks YouTube for "official"', () => {
+    // Searching for "official" is what returns official music videos, official
+    // *movie* videos and scene uploads — the exact class being avoided.
+    const plan = queryPlan(wanted, 'youtube');
+    expect(plan.some((query) => /official/iu.test(query))).toBe(false);
+  });
+
+  it('still broadens to a bare title when artist-qualified searching fails', () => {
+    const plan = queryPlan(wanted, 'youtube');
+    expect(plan).toContain('Blinding Lights lyrics');
+    expect(plan[plan.length - 1]).toBe('Blinding Lights');
   });
 });
 

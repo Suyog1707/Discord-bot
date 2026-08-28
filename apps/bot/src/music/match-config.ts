@@ -260,30 +260,71 @@ export const AUTOPLAY_WEIGHTS: MatchWeights = {
 };
 
 /**
- * Title phrases that argue this IS the release. Only the highest matching tier
- * is applied — "Official Music Video (Official Audio)" is one signal, not two,
- * and a title stuffed with the word must not outrank a Topic upload that says
- * nothing at all.
+ * Title phrases that say what KIND of upload this is, best kind first.
+ *
+ * Only the highest matching tier is applied — "Official Music Video (Official
+ * Audio)" is one signal, not two — and `.find()` returns the first match, so
+ * array order decides which phrase is recognised as well as what it is worth.
+ * More specific phrases must therefore precede the general ones they contain.
+ *
+ * The ordering is the content-type preference, and it deliberately does NOT
+ * reward the word "official". "Official" is what a music video, a picturised
+ * "full video", a movie clip and a scene compilation all call themselves, so
+ * ranking on it steers straight into the cinematic content this whole system
+ * exists to avoid. A lyrics upload is the opposite: it is the recording with
+ * text over it, structurally incapable of being a scene.
+ *
+ * Preference, high to low:
+ *
+ *   1. Lyrics / lyric video — the recording, nothing else.
+ *   2. Clean audio ("(Audio)", visualiser) — also just the recording.
+ *   3. "Official audio" — audio-only, but scored under bare `audio` because
+ *      the "official" half is the part that correlates with cinematic uploads.
+ *   4. Music video — legitimate, least preferred; earns a token bonus so it
+ *      still edges out an undescribed upload, never a decisive one.
+ *   5. Anything else — no keyword bonus at all.
+ *
+ * This is a *content-type* axis only. Trust is scored separately as
+ * attribution, so an artist's Topic upload can still outrank a stranger's
+ * lyrics video — both are clean audio, and one of them is vouched for.
  */
 export const RELEASE_TIERS: readonly (readonly [phrase: string, points: number, label: string])[] =
   [
-    ['official audio', 22, 'official-audio'],
-    ['official visualizer', 20, 'official-visualiser'],
-    ['official music video', 20, 'official-music-video'],
-    ['official video song', 18, 'official-video-song'],
-    ['official video', 16, 'official-video'],
-    ['official song', 16, 'official-song'],
-    ['full song', 12, 'full-song'],
-    // Above the lyric tiers and matched before them: a bare "(Audio)" upload is
-    // the standalone recording by definition, while a lyrics channel tying with
-    // the label's audio cut let the reupload win a coin toss.
-    ['audio', 10, 'audio'],
-    ['official', 9, 'official'],
-    // A lyrics video is the recording with text over it: standalone song
-    // content, never a scene, and the right answer when no official upload
-    // surfaces. Kept just under `audio` so a label's cut wins the head-to-head.
-    ['lyric video', 9, 'lyric-video'],
-    ['lyrics', 8, 'lyrics'],
+    // Tier 1. Ordered longest-first so the specific phrasing is what gets named
+    // in the log, though they are worth nearly the same.
+    ['lyric video', 32, 'lyric-video'],
+    ['lyrics video', 32, 'lyrics-video'],
+    ['lyrics', 30, 'lyrics'],
+    // Matches "lyrical" too, which is how half of South Asian music is titled.
+    ['lyric', 28, 'lyric'],
+
+    // Tier 3, before tier 2 in the array only because `audio` is a substring of
+    // it: checked first so "Official Audio" is recognised as itself and scores
+    // BELOW a bare "(Audio)" upload rather than inheriting its bonus.
+    ['official audio', 16, 'official-audio'],
+
+    // Tier 2. Clean audio with no cinematic surface.
+    ['audio', 20, 'audio'],
+    ['visualizer', 18, 'visualiser'],
+    ['visualiser', 18, 'visualiser'],
+    ['full song', 14, 'full-song'],
+
+    // Tier 4. A real music video is a legitimate answer and the least preferred
+    // one, so it is scored *negative* rather than merely small.
+    //
+    // Not a judgement about music videos as such — it is what "Official Video"
+    // labels in practice. In Indian releases especially it is the picturised
+    // cut: the one that opens on thirty seconds of dialogue before the song
+    // starts, sits beside a "Full Video" of the same scene, and is a film
+    // excerpt in everything but name. The penalty is sized to lose to a lyrics
+    // or audio cut of the same song while still leaving an attributed music
+    // video comfortably playable when it is the only thing that exists.
+    ['official music video', -12, 'music-video'],
+    ['music video', -12, 'music-video'],
+    ['official video', -12, 'official-video'],
+    // Ambiguous in the wild — sometimes audio, sometimes the video cut — so it
+    // earns nothing either way and lets the other signals decide.
+    ['official song', 0, 'official-song'],
   ];
 
 /**

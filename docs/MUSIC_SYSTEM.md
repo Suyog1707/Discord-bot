@@ -98,6 +98,77 @@ Three mechanisms, in increasing order of how much they know:
    outside tolerance, no attribution to the artist, a soft junk phrase. Any one
    is noise; three at once is not a song.
 
+### YouTube asks for lyrics, never for "official"
+
+The two providers' query plans differ, and YouTube's is the point of the
+fallback.
+
+```
+1. <ISRC>                          — when a catalogue supplied one
+2. <title> <artist> lyrics
+3. <title> <artist> lyric video
+4. <title> <artist> lyrics song
+5. <title> <artist>                — broadening starts here
+6. <title> <artist> topic
+7. <title> lyrics
+8. <title>
+```
+
+Searching `<song> official` returns official music videos, official *movie*
+videos, picturised "full video" cuts and scene uploads — the entire class of
+cinematic content this system exists to keep out — because that is what all of
+them call themselves. A lyrics upload cannot be any of those: it is the
+recording with text over it. So the cheapest, earliest queries ask for lyrics,
+and the broadening queries run only when those do not produce a confident match.
+
+The ISRC query stays first for the same reason, not the opposite one: an ISRC is
+only ever attached to an audio release, so that query cannot return a scene
+either. It is exact identification, not a keyword.
+
+Measured on the live index for "Tum Hi Ho Arijit Singh":
+
+| query | what came back |
+| --- | --- |
+| `… lyrics` | six lyrics/audio uploads, top one an exact 262s match. No cinematic results at all. |
+| `… official` | the picturised "Full HD Video Song", a live cut, a 10-minute upload, and a T-Series "पूरा वीडियो गाना" the matcher had to reject as non-music. |
+
+Candidates accumulate across the whole plan and are re-ranked together, so a
+later broadening query can still win — leading with lyrics biases *what gets
+seen first*, it does not cap the field.
+
+SoundCloud has no lyrics tier: everything on it is already audio. It *widens*
+instead (plain, drop to lead artist, bare title), because decorating a
+SoundCloud query mostly returns nothing.
+
+### Content-type preference
+
+Only the highest matching tier applies, and the ordering deliberately does not
+reward the word "official":
+
+| tier | examples | weight |
+| --- | --- | --- |
+| Lyrics / lyric video | `(Lyrics)`, `Lyric Video`, `Lyrical` | +28…+32 |
+| Clean audio | `(Audio)`, visualiser, `Full Song` | +14…+20 |
+| Official audio | `Official Audio` | +16 |
+| Music video | `Official Video`, `Music Video` | **−12** |
+| Anything else | — | 0 |
+
+Music video is scored negative rather than merely small. Not a judgement about
+music videos as such — it is what "Official Video" labels in practice, which in
+Indian releases is the picturised cut that opens on thirty seconds of dialogue.
+The penalty is sized to lose to a lyrics or audio cut of the same song while
+leaving an attributed music video comfortably playable when it is the only thing
+that exists.
+
+This is a *content-type* axis only. Trust is scored separately as attribution,
+so an artist's Topic upload — auto-generated pure audio, structurally incapable
+of being a scene — can still outrank a stranger's lyrics video.
+
+Lyrics is a preference, never a bypass: a candidate carrying the word still has
+to clear title, artist, duration, version and the vetoes. "Blinding Lights
+(Lyrics)" at 7:00, "Save Your Tears (Lyrics)" and "Blinding Lights Lyrics |
+Movie Scene" are each refused.
+
 **Version handling.** An unrequested remix / live take / cover / sped-up edit is
 penalised heavily. A version the *user typed* ("song x remix") is not: the
 request joins the wanted set, the matching variant earns a bonus, and a
