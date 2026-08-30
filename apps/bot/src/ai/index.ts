@@ -13,8 +13,10 @@ import type { Redis } from '@discord-music/shared/redis';
 import type { BotEnv } from '../config/env.js';
 import { getLogger } from '../lib/logger.js';
 
+import { AutoplayPlanner, type DislikeSource } from './autoplay-planner.js';
 import { AutoplayEngine } from './autoplay.js';
 import { CacheService } from './cache.js';
+import { FamiliarPoolService } from './familiar.js';
 import { IntentService } from './intent.js';
 import { LastFmService } from './lastfm.js';
 import { GroqProvider } from './llm/groq.js';
@@ -31,6 +33,8 @@ const logger = getLogger('ai');
 export interface AiStack {
   readonly orchestrator: MusicOrchestrator;
   readonly autoplay: AutoplayEngine;
+  /** Chooses autoplay's songs: known-pool selection plus discovery slots. */
+  readonly planner: AutoplayPlanner;
   readonly cache: CacheService;
   /** Per-guild played/queued/reserved state; the anti-repeat ledger. */
   readonly session: AutoplaySessionStore;
@@ -40,8 +44,10 @@ export function createAiStack(options: {
   readonly env: BotEnv;
   readonly prisma: PrismaClient;
   readonly redis?: Redis;
+  /** Explicit "not like" store; absent means dislikes are session-only. */
+  readonly dislikes?: DislikeSource;
 }): AiStack {
-  const { env, prisma, redis } = options;
+  const { env, prisma, redis, dislikes } = options;
 
   const cache = new CacheService(redis);
 
@@ -84,7 +90,27 @@ export function createAiStack(options: {
     session,
   });
 
-  const autoplay = new AutoplayEngine(orchestrator, session, {
+  // Autoplay proper: the planner keeps the listener's own songs (library,
+  // playlists, history, requests) apart from the similarity engine's output
+  // and decides the rhythm between them. The engine only buffers what the
+  // planner chooses.
+  const familiar = new FamiliarPoolService(prisma, cache);
+  const planner = new AutoplayPlanner({
+    session,
+    taste,
+    familiar,
+    recommender,
+    ...(dislikes === undefined ? {} : { dislikes }),
+    config: {
+      repeatCooldownMs: env.AUTOPLAY_REPEAT_COOLDOWN_MINUTES * 60_000,
+      interleave: {
+        familiarRunMin: Math.min(env.AUTOPLAY_FAMILIAR_RUN_MIN, env.AUTOPLAY_FAMILIAR_RUN_MAX),
+        familiarRunMax: env.AUTOPLAY_FAMILIAR_RUN_MAX,
+        discoveryEnabled: env.AUTOPLAY_DISCOVERY_ENABLED,
+      },
+    },
+  });
+  const autoplay = new AutoplayEngine(planner, session, {
     prefetchSize: env.AUTOPLAY_PREFETCH_SIZE,
   });
 
@@ -94,14 +120,16 @@ export function createAiStack(options: {
       lastfm: lastfm.enabled,
       musicbrainz: musicbrainz.enabled,
       cache: redis === undefined ? 'memory' : 'redis+memory',
+      familiarRun: `${String(planner.config.interleave.familiarRunMin)}-${String(planner.config.interleave.familiarRunMax)}`,
+      discovery: planner.config.interleave.discoveryEnabled,
     },
     'Recommendation stack ready',
   );
 
-  return { orchestrator, autoplay, cache, session };
+  return { orchestrator, autoplay, planner, cache, session };
 }
 
-export { AutoplayEngine, CacheService, MusicOrchestrator };
+export { AutoplayEngine, AutoplayPlanner, CacheService, MusicOrchestrator };
 export { AutoplaySessionStore } from './session.js';
 export type { SessionEntry } from './session.js';
 export type { MusicIntent } from './intent.js';

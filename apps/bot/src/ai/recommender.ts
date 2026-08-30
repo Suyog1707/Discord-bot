@@ -124,6 +124,18 @@ export interface RecommendationRequest {
    */
   readonly allowRerank?: boolean;
   /**
+   * Canonical keys the caller already has covered elsewhere — its own familiar
+   * pool, typically. Unlike {@link RecommendationExclusions} these are not
+   * "must never play"; they are "this pipeline is not the right source for
+   * them". Removing them here is what makes what comes out genuinely NEW to
+   * the room rather than a rediscovery of its own library.
+   *
+   * History candidates are exempt: they are supplied by the caller precisely
+   * because they are known and rested, so excluding them for being known would
+   * delete the source outright.
+   */
+  readonly knownKeys?: ReadonlySet<string>;
+  /**
    * Atomically reserve selected candidates before resolution. Returns the keys
    * this caller won; picks that lost the race are dropped, which is what stops
    * two concurrent generation passes queueing the same song.
@@ -145,6 +157,28 @@ export interface RecommendationTimings {
   readonly scoreMs: number;
   readonly resolveMs: number;
   readonly totalMs: number;
+}
+
+/**
+ * The output of {@link RecommendationService.rank}: candidates scored and in
+ * order, with nothing committed to. No selection, no reservation, no
+ * resolution — a caller that only wants to know what the pipeline thinks pays
+ * for none of those.
+ */
+export interface RankedCandidates {
+  /** Every surviving candidate, best first. */
+  readonly ranked: readonly ScoredCandidate[];
+  readonly candidateCount: number;
+  /** Candidates removed by the hard exclusion layer before ranking. */
+  readonly excludedCount: number;
+  readonly strategies: readonly string[];
+  /** Whether the LLM reranker actually contributed to the ordering. */
+  readonly reranked: boolean;
+  readonly timings: {
+    readonly candidateMs: number;
+    readonly enrichMs: number;
+    readonly scoreMs: number;
+  };
 }
 
 export interface RecommendationResult {
@@ -212,25 +246,18 @@ export class RecommendationService {
   }
 
   /**
-   * Produce up to `count` playable tracks.
+   * Score a pool of candidates and return it in order, resolving nothing.
    *
-   * Returns fewer rather than failing when the pool is thin — a short queue is a
-   * worse outcome than a full one, but it is a far better outcome than an error.
+   * This is the whole pipeline minus the commitment: generation, the two
+   * scoring passes with tag enrichment in between, the language filter, and
+   * the optional LLM rerank. It is split out because a caller can want the
+   * ranking without wanting these particular tracks queued — the autoplay
+   * planner interleaves this list with a familiar pool of its own and picks
+   * slot by slot, so resolving here would spend Lavalink searches on songs it
+   * was never going to play. `recommend()` is this plus the commitment.
    */
-  async recommend(
-    request: RecommendationRequest,
-    resolve: TrackResolver,
-  ): Promise<RecommendationResult> {
-    const startedAt = Date.now();
+  async rank(request: RecommendationRequest): Promise<RankedCandidates> {
     const exclusions = request.exclusions ?? EMPTY_EXCLUSIONS;
-    logger.debug(
-      {
-        event: 'AUTOPLAY_RECOMMENDATION_STARTED',
-        requested: request.count,
-        excludedKeys: exclusions.trackKeys.size,
-      },
-      'Recommendation started',
-    );
 
     // The session's language, resolved before the pool is built so it can
     // both anchor a language tag-chart (supply) and gate the ranking (demand).
@@ -247,21 +274,12 @@ export class RecommendationService {
 
     if (candidates.length === 0) {
       return {
-        tracks: [],
-        resolved: [],
-        picks: [],
+        ranked: [],
         candidateCount: 0,
         excludedCount,
-        blockedCount: 0,
-        reranked: false,
         strategies,
-        timings: {
-          candidateMs,
-          enrichMs: 0,
-          scoreMs: 0,
-          resolveMs: 0,
-          totalMs: Date.now() - startedAt,
-        },
+        reranked: false,
+        timings: { candidateMs, enrichMs: 0, scoreMs: 0 },
       };
     }
 
@@ -353,15 +371,69 @@ export class RecommendationService {
       }
     }
 
+    return {
+      ranked: finalRanked,
+      candidateCount: candidates.length,
+      excludedCount,
+      strategies,
+      reranked,
+      timings: { candidateMs, enrichMs, scoreMs },
+    };
+  }
+
+  /**
+   * Produce up to `count` playable tracks.
+   *
+   * Returns fewer rather than failing when the pool is thin — a short queue is a
+   * worse outcome than a full one, but it is a far better outcome than an error.
+   */
+  async recommend(
+    request: RecommendationRequest,
+    resolve: TrackResolver,
+  ): Promise<RecommendationResult> {
+    const startedAt = Date.now();
+    const exclusions = request.exclusions ?? EMPTY_EXCLUSIONS;
+    logger.debug(
+      {
+        event: 'AUTOPLAY_RECOMMENDATION_STARTED',
+        requested: request.count,
+        excludedKeys: exclusions.trackKeys.size,
+      },
+      'Recommendation started',
+    );
+
+    const {
+      ranked,
+      candidateCount,
+      excludedCount,
+      strategies,
+      reranked,
+      timings: ranking,
+    } = await this.rank(request);
+
+    if (candidateCount === 0) {
+      return {
+        tracks: [],
+        resolved: [],
+        picks: [],
+        candidateCount: 0,
+        excludedCount,
+        blockedCount: 0,
+        reranked,
+        strategies,
+        timings: { ...ranking, resolveMs: 0, totalMs: Date.now() - startedAt },
+      };
+    }
+
     // Session requests get the sequence-aware selector; one-shot requests
     // (/ask playlists) keep the simpler per-batch diversity cap.
     const session = request.session;
     const picks =
       session === undefined
-        ? selectDiverse(finalRanked, request.count, {
+        ? selectDiverse(ranked, request.count, {
             enforceArtistDiversity: request.intent?.artistDiversity ?? true,
           })
-        : selectSequence(finalRanked, request.count, {
+        : selectSequence(ranked, request.count, {
             artistFatigue: session.artistFatigue,
             knownArtists: new Set(Object.keys(request.profile.artistAffinity)),
           });
@@ -396,9 +468,7 @@ export class RecommendationService {
     }
 
     const timings: RecommendationTimings = {
-      candidateMs,
-      enrichMs,
-      scoreMs,
+      ...ranking,
       resolveMs,
       totalMs: Date.now() - startedAt,
     };
@@ -407,7 +477,7 @@ export class RecommendationService {
       {
         event: 'CANDIDATES_FILTERED',
         requested: request.count,
-        candidates: candidates.length,
+        candidates: candidateCount,
         excluded: excludedCount + blocked,
         picked: reservedPicks.length,
         resolved: resolved.length,
@@ -433,7 +503,7 @@ export class RecommendationService {
       tracks: resolved.map((entry) => entry.track),
       resolved,
       picks: reservedPicks,
-      candidateCount: candidates.length,
+      candidateCount,
       excludedCount,
       blockedCount: blocked,
       reranked,
@@ -695,6 +765,12 @@ export class RecommendationService {
     // as this once did) let "Song" and "Song (Official Video)" survive as two
     // candidates that resolved to the same upload. Hard exclusions apply in
     // the same pass: excluded songs are REMOVED, never merely down-scored.
+    // Novelty, as opposed to exclusion: `knownKeys` is what the CALLER can
+    // already offer from its own familiar pool, so a candidate matching one is
+    // dropped for being redundant rather than for being unplayable. History
+    // candidates are exempt because being known is the entire reason the
+    // caller supplied them.
+    const knownKeys = request.knownKeys;
     let excludedCount = 0;
     const byKey = new Map<string, Candidate>();
     for (const group of [...groups, historyGroup]) {
@@ -703,6 +779,7 @@ export class RecommendationService {
         if (
           exclusions.trackKeys.has(key) ||
           seedKeys.has(key) ||
+          (knownKeys !== undefined && candidate.origin !== 'history' && knownKeys.has(key)) ||
           (candidate.identifier !== undefined && exclusions.identifiers.has(candidate.identifier))
         ) {
           excludedCount += 1;
@@ -774,7 +851,18 @@ export class RecommendationService {
     });
   }
 
-  /** One artist's community tags, cache-fronted for a week. */
+  /**
+   * One artist's community tags, cache-fronted for a week.
+   *
+   * Public so the autoplay planner can enrich its familiar shortlist with the
+   * same tags — and the same cache — the discovery pool is scored with. Two
+   * tag vocabularies for one room would make the two pools' language and
+   * genre fit incomparable.
+   */
+  async artistTags(artist: string): Promise<readonly string[]> {
+    return this.#artistTags(artist);
+  }
+
   async #artistTags(artist: string): Promise<readonly string[]> {
     const key = normaliseArtist(artist);
     const cached = await this.#cache.get<readonly string[]>(`artist-tags:${key}`);

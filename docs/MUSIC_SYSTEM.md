@@ -222,3 +222,74 @@ Accepted resolutions are memoised by canonical identity — the ISRC alone where
 one exists, so two catalogues describing the same master share one entry.
 Rejected and low-confidence results are never cached: caching a bad match would
 make it permanent, and re-running the search is cheap by comparison.
+
+## Autoplay
+
+Autoplay is a personalised radio, not a "related songs" feed. When the queue
+drains it continues with songs the room already likes and introduces one
+discovery every few songs:
+
+```
+Known · Known · Discovery · Known · Known · Known · Discovery · …
+```
+
+`apps/bot/src/ai/autoplay-planner.ts` keeps two pools apart:
+
+| Pool | Sources | Scored by |
+| --- | --- | --- |
+| **Known** | songs requested this session, the listeners' playlists (own + guild-shared), their favorites, and play history (requested at least once, or replayed, or completed) | `familiar-scoring.ts`: source, replays, completion, explicit requests, artist affinity, fit with what is playing, how long since it last played, early skips, artist fatigue |
+| **Discovery** | the Last.fm similarity engine (`recommender.ts`), with every song in the known pool removed | `scoring.ts`: similarity, tag/artist affinity, language, novelty, recency |
+
+The rhythm is decided by `interleave.ts`: `AUTOPLAY_FAMILIAR_RUN_MIN` /
+`AUTOPLAY_FAMILIAR_RUN_MAX` known songs (the high end when the known pool is
+deep, the low end when it is thin) then exactly one discovery. The count of
+known songs since the last discovery is read back from the session ledger, so
+the pattern carries across the small batches autoplay generates in and across
+restarts. `AUTOPLAY_DISCOVERY_ENABLED=false` turns the radio into a jukebox.
+
+"Who is listening" is the set of people who requested the recent tracks; their
+personal taste profiles are blended with the guild's, and their libraries and
+playlists are what the known pool draws from. A track with no known listeners
+(a restored queue) uses guild history alone. A new user with no history gets
+discoveries seeded from what they requested, and their history becomes the
+known pool as they listen.
+
+### Continuous playback
+
+Autoplay refills the queue **before** it drains. Whenever the upcoming count is
+at or below `AUTOPLAY_LOW_WATER_MARK` (default 2) — on every track start, and
+after a queue removal — the player asks the planner for enough tracks to reach
+`AUTOPLAY_TARGET_QUEUE_SIZE` (default 4), in the background, one refill at a
+time per player. "Queue finished" is reserved for the case where the planner,
+after relaxing its repetition rules, genuinely has nothing playable.
+
+Repetition is a cooldown, not a ban. A song played within
+`AUTOPLAY_REPEAT_COOLDOWN_MINUTES` (default 180) or within the last 12 plays is
+excluded; beyond that it is eligible again and the familiar scorer's rest curve
+decides how eager autoplay is to bring it back. When nothing at all clears the
+cooldown — a small library deep into a long session — the same pass runs again
+with the window halved (never below 30 minutes), so the radio returns to songs
+from a few hours ago rather than stopping. What is playing, queued, reserved by
+a concurrent pass, or explicitly disliked never relaxes.
+
+### Not like
+
+`/dislike` (or the 👎 controller button) is stronger than a skip. A skip says
+"not now" and only lowers the ranking; a dislike is stored per user
+(`disliked_tracks`, keyed by the canonical `artist::title` identity so it holds
+whichever provider streams the song), pulls the song out of the queue and the
+prefetch buffer immediately, excludes it from both pools for good, and applies a
+small capped penalty to the artist's other songs — a dislike is about one song,
+not a discography. `/dislike list` and `/dislike remove` manage the list.
+
+Duplicate protection is structural: everything playing, queued, reserved by a
+concurrent generation pass or recently played is excluded before scoring,
+picks are reserved atomically before they are resolved, and the resolved
+upload is checked again under its own spelling.
+
+The planner never names a provider. A known song is resolved through the
+normal SoundCloud → YouTube walk with its stored runtime as evidence
+(`MusicManager.resolveKnown`); a discovery, which has only a title and an
+artist, goes through the same walk under the autoplay threshold
+(`MusicManager.resolveCandidate`). Stored Lavalink blobs are never replayed —
+they go stale.

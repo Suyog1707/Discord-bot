@@ -40,6 +40,24 @@ const CAUSE_LOG_LIMIT = 600;
  */
 const LINK_WAIT_MS = 2_500;
 
+/** Refill thresholds when the manager passes none (tests, legacy callers). */
+const DEFAULT_LOW_WATER_MARK = 2;
+const DEFAULT_TARGET_QUEUE_SIZE = 4;
+/** How long a failed drain-time autoplay attempt waits before its one retry. */
+const AUTOPLAY_RETRY_DELAY_MS = 5_000;
+/**
+ * A refill request that has not answered by now is treated as failed. Without
+ * a deadline one hung provider call would leave the in-flight marker set for
+ * the life of the player and every later drain would end the queue.
+ */
+const AUTOPLAY_REQUEST_TIMEOUT_MS = 45_000;
+/**
+ * How long the drain path waits for the history write before generating.
+ * Autoplay wants the just-finished track visible in history, but a slow
+ * database must not turn into a gap of silence.
+ */
+const HISTORY_WAIT_MS = 2_500;
+
 /**
  * How far short of its advertised runtime a "finished" track may fall before we
  * stop believing it finished.
@@ -85,6 +103,13 @@ export function isTruncatedPlayback(input: {
   );
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref();
+  });
+}
+
 function truncate(value: string | undefined, limit: number): string | undefined {
   if (value === undefined || value.length <= limit) return value;
   return `${value.slice(0, limit)}… (truncated)`;
@@ -115,13 +140,22 @@ export interface GuildPlayerOptions {
   readonly stayConnected: boolean;
   /** Smart autoplay: ask for more tracks when the queue drains. */
   readonly autoplayEnabled: boolean;
+  /**
+   * Queue refill thresholds. When the upcoming count is at or below the
+   * low-water mark a refill starts; it fills back up to the target. Refilling
+   * early is what keeps "queue ended" from ever being the normal case — the
+   * queue never gets a chance to drain while autoplay can produce music.
+   */
+  readonly autoplayLowWaterMark?: number;
+  readonly autoplayTargetQueueSize?: number;
   /** Called when the player wants to be torn down (idle timeout, fatal error). */
   readonly onSelfDestruct: (guildId: string, reason: string) => Promise<void>;
   /**
-   * Called when the queue drains with autoplay enabled. Returns tracks to
-   * continue with (may be empty — the player then parks as usual).
+   * Called when the queue runs low or drains with autoplay enabled, asking
+   * for up to `count` tracks. Returns tracks to continue with (may be
+   * shorter, or empty — the player then parks only if the queue is drained).
    */
-  readonly onAutoplayRequest: (guildId: string) => Promise<readonly QueuedTrack[]>;
+  readonly onAutoplayRequest: (guildId: string, count: number) => Promise<readonly QueuedTrack[]>;
   /**
    * Called when a track starts — EVERY track, not only with autoplay on: the
    * session ledger must see manual plays too, or the anti-repeat window has
@@ -182,9 +216,27 @@ export class GuildPlayer {
   #destroyed = false;
   #stayConnected: boolean;
   #autoplayEnabled: boolean;
-  #autoplayActive = false;
+  /**
+   * The refill (low-water or drain) currently running, or null. A promise
+   * rather than a flag so the drain path can WAIT for a refill that is
+   * already on its way instead of misreading "busy" as "exhausted".
+   */
+  #autoplayInFlight: Promise<void> | null = null;
+  /** Drain-time attempts that threw since the last track started. Bounds the retry. */
+  #autoplayRetries = 0;
+  /**
+   * `#handleTrackEnd` is between clearing `#playing` and starting the next
+   * track. A refill landing in that window must not auto-start playback:
+   * `current` still points at the track that just ended, and the end
+   * handler is about to advance and start the right one itself.
+   */
+  #endInFlight = false;
   #activeFilter: FilterPresetName | 'speed' | 'pitch' | null = null;
-  readonly #onAutoplayRequest: (guildId: string) => Promise<readonly QueuedTrack[]>;
+  readonly #onAutoplayRequest: (guildId: string, count: number) => Promise<readonly QueuedTrack[]>;
+  readonly #autoplayLowWaterMark: number;
+  readonly #autoplayTargetQueueSize: number;
+  /** A drain-time autoplay attempt that threw gets exactly one delayed retry. */
+  #autoplayRetryTimer: NodeJS.Timeout | undefined;
   readonly #onTrackStarted: ((guildId: string, track: QueuedTrack) => void) | undefined;
   readonly #onTrackFinished:
     | ((
@@ -232,6 +284,14 @@ export class GuildPlayer {
     this.#idleTimeoutSeconds = options.idleTimeoutSeconds;
     this.#stayConnected = options.stayConnected;
     this.#autoplayEnabled = options.autoplayEnabled;
+    this.#autoplayLowWaterMark = Math.max(
+      1,
+      options.autoplayLowWaterMark ?? DEFAULT_LOW_WATER_MARK,
+    );
+    this.#autoplayTargetQueueSize = Math.max(
+      this.#autoplayLowWaterMark + 1,
+      options.autoplayTargetQueueSize ?? DEFAULT_TARGET_QUEUE_SIZE,
+    );
     this.#onSelfDestruct = options.onSelfDestruct;
     this.#onAutoplayRequest = options.onAutoplayRequest;
     this.#onTrackStarted = options.onTrackStarted;
@@ -299,6 +359,26 @@ export class GuildPlayer {
   setAutoplayEnabled(enabled: boolean): void {
     this.#autoplayEnabled = enabled;
     this.#emit('AUTOPLAY_CHANGE');
+    // Switched on mid-session: fill the queue now rather than waiting for
+    // the current track to end.
+    if (!enabled) return;
+    if (this.isPlaying) {
+      this.#maintainAutoplay();
+    } else if (this.queue.upcoming.length === 0) {
+      // The most likely moment to switch autoplay on is right after "queue
+      // finished". A parked player has nothing to top up; it needs restarting.
+      void this.#tryAutoplay().then((outcome) => {
+        if (outcome === 'continued') this.#clearIdleTimer();
+      });
+    }
+  }
+
+  /** Configured refill thresholds, for diagnostics and tests. */
+  get autoplayThresholds(): { readonly lowWaterMark: number; readonly targetQueueSize: number } {
+    return {
+      lowWaterMark: this.#autoplayLowWaterMark,
+      targetQueueSize: this.#autoplayTargetQueueSize,
+    };
   }
 
   /** The filter preset currently applied, or null for clean playback. */
@@ -317,7 +397,7 @@ export class GuildPlayer {
     this.#persist();
     this.#emit('QUEUE_UPDATE');
 
-    if (!this.isPlaying) {
+    if (!this.isPlaying && !this.#endInFlight) {
       // After the queue drains, the cursor parks at the old length — exactly
       // where `add` just placed the first new track, so `current` is already
       // it. Calling `advance()` from there would move to the SECOND new track:
@@ -448,8 +528,32 @@ export class GuildPlayer {
     if (removed !== null) {
       this.#persist();
       this.#emit('QUEUE_UPDATE');
+      this.#maintainAutoplay();
     }
     return removed;
+  }
+
+  /**
+   * Remove every upcoming track matching `predicate` — an explicit dislike
+   * pulls the song out of the queue wherever it sits, under any spelling.
+   * Returns what was removed so the caller can report it.
+   */
+  removeUpcomingWhere(predicate: (track: QueuedTrack) => boolean): readonly QueuedTrack[] {
+    const removed: QueuedTrack[] = [];
+    // Walk from the back so indices ahead of the cursor stay valid.
+    for (let index = this.queue.upcoming.length - 1; index >= 0; index -= 1) {
+      const track = this.queue.upcoming[index];
+      if (track !== undefined && predicate(track)) {
+        const gone = this.queue.removeUpcoming(index);
+        if (gone !== null) removed.push(gone);
+      }
+    }
+    if (removed.length > 0) {
+      this.#persist();
+      this.#emit('QUEUE_UPDATE');
+      this.#maintainAutoplay();
+    }
+    return removed.reverse();
   }
 
   clearUpcoming(): number {
@@ -457,6 +561,7 @@ export class GuildPlayer {
     if (removed > 0) {
       this.#persist();
       this.#emit('QUEUE_CLEAR');
+      this.#maintainAutoplay();
     }
     return removed;
   }
@@ -467,7 +572,10 @@ export class GuildPlayer {
     // 'jump', not 'skip': ending the session says nothing bad about the song
     // that happened to be playing, and must not feed the skip penalty.
     this.#advanceIntent = 'jump';
-    this.#stopRequested = true;
+    // Only a stop that actually ends a track produces the `end` event that
+    // consumes this flag. Set it on an idle player and it would linger to
+    // silently cancel autoplay at the next natural drain.
+    this.#stopRequested = this.isPlaying;
     await this.#player.stopTrack();
     this.#persist();
     this.#startIdleTimer();
@@ -482,6 +590,10 @@ export class GuildPlayer {
     this.#emit('PLAYER_DISCONNECT');
 
     this.#clearIdleTimer();
+    if (this.#autoplayRetryTimer !== undefined) {
+      clearTimeout(this.#autoplayRetryTimer);
+      this.#autoplayRetryTimer = undefined;
+    }
     this.#player.removeAllListeners();
     await this.#store.flush(this.guildId, this.queue, this.paused);
   }
@@ -502,6 +614,7 @@ export class GuildPlayer {
       // Authoritative confirmation from Lavalink — covers any path where
       // playback began without `#playTrack` having set the flag.
       this.#playing = true;
+      this.#autoplayRetries = 0;
       this.#trackStartedAt = Date.now();
       this.#clearIdleTimer();
       this.#emit('TRACK_START');
@@ -537,10 +650,15 @@ export class GuildPlayer {
       // doing it only once the queue drains is heard as a gap of silence.
       // Fire-and-forget by construction — nothing here is awaited.
       this.#onTrackStarted?.(this.guildId, track);
+
+      // Keep the queue topped up while this track plays. This is the
+      // low-water refill: autoplay adds music while there is still music,
+      // so the drain path below is the exception rather than the routine.
+      this.#maintainAutoplay();
     });
 
     this.#player.on('end', (event) => {
-      void this.#handleTrackEnd(event.reason);
+      void this.#handleTrackEnd(event.reason, event.track.encoded);
     });
 
     this.#player.on('exception', (event) => {
@@ -597,7 +715,7 @@ export class GuildPlayer {
     });
   }
 
-  async #handleTrackEnd(reason: string): Promise<void> {
+  async #handleTrackEnd(reason: string, endedEncoded?: string): Promise<void> {
     // 'replaced' means we started another track ourselves (jump, previous, a
     // source rescue): audio IS playing. `#playing` must survive untouched —
     // clearing it here left the flag false for the whole replacement track,
@@ -608,10 +726,38 @@ export class GuildPlayer {
       return;
     }
 
+    // A track can only end once. Two `end` events for one track — a
+    // duplicated gateway event, or a late one landing after the queue has
+    // already advanced — used to advance the queue twice: the second arrived
+    // while the next track's `playTrack` was in flight, cleared `#playing`,
+    // wrote a history row for a song that never played a frame, and moved
+    // on again. Lavalink names the track in every end event, and a track
+    // that is no longer `current` has, by definition, already been dealt
+    // with. (Not keyed on "between playTrack and start": a load failure
+    // ends a track that never started, and must still advance the queue.)
+    const current = this.queue.current;
+    const stale =
+      endedEncoded !== undefined && current !== null && endedEncoded !== current.encoded;
+    if (stale) {
+      this.#logger.debug(
+        { event: 'TRACK_END_IGNORED', reason, current: current.title },
+        'Ignored a track end for a track that is not the one playing',
+      );
+      return;
+    }
+
+    this.#endInFlight = true;
+    try {
+      await this.#processTrackEnd(reason, current);
+    } finally {
+      this.#endInFlight = false;
+    }
+  }
+
+  async #processTrackEnd(reason: string, finished: QueuedTrack | null): Promise<void> {
     // The track is genuinely over; `#playTrack` re-sets this when recovery or
     // the next track starts.
     this.#playing = false;
-    const finished = this.queue.current;
 
     const failureBefore = this.#failureBeforeEnd;
     this.#failureBeforeEnd = null;
@@ -655,7 +801,8 @@ export class GuildPlayer {
         expectedMs,
         reachedMs,
         shortfallMs: expectedMs > 0 ? shortfallMs : undefined,
-        startedAt: this.#trackStartedAt > 0 ? new Date(this.#trackStartedAt).toISOString() : undefined,
+        startedAt:
+          this.#trackStartedAt > 0 ? new Date(this.#trackStartedAt).toISOString() : undefined,
         endedAt: new Date().toISOString(),
         intent: this.#advanceIntent,
       },
@@ -736,10 +883,16 @@ export class GuildPlayer {
         return;
       }
 
-      // The just-finished track must be visible to autoplay's history reads.
-      await historyWrite;
-      if (await this.#tryAutoplay()) return;
-      await this.#notify('✅ Queue finished. Add more with `/play`.');
+      // The just-finished track should be visible to autoplay's history
+      // reads — but not at any price: a slow write must not become silence.
+      await Promise.race([historyWrite, delay(HISTORY_WAIT_MS)]);
+      const outcome = await this.#tryAutoplay();
+      if (outcome === 'continued') return;
+      // 'failed' already told the channel and scheduled its retry; only a
+      // genuine exhaustion is the end of the queue.
+      if (outcome === 'exhausted') {
+        await this.#notify('✅ Queue finished. Add more with `/play`.');
+      }
       this.#startIdleTimer();
       return;
     }
@@ -748,33 +901,197 @@ export class GuildPlayer {
     this.#persist();
   }
 
-  /** Continue with similar tracks when the queue drains. True if it did. */
-  async #tryAutoplay(): Promise<boolean> {
-    if (!this.#autoplayEnabled || this.#autoplayActive) return false;
+  /**
+   * How many tracks a refill should ask for right now: enough to reach the
+   * target, never more. Zero when the queue is above the low-water mark.
+   */
+  #autoplayShortfall(): number {
+    const upcoming = this.queue.upcoming.length;
+    if (upcoming > this.#autoplayLowWaterMark) return 0;
+    return Math.max(0, this.#autoplayTargetQueueSize - upcoming);
+  }
 
-    this.#autoplayActive = true;
+  /**
+   * Low-water refill: top the queue up in the background while music plays.
+   *
+   * Fire-and-forget by design — the caller is a player event handler or a
+   * queue mutation and must not wait on candidate generation. One refill at
+   * a time per player (`#autoplayActive` is shared with the drain path, so
+   * a low-water refill and a drain-time request can never run together and
+   * double-fill the queue). Loops while still short, because one request may
+   * return fewer than asked; stops the moment a request returns nothing, so
+   * an empty pool is one failed request, not a hot loop.
+   */
+  #maintainAutoplay(): void {
+    if (!this.#autoplayEnabled || this.#autoplayInFlight !== null || this.#destroyed) return;
+    if (!this.isPlaying) return;
+    const need = this.#autoplayShortfall();
+    if (need === 0) return;
+
+    const run = (async () => {
+      try {
+        let shortfall = need;
+        while (shortfall > 0 && this.#autoplayEnabled && !this.#destroyed) {
+          const before = this.queue.upcoming.length;
+          const picks = await this.#requestAutoplay(shortfall);
+          if (picks.length === 0) break;
+          await this.enqueue(picks);
+          this.#logger.info(
+            {
+              event: 'QUEUE_REFILL',
+              trigger: 'low-water',
+              queueBefore: before,
+              queueAfter: this.queue.upcoming.length,
+              generated: picks.length,
+              lowWaterMark: this.#autoplayLowWaterMark,
+              target: this.#autoplayTargetQueueSize,
+            },
+            'Autoplay refilled the queue',
+          );
+          shortfall = Math.max(0, this.#autoplayTargetQueueSize - this.queue.upcoming.length);
+        }
+      } catch (error) {
+        // A failed top-up is not a stopped radio: the drain path still runs
+        // when the queue actually empties, with its own retry.
+        this.#logger.warn({ err: error }, 'Low-water autoplay refill failed');
+      } finally {
+        this.#autoplayInFlight = null;
+      }
+    })();
+    this.#autoplayInFlight = run;
+  }
+
+  /** One refill request, with a deadline. */
+  async #requestAutoplay(count: number): Promise<readonly QueuedTrack[]> {
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(
+          new Error(`Autoplay request timed out after ${String(AUTOPLAY_REQUEST_TIMEOUT_MS)}ms`),
+        );
+      }, AUTOPLAY_REQUEST_TIMEOUT_MS);
+      timer.unref();
+    });
     try {
-      const picks = await this.#onAutoplayRequest(this.guildId);
-      if (picks.length === 0) return false;
+      return await Promise.race([this.#onAutoplayRequest(this.guildId, count), deadline]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
 
-      const { startedPlayback } = await this.enqueue(picks);
+  /**
+   * Continue when the queue has drained.
+   *
+   * This is the exception path now — the low-water refill normally keeps
+   * the queue from ever reaching here — and it is the last line before
+   * "queue finished". Three outcomes, because they mean different things to
+   * the listener: `continued` (music is playing), `exhausted` (the planner,
+   * after relaxing its rules, has nothing — the honest end of the queue),
+   * `failed` (the request threw or timed out — a retry is scheduled and the
+   * channel has been told; not the end of the queue).
+   */
+  async #tryAutoplay(): Promise<'continued' | 'exhausted' | 'failed'> {
+    if (!this.#autoplayEnabled) return 'exhausted';
+
+    // A refill already on its way is not an empty pool. Wait for it; if it
+    // got the music going there is nothing left to do here.
+    const inFlight = this.#autoplayInFlight;
+    if (inFlight !== null) {
+      await inFlight.catch(() => undefined);
+      if (this.isPlaying) return 'continued';
+      if (await this.#startParked()) return 'continued';
+    }
+
+    const before = this.queue.upcoming.length;
+    let settle: (() => void) | undefined;
+    this.#autoplayInFlight = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    try {
+      const picks = await this.#requestAutoplay(this.#autoplayTargetQueueSize);
+      if (picks.length === 0) {
+        // A refill may have landed while this request ran (or during the
+        // history wait before it); a full queue is never "exhausted".
+        if (await this.#startParked()) return 'continued';
+        this.#logger.warn(
+          { event: 'AUTOPLAY_EXHAUSTED', queueBefore: before },
+          'Autoplay produced no playable candidate after fallback; queue will end',
+        );
+        return 'exhausted';
+      }
+
+      // `enqueue` will not auto-start while the end handler is in flight
+      // (this is usually called from inside it), so the drain path starts
+      // the parked cursor itself.
+      const { startedPlayback: autoStarted } = await this.enqueue(picks);
+      const startedPlayback = autoStarted || (await this.#startParked());
+      this.#logger.info(
+        {
+          event: 'QUEUE_REFILL',
+          trigger: 'drain',
+          queueBefore: before,
+          queueAfter: this.queue.upcoming.length,
+          generated: picks.length,
+        },
+        'Autoplay refilled a drained queue',
+      );
       if (startedPlayback && this.#announce) {
         await this.#notify(
           `📻 Autoplay: queue finished, continuing with **${picks[0]?.title ?? 'similar tracks'}**. Disable with \`/autoplay\`.`,
         );
       }
-      return startedPlayback;
+      return startedPlayback ? 'continued' : 'exhausted';
     } catch (error) {
       // Technical detail stays in the log; the listener gets an explanation
-      // and reassurance, not an exception name.
-      this.#logger.warn({ err: error }, 'Autoplay failed; parking the player');
-      await this.#notify(
-        "⚠️ I couldn't prepare the next songs right now. I'll try again when the queue runs low — you can also add songs with `/play`.",
-      );
-      return false;
+      // and reassurance, not an exception name. Exactly one retry, a few
+      // seconds out: a transient provider or database hiccup must not end
+      // the radio, and a persistent outage must not spam the channel.
+      this.#autoplayRetries += 1;
+      if (this.#autoplayRetries === 1) {
+        this.#logger.warn({ err: error }, 'Autoplay failed; retrying once shortly');
+        this.#scheduleAutoplayRetry();
+        await this.#notify(
+          "⚠️ I couldn't prepare the next songs right now. I'll try again in a moment — you can also add songs with `/play`.",
+        );
+        return 'failed';
+      }
+      this.#logger.warn({ err: error }, 'Autoplay failed again; giving up until the next track');
+      return 'exhausted';
     } finally {
-      this.#autoplayActive = false;
+      this.#autoplayInFlight = null;
+      settle?.();
     }
+  }
+
+  /**
+   * Start playback from a parked cursor. After a drain the cursor sits at
+   * the old length — exactly where new tracks land, so `current` is already
+   * the first of them; on a fresh queue `advance()` moves onto it.
+   */
+  async #startParked(): Promise<boolean> {
+    if (this.isPlaying) return true;
+    const first = this.queue.current ?? this.queue.advance();
+    if (first === null) return false;
+    await this.#playTrack(first);
+    return true;
+  }
+
+  #scheduleAutoplayRetry(): void {
+    if (this.#autoplayRetryTimer !== undefined) return;
+    const timer = setTimeout(() => {
+      this.#autoplayRetryTimer = undefined;
+      // Only if nothing else got the music going in the meantime.
+      if (this.#destroyed || this.isPlaying || !this.#autoplayEnabled) return;
+      void this.#tryAutoplay().then(async (outcome) => {
+        if (outcome === 'continued') {
+          this.#clearIdleTimer();
+          return;
+        }
+        await this.#notify('✅ Queue finished. Add more with `/play`.');
+      });
+    }, AUTOPLAY_RETRY_DELAY_MS);
+    timer.unref();
+    this.#autoplayRetryTimer = timer;
   }
 
   /**
@@ -838,7 +1155,9 @@ export class GuildPlayer {
       const next = this.queue.skip();
       if (next !== null) {
         await this.#playTrack(next);
-      } else {
+      } else if ((await this.#tryAutoplay()) !== 'continued') {
+        // The last track in the queue was unplayable: that is a drained
+        // queue, and autoplay gets its say before the player parks.
         this.#startIdleTimer();
       }
     }

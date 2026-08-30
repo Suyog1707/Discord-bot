@@ -191,9 +191,7 @@ export class QueueStore {
                 isStream: track.isStream,
                 source: TO_DB_SOURCE[track.source],
                 playbackSource:
-                  track.playbackSource === undefined
-                    ? null
-                    : TO_DB_SOURCE[track.playbackSource],
+                  track.playbackSource === undefined ? null : TO_DB_SOURCE[track.playbackSource],
               })),
             }),
           ]
@@ -298,10 +296,33 @@ export class QueueStore {
       });
       if (guild === null) return;
 
-      const user = await this.#prisma.user.findUnique({
-        where: { discordId: track.requestedById },
-        select: { id: true },
-      });
+      // The requester's User row is CREATED here when it does not exist yet,
+      // not merely looked up. Personalised autoplay reads history per
+      // listener, and a listener who has never opened the dashboard or saved
+      // a favourite had no User row — so every play they ever requested was
+      // recorded with a null userId and was invisible to their own profile.
+      // Only real people get a row: autoplay's picks are attributed to the
+      // bot, and a restored queue's "0" requester is nobody.
+      const requesterId = track.requestedById;
+      const isPerson = trackOrigin(track) === 'user' && /^\d{15,22}$/u.test(requesterId);
+      // The upsert is not atomic against a concurrent first insert: two of a
+      // new listener's tracks ending together can both take the create branch,
+      // and the loser must not drop the play — it is that person's first row.
+      const user = isPerson
+        ? await this.#prisma.user
+            .upsert({
+              where: { discordId: requesterId },
+              update: {},
+              create: { discordId: requesterId, username: track.requestedByName },
+              select: { id: true },
+            })
+            .catch(() =>
+              this.#prisma.user.findUnique({
+                where: { discordId: requesterId },
+                select: { id: true },
+              }),
+            )
+        : null;
 
       await this.#prisma.songHistory.create({
         data: {

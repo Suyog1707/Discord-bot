@@ -1,10 +1,21 @@
 import type { Redis } from '@discord-music/shared/redis';
 import { describe, expect, it } from 'vitest';
 
+import type { AutoplayKind } from './interleave.js';
 import { AutoplaySessionStore, computeArtistFatigue, type SessionEntry } from './session.js';
 
 function entry(key: string, artistKey = 'artist', identifier = ''): SessionEntry {
   return { key, identifier, artistKey };
+}
+
+/** An autoplay pick that recorded which half of the cadence it filled. */
+function autoplayEntry(key: string, kind: AutoplayKind): SessionEntry {
+  return { key, identifier: '', artistKey: 'artist', origin: 'autoplay', kind };
+}
+
+/** A track someone actually asked for. */
+function userEntry(key: string, requestedById: string): SessionEntry {
+  return { key, identifier: '', artistKey: 'artist', origin: 'user', requestedById };
 }
 
 /**
@@ -283,11 +294,28 @@ describe('computeArtistFatigue', () => {
   // should read hotter than one heard once a while back.
   it('rates an artist played twice recently above one played once long ago', () => {
     const twiceRecently = computeArtistFatigue([
-      'filler0', 'filler1', 'filler2', 'filler3', 'filler4', 'x', 'filler6', 'x',
+      'filler0',
+      'filler1',
+      'filler2',
+      'filler3',
+      'filler4',
+      'x',
+      'filler6',
+      'x',
     ]).get('x');
     const onceLongAgo = computeArtistFatigue([
-      'filler0', 'filler1', 'filler2', 'filler3', 'filler4', 'filler5', 'filler6', 'filler7',
-      'filler8', 'filler9', 'filler10', 'x',
+      'filler0',
+      'filler1',
+      'filler2',
+      'filler3',
+      'filler4',
+      'filler5',
+      'filler6',
+      'filler7',
+      'filler8',
+      'filler9',
+      'filler10',
+      'x',
     ]).get('x');
 
     expect(twiceRecently ?? 0).toBeGreaterThan(onceLongAgo ?? 0);
@@ -366,5 +394,155 @@ describe('AutoplaySessionStore — Redis write-through', () => {
 
     expect(snap.recentKeys).toEqual(['s1']);
     expect(snap.queuedKeys.has('s2')).toBe(true);
+  });
+});
+
+describe('AutoplaySessionStore — autoplay cadence', () => {
+  // The ordering is the whole point: `queued` runs in PLAY order, so its last
+  // element is the newest decision, while `recent` is already newest-first.
+  // Getting this backwards would make the planner read a finished run as if it
+  // had just started.
+  it('reports queued kinds last-queued-first, ahead of recent plays newest-first', async () => {
+    const store = new AutoplaySessionStore();
+    await store.recordPlayed('guild', autoplayEntry('p1', 'familiar'));
+    await store.recordPlayed('guild', autoplayEntry('p2', 'discovery'));
+    await store.syncQueue('guild', [
+      autoplayEntry('q1', 'familiar'),
+      autoplayEntry('q2', 'discovery'),
+    ]);
+
+    const snap = await store.snapshot('guild');
+
+    expect(snap.recentAutoplayKinds).toEqual(['discovery', 'familiar', 'discovery', 'familiar']);
+  });
+
+  // The playing track is in BOTH lists: `recordPlayed` put it at the head of
+  // recent, and the queue mirror (which includes the current track) puts it
+  // at the head of queued. Counted twice the run would read one longer than
+  // it is and a discovery would land a beat early.
+  it('does not count the currently playing track twice when it is in recent and queued', async () => {
+    const store = new AutoplaySessionStore();
+    await store.recordPlayed('guild', autoplayEntry('p1', 'familiar'));
+    await store.recordPlayed('guild', autoplayEntry('p2', 'familiar'));
+    await store.syncQueue('guild', [
+      autoplayEntry('p2', 'familiar'),
+      autoplayEntry('q1', 'familiar'),
+    ]);
+
+    const snap = await store.snapshot('guild');
+
+    expect(snap.recentAutoplayKinds).toEqual(['familiar', 'familiar', 'familiar']);
+  });
+
+  it('stamps playedAt on recorded plays and exposes the timed ring as recentEntries', async () => {
+    let clock = 1_000_000;
+    const store = new AutoplaySessionStore({ now: () => clock });
+    await store.recordPlayed('guild', entry('p1'));
+    clock += 60_000;
+    await store.recordPlayed('guild', entry('p2'));
+
+    const snap = await store.snapshot('guild');
+
+    expect(snap.recentEntries.map((item) => item.key)).toEqual(['p2', 'p1']);
+    expect(snap.recentEntries[0]?.playedAt).toBe(1_060_000);
+    expect(snap.recentEntries[1]?.playedAt).toBe(1_000_000);
+  });
+
+  it('remembers dislikes for the session and drops any reservation on them', async () => {
+    const store = new AutoplaySessionStore();
+    await store.reserve('guild', ['bad']);
+    await store.recordDisliked('guild', ['bad']);
+
+    const snap = await store.snapshot('guild');
+
+    expect(snap.dislikedKeys.has('bad')).toBe(true);
+    expect(snap.reservedKeys.has('bad')).toBe(false);
+  });
+
+  it('forgets a dislike so a forgiven song is eligible again this session', async () => {
+    const store = new AutoplaySessionStore();
+    await store.recordDisliked('guild', ['bad', 'worse']);
+    await store.forgetDisliked('guild', ['bad']);
+
+    const snap = await store.snapshot('guild');
+
+    expect(snap.dislikedKeys.has('bad')).toBe(false);
+    expect(snap.dislikedKeys.has('worse')).toBe(true);
+  });
+
+  it('ignores entries with no kind, so user requests never break a familiar run', async () => {
+    const store = new AutoplaySessionStore();
+    await store.recordPlayed('guild', autoplayEntry('p1', 'familiar'));
+    await store.recordPlayed('guild', userEntry('p2', '111111111111111111'));
+    await store.recordPlayed('guild', autoplayEntry('p3', 'familiar'));
+    await store.syncQueue('guild', [userEntry('q1', '111111111111111111')]);
+
+    const snap = await store.snapshot('guild');
+
+    expect(snap.recentAutoplayKinds).toEqual(['familiar', 'familiar']);
+  });
+
+  // Backwards compatibility: sessions written before the cadence existed, and
+  // every caller that does not care about it, must still snapshot cleanly.
+  it('leaves the cadence empty for entries that carry none of the new fields', async () => {
+    const store = new AutoplaySessionStore();
+    await store.recordPlayed('guild', entry('p1'));
+    await store.syncQueue('guild', [entry('q1')]);
+
+    const snap = await store.snapshot('guild');
+
+    expect(snap.recentAutoplayKinds).toEqual([]);
+    expect(snap.listenerIds).toEqual([]);
+  });
+
+  it('carries kind and requester through Redis so a restart keeps the cadence', async () => {
+    const redis = new WorkingFakeRedis() as unknown as Redis;
+    const first = new AutoplaySessionStore({ redis });
+    await first.recordPlayed('guild', autoplayEntry('p1', 'discovery'));
+    await first.syncQueue('guild', [userEntry('q1', '111111111111111111')]);
+
+    const second = new AutoplaySessionStore({ redis });
+    const snap = await second.snapshot('guild');
+
+    expect(snap.recentAutoplayKinds).toEqual(['discovery']);
+    expect(snap.listenerIds).toEqual(['111111111111111111']);
+  });
+});
+
+describe('AutoplaySessionStore — listeners', () => {
+  it('lists distinct requesters, recent plays before the queue', async () => {
+    const store = new AutoplaySessionStore();
+    await store.recordPlayed('guild', userEntry('p1', 'user-a'));
+    await store.recordPlayed('guild', userEntry('p2', 'user-b'));
+    // The same person again: newest position wins, and they appear once.
+    await store.recordPlayed('guild', userEntry('p3', 'user-a'));
+    await store.syncQueue('guild', [userEntry('q1', 'user-c'), userEntry('q2', 'user-b')]);
+
+    const snap = await store.snapshot('guild');
+
+    expect(snap.listenerIds).toEqual(['user-a', 'user-b', 'user-c']);
+  });
+
+  it('ignores autoplay entries and placeholder requester ids', async () => {
+    const store = new AutoplaySessionStore();
+    await store.recordPlayed('guild', autoplayEntry('p1', 'familiar'));
+    await store.recordPlayed('guild', { ...userEntry('p2', '0') });
+    await store.recordPlayed('guild', { ...userEntry('p3', '') });
+    await store.recordPlayed('guild', userEntry('p4', 'user-a'));
+
+    const snap = await store.snapshot('guild');
+
+    expect(snap.listenerIds).toEqual(['user-a']);
+  });
+
+  it('caps the listener list at five', async () => {
+    const store = new AutoplaySessionStore();
+    for (const index of [1, 2, 3, 4, 5, 6]) {
+      await store.recordPlayed('guild', userEntry(`p${String(index)}`, `user-${String(index)}`));
+    }
+
+    const snap = await store.snapshot('guild');
+
+    expect(snap.listenerIds).toEqual(['user-6', 'user-5', 'user-4', 'user-3', 'user-2']);
   });
 });

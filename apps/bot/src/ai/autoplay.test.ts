@@ -2,10 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { QueuedTrack } from '../music/track.js';
 
+import type { AutoplayGenerator, GeneratedTrack } from './autoplay-planner.js';
 import { AutoplayEngine } from './autoplay.js';
 import { identityOf, trackKeyOf } from './identity.js';
-import type { MusicOrchestrator } from './orchestrator.js';
-import type { TrackSeed } from './recommender.js';
+import type { RecommendationExclusions, TrackSeed } from './recommender.js';
 import { AutoplaySessionStore, type SessionEntry } from './session.js';
 
 /** Build a QueuedTrack the way autoplay's own resolver would — see `track()` in recommender.test.ts. */
@@ -30,56 +30,62 @@ function sessionEntryFor(track: QueuedTrack): SessionEntry {
   return { key: identity.key, identifier: track.identifier, artistKey: identity.artistKey };
 }
 
-type RecommendRequest = Parameters<MusicOrchestrator['recommend']>[0];
-type RecommendResult = Awaited<ReturnType<MusicOrchestrator['recommend']>>;
+interface GenerateCall {
+  readonly guildId: string;
+  readonly seeds: readonly TrackSeed[];
+  readonly count: number;
+  /** The exclusions the fake derived from the session, as the real planner does. */
+  readonly exclusions: RecommendationExclusions;
+}
 
 /**
- * A minimal fake standing in for the whole recommendation stack, honouring
- * just enough of the real `RecommendationService` contract for AutoplayEngine
- * to be exercised honestly: it removes anything in `request.exclusions`
- * before offering candidates, and — like the real reserve step — only serves
- * what the injected `reserve` callback actually grants.
+ * A minimal fake standing in for the planner, honouring just enough of the
+ * real contract for AutoplayEngine to be exercised honestly: it reads the
+ * session store's exclusions itself (that responsibility lives in the
+ * generator, not the engine), removes anything excluded before offering
+ * candidates, and — like the real reserve step — only serves what the
+ * session actually grants.
  */
-function makeFakeOrchestrator(
-  supply: (request: RecommendRequest) => readonly QueuedTrack[],
-): { orchestrator: MusicOrchestrator; calls: RecommendRequest[] } {
-  const calls: RecommendRequest[] = [];
+function makeFakeGenerator(
+  session: AutoplaySessionStore,
+  supply: (call: GenerateCall) => readonly QueuedTrack[],
+): { generator: AutoplayGenerator; calls: GenerateCall[] } {
+  const calls: GenerateCall[] = [];
 
-  const recommend = async (request: RecommendRequest): Promise<RecommendResult> => {
-    calls.push(request);
-    const offered = supply(request);
-    const exclusions = request.exclusions;
+  const generate = async (
+    guildId: string,
+    seeds: readonly TrackSeed[],
+    count: number,
+  ): Promise<readonly GeneratedTrack[]> => {
+    const snapshot = await session.snapshot(guildId);
+    const exclusions: RecommendationExclusions = {
+      trackKeys: new Set([
+        ...snapshot.recentKeys,
+        ...snapshot.queuedKeys,
+        ...snapshot.reservedKeys,
+      ]),
+      identifiers: new Set([...snapshot.recentIdentifiers, ...snapshot.queuedIdentifiers]),
+    };
+    const call: GenerateCall = { guildId, seeds, count, exclusions };
+    calls.push(call);
+
+    const offered = supply(call);
     const survivors = offered.filter((candidate) => {
       const key = trackKeyOf(candidate.author, candidate.title);
-      if (exclusions?.trackKeys.has(key) === true) return false;
-      if (exclusions?.identifiers.has(candidate.identifier) === true) return false;
+      if (exclusions.trackKeys.has(key)) return false;
+      if (exclusions.identifiers.has(candidate.identifier)) return false;
       return true;
     });
 
-    let granted = survivors;
-    if (request.reserve !== undefined) {
-      const keys = survivors.map((candidate) => trackKeyOf(candidate.author, candidate.title));
-      const grantedKeys = await request.reserve(keys);
-      granted = survivors.filter((candidate) =>
-        grantedKeys.has(trackKeyOf(candidate.author, candidate.title)),
-      );
-    }
-
-    const resolved = granted.map((candidate) => ({
-      track: candidate,
-      trackKey: trackKeyOf(candidate.author, candidate.title),
-    }));
-
-    return {
-      tracks: resolved.map((entry) => entry.track),
-      resolved,
-      blockedCount: offered.length - survivors.length,
-      strategies: ['fake'],
-      timings: {},
-    };
+    const keys = survivors.map((candidate) => trackKeyOf(candidate.author, candidate.title));
+    const grantedKeys = await session.reserve(guildId, keys);
+    return survivors
+      .filter((candidate) => grantedKeys.has(trackKeyOf(candidate.author, candidate.title)))
+      .slice(0, count)
+      .map((track) => ({ track, reservedKey: trackKeyOf(track.author, track.title) }));
   };
 
-  return { orchestrator: { recommend } as unknown as MusicOrchestrator, calls };
+  return { generator: { generate }, calls };
 }
 
 const seeds: readonly TrackSeed[] = [{ title: 'Seed Song', artist: 'Seed Artist' }];
@@ -100,8 +106,8 @@ describe('AutoplayEngine — no duplicate across consecutive takes', () => {
     const session = new AutoplaySessionStore();
     const trackA = queuedTrack('a1', 'Artist A', 'Song A');
     const trackB = queuedTrack('b1', 'Artist B', 'Song B');
-    const { orchestrator } = makeFakeOrchestrator(() => [trackA, trackB]);
-    const engine = new AutoplayEngine(orchestrator, session, { prefetchSize: 2 });
+    const { generator } = makeFakeGenerator(session, () => [trackA, trackB]);
+    const engine = new AutoplayEngine(generator, session, { prefetchSize: 2 });
 
     const first = await engine.take('guild', 2, seeds);
     expect(first.length).toBeGreaterThan(0);
@@ -122,8 +128,8 @@ describe('AutoplayEngine — exclusions passed to generation', () => {
     const session = new AutoplaySessionStore();
     const played = queuedTrack('x1', 'Artist X', 'Song X');
     const queued = queuedTrack('y1', 'Artist Y', 'Song Y');
-    const { orchestrator, calls } = makeFakeOrchestrator(() => []);
-    const engine = new AutoplayEngine(orchestrator, session, { prefetchSize: 2 });
+    const { generator, calls } = makeFakeGenerator(session, () => []);
+    const engine = new AutoplayEngine(generator, session, { prefetchSize: 2 });
 
     await session.recordPlayed('guild', sessionEntryFor(played));
     await session.syncQueue('guild', [sessionEntryFor(queued)]);
@@ -131,36 +137,30 @@ describe('AutoplayEngine — exclusions passed to generation', () => {
     await engine.take('guild', 2, seeds);
 
     const request = calls.at(-1);
-    expect(request?.exclusions?.trackKeys.has(trackKeyOf(played.author, played.title))).toBe(true);
-    expect(request?.exclusions?.trackKeys.has(trackKeyOf(queued.author, queued.title))).toBe(true);
+    expect(request?.exclusions.trackKeys.has(trackKeyOf(played.author, played.title))).toBe(true);
+    expect(request?.exclusions.trackKeys.has(trackKeyOf(queued.author, queued.title))).toBe(true);
   });
 });
 
 describe('AutoplayEngine — concurrent take + prefetch coalesce', () => {
-  it('invokes the recommender exactly once when a take races an in-flight prefetch', async () => {
+  it('invokes the generator exactly once when a take races an in-flight prefetch', async () => {
     const session = new AutoplaySessionStore();
     const trackA = queuedTrack('a1', 'Artist A', 'Song A');
     let invocations = 0;
     let releaseHang: (() => void) | undefined;
 
-    const orchestrator = {
-      recommend: (): Promise<RecommendResult> => {
+    const generator: AutoplayGenerator = {
+      generate: (): Promise<readonly GeneratedTrack[]> => {
         invocations += 1;
         return new Promise((resolve) => {
           releaseHang = () => {
-            resolve({
-              tracks: [trackA],
-              resolved: [{ track: trackA, trackKey: trackKeyOf(trackA.author, trackA.title) }],
-              blockedCount: 0,
-              strategies: ['fake'],
-              timings: {},
-            });
+            resolve([{ track: trackA, reservedKey: trackKeyOf(trackA.author, trackA.title) }]);
           };
         });
       },
-    } as unknown as MusicOrchestrator;
+    };
 
-    const engine = new AutoplayEngine(orchestrator, session, { prefetchSize: 1 });
+    const engine = new AutoplayEngine(generator, session, { prefetchSize: 1 });
 
     engine.prefetch('guild', seeds);
     const takePromise = engine.take('guild', 1, seeds);
@@ -183,8 +183,8 @@ describe('AutoplayEngine — buffer serves on matching seeds', () => {
     const trackA = queuedTrack('a1', 'Artist A', 'Song A');
     const trackB = queuedTrack('b1', 'Artist B', 'Song B');
     const trackC = queuedTrack('c1', 'Artist C', 'Song C');
-    const { orchestrator, calls } = makeFakeOrchestrator(() => [trackA, trackB, trackC]);
-    const engine = new AutoplayEngine(orchestrator, session, { prefetchSize: 3 });
+    const { generator, calls } = makeFakeGenerator(session, () => [trackA, trackB, trackC]);
+    const engine = new AutoplayEngine(generator, session, { prefetchSize: 3 });
 
     engine.prefetch('guild', seeds);
 
@@ -207,8 +207,8 @@ describe('AutoplayEngine — seed drift invalidates the buffer', () => {
     // an empty reservation set afterwards can only mean the S1 buffer's
     // reservation was actually released, not re-granted by a new pick.
     let offered: readonly QueuedTrack[] = [trackA];
-    const { orchestrator, calls } = makeFakeOrchestrator(() => offered);
-    const engine = new AutoplayEngine(orchestrator, session, { prefetchSize: 1 });
+    const { generator, calls } = makeFakeGenerator(session, () => offered);
+    const engine = new AutoplayEngine(generator, session, { prefetchSize: 1 });
     const seedS1: readonly TrackSeed[] = [{ title: 'Song S1', artist: 'Artist S1' }];
     const seedS2: readonly TrackSeed[] = [{ title: 'Song S2', artist: 'Artist S2' }];
 
@@ -235,8 +235,8 @@ describe('AutoplayEngine — seed drift invalidates the buffer', () => {
   it('releases buffered reservations directly via clear()', async () => {
     const session = new AutoplaySessionStore();
     const trackA = queuedTrack('a1', 'Artist A', 'Song A');
-    const { orchestrator, calls } = makeFakeOrchestrator(() => [trackA]);
-    const engine = new AutoplayEngine(orchestrator, session, { prefetchSize: 1 });
+    const { generator, calls } = makeFakeGenerator(session, () => [trackA]);
+    const engine = new AutoplayEngine(generator, session, { prefetchSize: 1 });
 
     engine.prefetch('guild', seeds);
     await waitUntil(() => calls.length >= 1);
@@ -251,13 +251,34 @@ describe('AutoplayEngine — seed drift invalidates the buffer', () => {
   });
 });
 
-describe('AutoplayEngine — generation failure', () => {
-  it('resolves to an empty array rather than throwing when the recommender rejects', async () => {
+describe('AutoplayEngine — evict', () => {
+  it('drops a disliked song from the buffer and releases its reservation, keeping the rest', async () => {
     const session = new AutoplaySessionStore();
-    const orchestrator = {
-      recommend: vi.fn().mockRejectedValue(new Error('recommend blew up')),
-    } as unknown as MusicOrchestrator;
-    const engine = new AutoplayEngine(orchestrator, session, { prefetchSize: 2 });
+    const trackA = queuedTrack('a1', 'Artist A', 'Song A');
+    const trackB = queuedTrack('b1', 'Artist B', 'Song B');
+    const { generator, calls } = makeFakeGenerator(session, () => [trackA, trackB]);
+    const engine = new AutoplayEngine(generator, session, { prefetchSize: 2 });
+
+    engine.prefetch('guild', seeds);
+    await waitUntil(() => calls.length >= 1);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    const keyA = trackKeyOf(trackA.author, trackA.title);
+    expect(engine.evict('guild', new Set([keyA]))).toBe(1);
+    expect((await session.snapshot('guild')).reservedKeys.has(keyA)).toBe(false);
+
+    const served = await engine.take('guild', 2, seeds);
+    expect(served.map((entry) => entry.identifier)).toEqual(['b1']);
+  });
+});
+
+describe('AutoplayEngine — generation failure', () => {
+  it('resolves to an empty array rather than throwing when the generator rejects', async () => {
+    const session = new AutoplaySessionStore();
+    const generator: AutoplayGenerator = {
+      generate: vi.fn().mockRejectedValue(new Error('generate blew up')),
+    };
+    const engine = new AutoplayEngine(generator, session, { prefetchSize: 2 });
 
     const served = await engine.take('guild', 2, seeds);
 
@@ -270,8 +291,8 @@ describe('AutoplayEngine — recordOutcome wiring', () => {
     const session = new AutoplaySessionStore();
     const trackA = queuedTrack('a1', 'Artist A', 'Song A');
     const trackB = queuedTrack('b1', 'Artist B', 'Song B');
-    const { orchestrator } = makeFakeOrchestrator(() => [trackA, trackB]);
-    const engine = new AutoplayEngine(orchestrator, session, { prefetchSize: 2 });
+    const { generator } = makeFakeGenerator(session, () => [trackA, trackB]);
+    const engine = new AutoplayEngine(generator, session, { prefetchSize: 2 });
 
     const served = await engine.take('guild', 2, seeds);
 

@@ -104,6 +104,7 @@ function controls(state: PlayerSnapshot | null, disabled: boolean) {
     new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(
       button('loop', '🔁'),
       button('favorite', '❤️'),
+      button('dislike', '👎'),
       button('queue', '📜'),
       button('lyrics', '🎵'),
       button(

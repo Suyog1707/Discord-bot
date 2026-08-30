@@ -123,7 +123,12 @@ export default defineEvent({
 
         // Informational buttons reply ephemerally instead of touching the
         // message they live on.
-        if (action === 'favorite' || action === 'queue' || action === 'lyrics') {
+        if (
+          action === 'favorite' ||
+          action === 'dislike' ||
+          action === 'queue' ||
+          action === 'lyrics'
+        ) {
           // Non-null by the guard above; narrowed once for the branches below.
           const current = player.queue.current;
           if (action === 'favorite') {
@@ -137,6 +142,29 @@ export default defineEvent({
                 ? `⭐ Saved **${current.title}** to your favorites.`
                 : `**${current.title}** is already in your favorites.`,
               flags: MessageFlags.Ephemeral,
+            });
+          } else if (action === 'dislike') {
+            // "Not like" is stronger than a skip: remembered, and the song
+            // is pulled from everywhere autoplay could bring it back from.
+            // A write plus a skip does not fit the three-second window.
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+            const music = client.music;
+            const persisted = await client.services.dislikes.add(
+              interaction.user.id,
+              interaction.user.username,
+              {
+                title: current.title,
+                author: current.author,
+                ...(current.sourceKey === undefined ? {} : { trackKey: current.sourceKey }),
+              },
+              'button',
+            );
+            music?.applyDislike(player.guildId, current);
+            await player.skip();
+            await interaction.editReply({
+              content: persisted
+                ? `👎 Won't recommend **${current.title}** again — skipped.`
+                : `**${current.title}** was already on your "not like" list — skipped.`,
             });
           } else if (action === 'queue') {
             const upcoming = player.queue.upcoming.slice(0, 10);

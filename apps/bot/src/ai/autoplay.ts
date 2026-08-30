@@ -21,9 +21,9 @@
 import { getLogger } from '../lib/logger.js';
 import type { QueuedTrack } from '../music/track.js';
 
+import type { AutoplayGenerator } from './autoplay-planner.js';
 import { trackKeyOf } from './identity.js';
 import { computeAutoplayMetrics } from './metrics.js';
-import { MusicOrchestrator } from './orchestrator.js';
 import type { TrackSeed } from './recommender.js';
 import type { AutoplaySessionStore } from './session.js';
 
@@ -54,7 +54,7 @@ export interface AutoplayOptions {
 }
 
 export class AutoplayEngine {
-  readonly #orchestrator: MusicOrchestrator;
+  readonly #generator: AutoplayGenerator;
   readonly #session: AutoplaySessionStore;
   readonly #options: AutoplayOptions;
 
@@ -67,12 +67,17 @@ export class AutoplayEngine {
    */
   readonly #inFlight = new Map<string, Promise<void>>();
 
+  /**
+   * @param generator - Whatever chooses the songs. In production this is the
+   *   `AutoplayPlanner` (known-pool + discovery slots); the engine itself only
+   *   knows how to buffer, gate and reserve what it is handed.
+   */
   constructor(
-    orchestrator: MusicOrchestrator,
+    generator: AutoplayGenerator,
     session: AutoplaySessionStore,
     options: AutoplayOptions,
   ) {
-    this.#orchestrator = orchestrator;
+    this.#generator = generator;
     this.#session = session;
     this.#options = options;
   }
@@ -163,10 +168,7 @@ export class AutoplayEngine {
         // through to the mix path with a silent empty result.
         const coalesced = this.#drain(guildId, count, seeds);
         if (coalesced.length > 0) {
-          logger.debug(
-            { guildId, served: coalesced.length, from: 'coalesced' },
-            'Autoplay served',
-          );
+          logger.debug({ guildId, served: coalesced.length, from: 'coalesced' }, 'Autoplay served');
           return coalesced;
         }
       }
@@ -198,6 +200,31 @@ export class AutoplayEngine {
     }
   }
 
+  /**
+   * Drop specific songs from a guild's buffer — an explicit dislike must not
+   * be served from a pick chosen a minute earlier. Reservations on the
+   * evicted keys are released so nothing keeps holding them.
+   */
+  evict(guildId: string, keys: ReadonlySet<string>): number {
+    const buffer = this.#buffers.get(guildId);
+    if (buffer === undefined || keys.size === 0) return 0;
+    const evicted = buffer.tracks.filter(
+      (entry) =>
+        keys.has(entry.reservedKey) || keys.has(trackKeyOf(entry.track.author, entry.track.title)),
+    );
+    if (evicted.length === 0) return 0;
+    const remaining = buffer.tracks.filter((entry) => !evicted.includes(entry));
+    if (remaining.length === 0) this.#buffers.delete(guildId);
+    else this.#buffers.set(guildId, { ...buffer, tracks: remaining });
+    void this.#session
+      .release(
+        guildId,
+        evicted.map((entry) => entry.reservedKey),
+      )
+      .catch(() => undefined);
+    return evicted.length;
+  }
+
   #drain(guildId: string, count: number, seeds: readonly TrackSeed[]): readonly QueuedTrack[] {
     const buffer = this.#buffers.get(guildId);
     if (buffer === undefined) return [];
@@ -207,8 +234,7 @@ export class AutoplayEngine {
     // (The original compared two differently-shaped seed lists for equality,
     // which never matched, so the buffer never served at all.)
     const stale =
-      Date.now() - buffer.generatedAt > BUFFER_TTL_MS ||
-      !seedWindowOf(seeds).has(buffer.seedKey);
+      Date.now() - buffer.generatedAt > BUFFER_TTL_MS || !seedWindowOf(seeds).has(buffer.seedKey);
     if (stale) {
       this.clear(guildId);
       return [];
@@ -243,9 +269,7 @@ export class AutoplayEngine {
       // generation pass and delete a live reservation.
       const existing = this.#buffers.get(guildId);
       const survivors =
-        existing !== undefined && seedWindowOf(seeds).has(existing.seedKey)
-          ? existing.tracks
-          : [];
+        existing !== undefined && seedWindowOf(seeds).has(existing.seedKey) ? existing.tracks : [];
       if (existing !== undefined && survivors.length === 0) {
         this.#buffers.delete(guildId);
         if (existing.tracks.length > 0) {
@@ -272,9 +296,8 @@ export class AutoplayEngine {
           // the buffer's validity (15 min), and resetting this clock on every
           // merge would let a survivor sit past its reservation, protected by
           // nothing.
-          generatedAt: survivors.length > 0 && existing !== undefined
-            ? existing.generatedAt
-            : Date.now(),
+          generatedAt:
+            survivors.length > 0 && existing !== undefined ? existing.generatedAt : Date.now(),
           seedKey: seedKeyOf(seeds),
         });
       }
@@ -287,61 +310,35 @@ export class AutoplayEngine {
     count: number,
     options: { readonly background: boolean },
   ): Promise<readonly BufferedTrack[]> {
-    const snapshot = await this.#session.snapshot(guildId);
+    // The generator reads the session itself — exclusions, reservations and
+    // the familiar/discovery rhythm all live there — and returns picks that
+    // are already reserved under `reservedKey`.
+    const generated = await this.#generator.generate(guildId, seeds, count, options);
 
-    // Everything the session knows about is a hard exclusion: playing/queued,
-    // reserved by another pass, or inside the recent-play cooldown window.
-    const exclusions = {
-      trackKeys: new Set([
-        ...snapshot.recentKeys,
-        ...snapshot.queuedKeys,
-        ...snapshot.reservedKeys,
-      ]),
-      identifiers: new Set([...snapshot.recentIdentifiers, ...snapshot.queuedIdentifiers]),
-    };
-
-    const result = await this.#orchestrator.recommend({
-      guildId,
-      seeds,
-      count,
-      // Autoplay continues a session; there is no sentence to parse, so the
-      // intent is synthesised. The only LLM involvement is the optional rerank
-      // pass, and only when this generation is running in the background.
-      intent: MusicOrchestrator.continuationIntent(count),
-      exclusions,
-      session: {
-        recentArtists: snapshot.recentArtists,
-        artistFatigue: snapshot.artistFatigue,
-      },
-      allowRerank: options.background,
-      reserve: (keys) => this.#session.reserve(guildId, keys),
-      release: (keys) => this.#session.release(guildId, keys),
-    });
-
-    if (result.resolved.length > 0) {
+    if (generated.length > 0) {
       void this.#session
-        .recordOutcome(guildId, 'recommended', result.resolved.length)
-        .catch(() => undefined);
-    }
-    if (result.blockedCount > 0) {
-      void this.#session
-        .recordOutcome(guildId, 'duplicatesBlocked', result.blockedCount)
+        .recordOutcome(guildId, 'recommended', generated.length)
         .catch(() => undefined);
     }
 
     // Quality is measured, not asserted: one structured line per generation
     // pass, so a regression shows up in the logs before it shows up in a
     // complaint.
-    logger.debug(
-      {
-        event: 'AUTOPLAY_METRICS',
-        guildId,
-        ...computeAutoplayMetrics(snapshot.outcomes, snapshot.recentArtists),
-      },
-      'Autoplay quality metrics',
-    );
+    try {
+      const snapshot = await this.#session.snapshot(guildId);
+      logger.debug(
+        {
+          event: 'AUTOPLAY_METRICS',
+          guildId,
+          ...computeAutoplayMetrics(snapshot.outcomes, snapshot.recentArtists),
+        },
+        'Autoplay quality metrics',
+      );
+    } catch {
+      // Metrics are observability, never a reason to fail a generation.
+    }
 
-    return result.resolved.map((entry) => ({ track: entry.track, reservedKey: entry.trackKey }));
+    return generated.map((entry) => ({ track: entry.track, reservedKey: entry.reservedKey }));
   }
 }
 

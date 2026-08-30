@@ -21,6 +21,7 @@ export { Prisma, PrismaClient } from '@prisma/client';
 
 export type {
   Account,
+  DislikedTrack,
   FavoriteTrack,
   Guild,
   GuildMember,

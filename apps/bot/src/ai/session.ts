@@ -22,6 +22,8 @@ import type { Redis } from '@discord-music/shared/redis';
 
 import { getLogger } from '../lib/logger.js';
 
+import type { AutoplayKind } from './interleave.js';
+
 const logger = getLogger('ai-session');
 
 const SESSION_PREFIX = 'autoplay:sess:';
@@ -39,9 +41,25 @@ const DEFAULT_RESERVATION_TTL_SECONDS = 20 * 60;
 
 /** Bounded so a long-running, many-guild bot cannot leak memory. */
 const MAX_GUILD_SESSIONS = 500;
+/** Session dislikes kept per guild; the durable record has no such cap. */
+const MAX_SESSION_DISLIKES = 500;
 
 /** Half-life-shaped decay: how many "recent plays back" still counts as fatigue. */
 const FATIGUE_TAU = 6;
+
+/**
+ * How many listeners the snapshot reports. Personalisation blends a profile per
+ * listener, and past a handful the blend is indistinguishable from the guild's
+ * own taste while the query cost keeps climbing.
+ */
+const MAX_LISTENERS = 5;
+
+/**
+ * Requester ids that identify nobody: `''` is "unknown", `'0'` is what a
+ * restored queue and the autoplay requester itself carry. Treating either as a
+ * listener would personalise the room around a placeholder.
+ */
+const ANONYMOUS_REQUESTERS: ReadonlySet<string> = new Set(['', '0']);
 
 export interface SessionEntry {
   readonly key: string; // canonical track key
@@ -55,6 +73,33 @@ export interface SessionEntry {
    * matches the YouTube-vocabulary key the queue recorded.
    */
   readonly altKey?: string;
+  /**
+   * How the track entered the queue. Absent on entries written before this
+   * field existed (and by any caller that does not care), which is why every
+   * consumer below treats "no origin" as "not a signal" rather than as 'user'.
+   */
+  readonly origin?: 'user' | 'autoplay';
+  /**
+   * Which half of the autoplay cadence this pick filled. Only autoplay entries
+   * carry it, and it is the ONLY record of the familiar/discovery rhythm that
+   * survives a batch boundary — the planner generates two tracks at a time and
+   * would otherwise restart its run counter every second song.
+   */
+  readonly kind?: AutoplayKind;
+  /**
+   * Discord id of whoever asked for this track. Autoplay is personalised
+   * around the people currently in the room, and the queue is the only place
+   * that knows who they are — `SongHistory.userId` is null for anyone who has
+   * never touched favourites or playlists.
+   */
+  readonly requestedById?: string;
+  /**
+   * When the track started, epoch ms. Stamped by `recordPlayed`. This is
+   * what turns the recent ring from a permanent ban into a cooldown: a song
+   * from three hours ago may come back, one from ten minutes ago may not,
+   * and without a clock the two are indistinguishable.
+   */
+  readonly playedAt?: number;
 }
 
 /** Both keys an entry is known under. */
@@ -79,11 +124,40 @@ export interface SessionSnapshot {
   readonly recentIdentifiers: readonly string[];
   /** Artist keys of recent plays, newest first, repeats preserved. */
   readonly recentArtists: readonly string[];
+  /**
+   * The recent ring itself, newest first, timestamps included. The planner
+   * applies its repeat cooldown to this — by position and by age — rather
+   * than treating every key in `recentKeys` as excluded forever.
+   */
+  readonly recentEntries: readonly SessionEntry[];
+  /**
+   * Canonical keys the room has explicitly disliked this session. Mirrors
+   * the persistent store so a dislike takes effect on the very next
+   * generation pass, before any database read.
+   */
+  readonly dislikedKeys: ReadonlySet<string>;
   readonly queuedKeys: ReadonlySet<string>;
   readonly queuedIdentifiers: ReadonlySet<string>;
   readonly reservedKeys: ReadonlySet<string>;
   /** artistKey -> fatigue 0..1 (1 = just played repeatedly). */
   readonly artistFatigue: ReadonlyMap<string, number>;
+  /**
+   * The familiar/discovery rhythm as the listener will experience it, newest
+   * first — which is NOT the order the entries are stored in. Queued autoplay
+   * picks come first, reversed, because the last one queued is the furthest
+   * from the speaker and therefore the most recent decision the planner made;
+   * recent plays follow, already newest-first. Reading them in this order is
+   * what lets a run of familiars continue across generation batches instead of
+   * resetting every two tracks.
+   */
+  readonly recentAutoplayKinds: readonly AutoplayKind[];
+  /**
+   * Distinct Discord ids of the people whose requests are in this session,
+   * most recently heard first, capped at {@link MAX_LISTENERS}. This is the
+   * answer to "who is this radio for" — without it, personalisation has only
+   * the guild's aggregate taste to work from.
+   */
+  readonly listenerIds: readonly string[];
   readonly outcomes: SessionOutcomes;
 }
 
@@ -106,6 +180,8 @@ export interface SessionStoreOptions {
 interface GuildSession {
   recent: SessionEntry[];
   queued: SessionEntry[];
+  /** Canonical keys disliked this session. Persisted separately in the DB. */
+  disliked: Set<string>;
   /** trackKey -> expiry timestamp (ms), pruned lazily. */
   reservations: Map<string, number>;
   outcomes: SessionOutcomes;
@@ -129,6 +205,10 @@ function outcomesKey(guildId: string): string {
   return `${SESSION_PREFIX}${guildId}:outcomes`;
 }
 
+function dislikedKey(guildId: string): string {
+  return `${SESSION_PREFIX}${guildId}:disliked`;
+}
+
 function reservationKey(guildId: string, trackKey: string): string {
   return `${RESERVATION_PREFIX}${guildId}:${trackKey}`;
 }
@@ -147,7 +227,9 @@ function clamp01(value: number): number {
  * recently" outrank "once, ten tracks ago" (≈0.19) even though both are a
  * single occurrence away from a clamp ceiling.
  */
-export function computeArtistFatigue(recentArtists: readonly string[]): ReadonlyMap<string, number> {
+export function computeArtistFatigue(
+  recentArtists: readonly string[],
+): ReadonlyMap<string, number> {
   const fatigue = new Map<string, number>();
   recentArtists.forEach((artist, index) => {
     const contribution = Math.exp(-index / FATIGUE_TAU);
@@ -155,6 +237,56 @@ export function computeArtistFatigue(recentArtists: readonly string[]): Readonly
   });
   for (const [artist, value] of fatigue) fatigue.set(artist, clamp01(value));
   return fatigue;
+}
+
+/**
+ * The autoplay cadence, newest decision first.
+ *
+ * `queued` is in play order, so the pick made LAST sits at the end of it — the
+ * reverse of what "newest first" means. Recent plays are already newest first
+ * and simply follow. Entries with no `kind` (user requests, and anything
+ * written before the field existed) are not part of the rhythm at all.
+ */
+function autoplayKindsOf(
+  recent: readonly SessionEntry[],
+  queued: readonly SessionEntry[],
+): readonly AutoplayKind[] {
+  const kindOf = (entry: SessionEntry): AutoplayKind | undefined => entry.kind;
+  // The playing track is BOTH the head of `recent` (it started) and the head
+  // of `queued` (the queue mirror includes the current track). Counted twice
+  // it would advance the cadence a beat early, so the recent ring wins and
+  // any queued entry it already covers is dropped.
+  const covered = new Set(recent.flatMap(keysOf));
+  const queuedKinds = [...queued]
+    .reverse()
+    .filter((entry) => !keysOf(entry).some((key) => covered.has(key)))
+    .map(kindOf);
+  return [...queuedKinds, ...recent.map(kindOf)].filter(
+    (kind): kind is AutoplayKind => kind !== undefined,
+  );
+}
+
+/**
+ * Who this session belongs to: the requesters of user-origin entries, most
+ * recently heard first. Recent plays lead because someone who just heard their
+ * request is more certainly still listening than someone whose track is still
+ * waiting in the queue — though both count.
+ */
+function listenersOf(
+  recent: readonly SessionEntry[],
+  queued: readonly SessionEntry[],
+): readonly string[] {
+  const listeners: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of [...recent, ...queued]) {
+    const id = entry.requestedById;
+    if (entry.origin !== 'user' || id === undefined) continue;
+    if (ANONYMOUS_REQUESTERS.has(id) || seen.has(id)) continue;
+    seen.add(id);
+    listeners.push(id);
+    if (listeners.length >= MAX_LISTENERS) break;
+  }
+  return listeners;
 }
 
 function parseOutcomes(raw: Record<string, string>): SessionOutcomes {
@@ -218,8 +350,85 @@ export class AutoplaySessionStore {
       queuedIdentifiers: identifiers,
       reservedKeys: new Set(session.reservations.keys()),
       artistFatigue: computeArtistFatigue(recent.map((entry) => entry.artistKey)),
+      recentEntries: recent,
+      dislikedKeys: await this.#readDisliked(guildId, session),
+      recentAutoplayKinds: autoplayKindsOf(recent, queued),
+      listenerIds: listenersOf(recent, queued),
       outcomes,
     };
+  }
+
+  /**
+   * Note an explicit dislike for this guild's session.
+   *
+   * The durable record lives in the database; this mirror exists so the
+   * exclusion applies on the very next generation pass and so a buffered
+   * pick for the same song is recognised without a query. Reservations on
+   * the keys are dropped too: nothing should be holding a disliked song.
+   */
+  async recordDisliked(guildId: string, keys: readonly string[]): Promise<void> {
+    const session = this.#touch(guildId);
+    // Guild-wide on purpose: the room shares one queue, so one listener's
+    // "not like" keeps the song out for everyone present this session — the
+    // durable per-user record is what carries it into other rooms. Bounded
+    // like the recent ring; a session that dislikes hundreds of songs keeps
+    // the newest.
+    for (const key of keys) {
+      session.disliked.add(key);
+      session.reservations.delete(key);
+    }
+    while (session.disliked.size > MAX_SESSION_DISLIKES) {
+      const oldest = session.disliked.values().next();
+      if (oldest.done === true) break;
+      session.disliked.delete(oldest.value);
+    }
+
+    if (this.#redis === undefined || keys.length === 0) return;
+
+    try {
+      const pipeline = this.#redis.multi();
+      pipeline.sadd(dislikedKey(guildId), ...keys);
+      pipeline.expire(dislikedKey(guildId), this.#ttlSeconds);
+      for (const key of keys) pipeline.del(reservationKey(guildId, key));
+      await pipeline.exec();
+    } catch (error) {
+      this.#redisErrors += 1;
+      logger.debug(
+        { err: error, guildId },
+        'Recording dislike in Redis failed; memory tier still holds it',
+      );
+    }
+  }
+
+  /** A forgiven song: `/dislike remove` must take effect this session, not after the TTL. */
+  async forgetDisliked(guildId: string, keys: readonly string[]): Promise<void> {
+    const session = this.#touch(guildId);
+    for (const key of keys) session.disliked.delete(key);
+
+    if (this.#redis === undefined || keys.length === 0) return;
+
+    try {
+      await this.#redis.srem(dislikedKey(guildId), ...keys);
+    } catch (error) {
+      this.#redisErrors += 1;
+      logger.debug(
+        { err: error, guildId },
+        'Forgetting dislike in Redis failed; memory already cleared',
+      );
+    }
+  }
+
+  async #readDisliked(guildId: string, session: GuildSession): Promise<ReadonlySet<string>> {
+    if (this.#redis === undefined) return new Set(session.disliked);
+
+    try {
+      const raw = await this.#redis.smembers(dislikedKey(guildId));
+      for (const key of raw) session.disliked.add(key);
+    } catch (error) {
+      this.#redisErrors += 1;
+      logger.debug({ err: error, guildId }, 'Reading dislikes from Redis failed; using memory');
+    }
+    return new Set(session.disliked);
   }
 
   /**
@@ -275,7 +484,10 @@ export class AutoplaySessionStore {
       }
     } catch (error) {
       this.#redisErrors += 1;
-      logger.debug({ err: error, guildId }, 'Reservation sync to Redis failed; memory grant stands');
+      logger.debug(
+        { err: error, guildId },
+        'Reservation sync to Redis failed; memory grant stands',
+      );
     }
 
     return granted;
@@ -291,7 +503,10 @@ export class AutoplaySessionStore {
       await this.#redis.del(...keys.map((key) => reservationKey(guildId, key)));
     } catch (error) {
       this.#redisErrors += 1;
-      logger.debug({ err: error, guildId }, 'Reservation release in Redis failed; memory already cleared');
+      logger.debug(
+        { err: error, guildId },
+        'Reservation release in Redis failed; memory already cleared',
+      );
     }
   }
 
@@ -303,10 +518,18 @@ export class AutoplaySessionStore {
     if (this.#redis === undefined) return;
 
     try {
-      await this.#redis.set(queuedKey(guildId), JSON.stringify(session.queued), 'EX', this.#ttlSeconds);
+      await this.#redis.set(
+        queuedKey(guildId),
+        JSON.stringify(session.queued),
+        'EX',
+        this.#ttlSeconds,
+      );
     } catch (error) {
       this.#redisErrors += 1;
-      logger.debug({ err: error, guildId }, 'Queue sync to Redis failed; memory tier still holds it');
+      logger.debug(
+        { err: error, guildId },
+        'Queue sync to Redis failed; memory tier still holds it',
+      );
     }
   }
 
@@ -314,7 +537,9 @@ export class AutoplaySessionStore {
   async recordPlayed(guildId: string, entry: SessionEntry): Promise<void> {
     const session = this.#touch(guildId);
     const entryKeys = new Set(keysOf(entry));
-    session.recent = [entry, ...session.recent].slice(0, this.#recentLimit);
+    const stamped: SessionEntry =
+      entry.playedAt === undefined ? { ...entry, playedAt: this.#now() } : entry;
+    session.recent = [stamped, ...session.recent].slice(0, this.#recentLimit);
     session.queued = session.queued.filter(
       (queuedEntry) => !keysOf(queuedEntry).some((key) => entryKeys.has(key)),
     );
@@ -324,14 +549,17 @@ export class AutoplaySessionStore {
 
     try {
       const pipeline = this.#redis.multi();
-      pipeline.lpush(recentKey(guildId), JSON.stringify(entry));
+      pipeline.lpush(recentKey(guildId), JSON.stringify(stamped));
       pipeline.ltrim(recentKey(guildId), 0, this.#recentLimit - 1);
       pipeline.expire(recentKey(guildId), this.#ttlSeconds);
       for (const key of entryKeys) pipeline.del(reservationKey(guildId, key));
       await pipeline.exec();
     } catch (error) {
       this.#redisErrors += 1;
-      logger.debug({ err: error, guildId }, 'Recording played track in Redis failed; memory tier still holds it');
+      logger.debug(
+        { err: error, guildId },
+        'Recording played track in Redis failed; memory tier still holds it',
+      );
     }
   }
 
@@ -348,7 +576,10 @@ export class AutoplaySessionStore {
       await pipeline.exec();
     } catch (error) {
       this.#redisErrors += 1;
-      logger.debug({ err: error, guildId }, 'Recording outcome in Redis failed; memory tier still holds it');
+      logger.debug(
+        { err: error, guildId },
+        'Recording outcome in Redis failed; memory tier still holds it',
+      );
     }
   }
 
@@ -361,10 +592,18 @@ export class AutoplaySessionStore {
       // Reservation keys are not tracked here — they are short-lived (10 min
       // default) and self-expire, and clearing a guild that just finished a
       // session is not on a path where a stale reservation matters.
-      await this.#redis.del(recentKey(guildId), queuedKey(guildId), outcomesKey(guildId));
+      await this.#redis.del(
+        recentKey(guildId),
+        queuedKey(guildId),
+        outcomesKey(guildId),
+        dislikedKey(guildId),
+      );
     } catch (error) {
       this.#redisErrors += 1;
-      logger.debug({ err: error, guildId }, 'Clearing session in Redis failed; memory tier already cleared');
+      logger.debug(
+        { err: error, guildId },
+        'Clearing session in Redis failed; memory tier already cleared',
+      );
     }
   }
 
@@ -383,7 +622,10 @@ export class AutoplaySessionStore {
       return entries;
     } catch (error) {
       this.#redisErrors += 1;
-      logger.debug({ err: error, guildId }, 'Reading recent tracks from Redis failed; using memory');
+      logger.debug(
+        { err: error, guildId },
+        'Reading recent tracks from Redis failed; using memory',
+      );
       return session.recent;
     }
   }
@@ -399,7 +641,10 @@ export class AutoplaySessionStore {
       return entries;
     } catch (error) {
       this.#redisErrors += 1;
-      logger.debug({ err: error, guildId }, 'Reading queued tracks from Redis failed; using memory');
+      logger.debug(
+        { err: error, guildId },
+        'Reading queued tracks from Redis failed; using memory',
+      );
       return session.queued;
     }
   }
@@ -432,7 +677,14 @@ export class AutoplaySessionStore {
 
     let session = this.#sessions.get(guildId);
     if (session === undefined) {
-      session = { recent: [], queued: [], reservations: new Map(), outcomes: emptyOutcomes(), touchedAt: now };
+      session = {
+        recent: [],
+        queued: [],
+        disliked: new Set(),
+        reservations: new Map(),
+        outcomes: emptyOutcomes(),
+        touchedAt: now,
+      };
     } else {
       this.#sessions.delete(guildId);
     }

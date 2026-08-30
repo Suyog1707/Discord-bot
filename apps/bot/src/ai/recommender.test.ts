@@ -795,3 +795,98 @@ describe('RecommendationService — rerank safety', () => {
     }
   });
 });
+
+describe('RecommendationService — rank()', () => {
+  // The seam the autoplay planner needs: it interleaves these candidates with
+  // a familiar pool of its own and picks slot by slot, so resolving here would
+  // spend Lavalink searches on songs it was never going to queue.
+  it('returns scored candidates in order without resolving anything', async () => {
+    const { service } = fakeLastFm();
+    const recommender = new RecommendationService(service, new CacheService());
+    const resolve = vi.fn(trackingResolver().resolve);
+
+    const result = await recommender.rank({ ...baseRequest, count: 10 });
+
+    expect(resolve).not.toHaveBeenCalled();
+    expect(result.ranked.length).toBeGreaterThan(10);
+    // The shortlist is a slice of the pool, never larger than it.
+    expect(result.candidateCount).toBeGreaterThanOrEqual(result.ranked.length);
+    expect(result.strategies).toContain('similar-tracks');
+    expect(result.reranked).toBe(false);
+    for (const key of ['candidateMs', 'enrichMs', 'scoreMs'] as const) {
+      expect(result.timings[key]).toBeGreaterThanOrEqual(0);
+    }
+
+    const scores = result.ranked.map((entry) => entry.breakdown.final);
+    expect([...scores].sort((a, b) => b - a)).toEqual(scores);
+  });
+
+  it('reports an empty ranking rather than failing when there is no discovery source', async () => {
+    const disabled = { enabled: false } as unknown as LastFmService;
+    const recommender = new RecommendationService(disabled, new CacheService());
+
+    const result = await recommender.rank({ ...baseRequest, count: 10 });
+
+    expect(result.ranked).toEqual([]);
+    expect(result.candidateCount).toBe(0);
+    expect(result.strategies).toContain('lastfm-disabled');
+  });
+});
+
+describe('RecommendationService — knownKeys novelty filter', () => {
+  // `knownKeys` is not an exclusion: it says "the caller can already offer
+  // this one", so discovery has to be something the room does NOT have. The
+  // history origin is exempt, because being known is why it was supplied.
+  it('drops a similar-track candidate the caller already knows, but keeps a known history candidate', async () => {
+    const service = fakeLastFmReturning([
+      { name: 'Known Song', artist: 'Known Artist', match: 1 },
+      ...Array.from({ length: 20 }, (_unused, index) => ({
+        name: `Filler ${String(index)}`,
+        artist: `Filler Artist ${String(index)}`,
+        match: 0.5 - index / 100,
+      })),
+    ]);
+    const recommender = new RecommendationService(service, new CacheService());
+
+    const result = await recommender.rank({
+      seeds: [{ title: 'Seed Song', artist: 'Seed Artist' }],
+      count: 5,
+      profile: EMPTY_TASTE_PROFILE,
+      recent: EMPTY_RECENT_CONTEXT,
+      historyCandidates: [
+        { title: 'History Song', artist: 'History Artist', identifier: 'hist-1' },
+      ],
+      knownKeys: new Set([
+        trackKeyOf('Known Artist', 'Known Song'),
+        trackKeyOf('History Artist', 'History Song'),
+      ]),
+    });
+
+    const titles = result.ranked.map((entry) => entry.candidate.title);
+    expect(titles).not.toContain('Known Song');
+    expect(titles).toContain('History Song');
+    expect(result.excludedCount).toBeGreaterThan(0);
+  });
+
+  it('changes nothing when no knownKeys are supplied', async () => {
+    const service = fakeLastFmReturning([
+      { name: 'Known Song', artist: 'Known Artist', match: 1 },
+      ...Array.from({ length: 20 }, (_unused, index) => ({
+        name: `Filler ${String(index)}`,
+        artist: `Filler Artist ${String(index)}`,
+        match: 0.5 - index / 100,
+      })),
+    ]);
+    const recommender = new RecommendationService(service, new CacheService());
+
+    const result = await recommender.rank({
+      seeds: [{ title: 'Seed Song', artist: 'Seed Artist' }],
+      count: 5,
+      profile: EMPTY_TASTE_PROFILE,
+      recent: EMPTY_RECENT_CONTEXT,
+    });
+
+    expect(result.ranked.map((entry) => entry.candidate.title)).toContain('Known Song');
+    expect(result.excludedCount).toBe(0);
+  });
+});

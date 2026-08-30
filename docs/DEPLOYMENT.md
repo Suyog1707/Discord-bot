@@ -37,8 +37,9 @@ Targets: Web → Vercel · Bot + Lavalink → VPS · PostgreSQL → managed · R
 
 7. **Recommendations (optional)** — `GROQ_API_KEY` enables natural-language
    `/ask` parsing (without it a keyword parser handles it), and
-   `LASTFM_API_KEY` enables the similarity graph that autoplay and `/ask` draw
-   candidates from (without it autoplay falls back to YouTube mixes, unchanged).
+   `LASTFM_API_KEY` enables the similarity graph that autoplay's _discovery_
+   slots and `/ask` draw candidates from (without it autoplay still plays the
+   listener's own library, playlists and history, just with no discoveries).
    MusicBrainz needs no key and supplies canonical artist identity plus the tags
    that drive language matching; `MUSICBRAINZ_ENABLED=false` is a kill switch
    for its one-request-per-second limit. None of these are required to play

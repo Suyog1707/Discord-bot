@@ -65,6 +65,7 @@ model User {
   queueTracks   QueueTrack[]
   songHistory   SongHistory[]
   favorites     FavoriteTrack[]
+  dislikes      DislikedTrack[]
   spotify       SpotifyAccount?
   tasteProfile  TasteProfile?
 
@@ -384,6 +385,29 @@ model FavoriteTrack {
   @@unique([userId, identifier])
   @@index([userId, createdAt])
   @@map("favorite_tracks")
+}
+
+/// A song a user explicitly does not want recommended again. Keyed by the
+/// canonical track identity, not a provider id — the same recording must stay
+/// disliked whichever provider ends up streaming it.
+model DislikedTrack {
+  id        String   @id @default(cuid())
+  userId    String
+  /// `identityOf(author, title).key` — see apps/bot/src/ai/identity.ts.
+  trackKey  String
+  isrc      String?
+  title     String
+  author    String
+  /// Where the dislike was expressed: "button" | "command" | "dashboard".
+  source    String   @default("command")
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, trackKey])
+  @@index([userId])
+  @@index([isrc])
+  @@map("disliked_tracks")
 }
 
 /// Append-only playback log powering the Analytics feature.

@@ -313,6 +313,39 @@ export const botEnvSchema = requireInProduction(
        * large buffer would lock in picks made before that feedback existed.
        */
       AUTOPLAY_PREFETCH_SIZE: z.coerce.number().int().min(1).max(50).default(2),
+      /**
+       * How many familiar songs autoplay plays between discoveries.
+       *
+       * A range rather than a fixed number on purpose: the planner picks the
+       * high end when the listener's own pool (library, playlists, history)
+       * is deep, and the low end when it is thin, so the radio adapts instead
+       * of marching to a fixed "two known, one new" beat. MIN is clamped to
+       * MAX at read time if an operator inverts them.
+       */
+      AUTOPLAY_FAMILIAR_RUN_MIN: z.coerce.number().int().min(1).max(6).default(2),
+      AUTOPLAY_FAMILIAR_RUN_MAX: z.coerce.number().int().min(1).max(8).default(3),
+      /**
+       * Whether autoplay introduces discoveries at all. Off means the radio
+       * only ever replays what the room already knows — useful for a guild
+       * that wants a jukebox, not a recommender.
+       */
+      AUTOPLAY_DISCOVERY_ENABLED: booleanish.default(true),
+      /**
+       * Queue refill: autoplay tops the queue up BEFORE it drains. When the
+       * upcoming count falls to the low-water mark a refill starts, and it
+       * fills back up to the target. Small numbers on purpose: every pick
+       * beyond the target was chosen before the feedback that could have
+       * changed it.
+       */
+      AUTOPLAY_LOW_WATER_MARK: z.coerce.number().int().min(1).max(10).default(2),
+      AUTOPLAY_TARGET_QUEUE_SIZE: z.coerce.number().int().min(2).max(20).default(4),
+      /**
+       * How long a song rests before autoplay may bring it back. This is the
+       * "intelligent repetition" knob: a favourite from three hours ago is a
+       * welcome return, one from ten minutes ago is a bug. Halved (never
+       * below 30 minutes) only when the pool would otherwise be empty.
+       */
+      AUTOPLAY_REPEAT_COOLDOWN_MINUTES: z.coerce.number().int().min(15).max(1440).default(180),
     }),
   ['REDIS_URL', 'LAVALINK_HOST', 'LAVALINK_PASSWORD'],
 );

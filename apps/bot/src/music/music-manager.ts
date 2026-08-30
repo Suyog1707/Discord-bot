@@ -29,7 +29,9 @@ import {
 } from 'shoukaku';
 
 import { selectAutoplaySeeds, type AnchorHistoryEntry } from '../ai/anchors.js';
+import type { AutoplayPlanner } from '../ai/autoplay-planner.js';
 import type { AutoplayEngine } from '../ai/autoplay.js';
+import type { FamiliarCandidate } from '../ai/familiar-scoring.js';
 import { identityOf } from '../ai/identity.js';
 import type { MusicOrchestrator } from '../ai/orchestrator.js';
 import type { TrackSeed } from '../ai/recommender.js';
@@ -60,11 +62,7 @@ import {
 } from './candidate-matcher.js';
 import { AUTOPLAY_WEIGHTS } from './match-config.js';
 import { identifyCanonicalTrack } from './metadata-providers.js';
-import {
-  resolvePlayback,
-  ResolutionCache,
-  type ResolvedPlayback,
-} from './playback-resolver.js';
+import { resolvePlayback, ResolutionCache, type ResolvedPlayback } from './playback-resolver.js';
 import { getResolutionSettings } from './resolution-settings.js';
 import type { SpotifyTrackMeta } from './spotify-resolver.js';
 import type { QueueStore } from './queue-store.js';
@@ -92,6 +90,8 @@ const PROBE_TIMEOUT_MS = 2_000;
  * next generation reads.
  */
 const AUTOPLAY_PICK_TARGET = 2;
+/** Ceiling on one refill request, whatever the caller asks for. */
+const AUTOPLAY_MAX_PICKS = 10;
 
 export interface ResolveResult {
   readonly tracks: readonly QueuedTrack[];
@@ -467,11 +467,13 @@ export class MusicManager {
       idleTimeoutSeconds: settings.leaveOnEmptyAfter,
       stayConnected: settings.stayConnected,
       autoplayEnabled: settings.autoplayEnabled,
+      autoplayLowWaterMark: getEnv().AUTOPLAY_LOW_WATER_MARK,
+      autoplayTargetQueueSize: getEnv().AUTOPLAY_TARGET_QUEUE_SIZE,
       onSelfDestruct: async (guildId, reason) => {
         logger.info({ guildId, reason }, 'Player self-destructing');
         await this.destroyPlayer(guildId);
       },
-      onAutoplayRequest: (guildId) => this.pickAutoplayTracks(guildId),
+      onAutoplayRequest: (guildId, count) => this.pickAutoplayTracks(guildId, count),
       // A track actually started: this is the moment it becomes "recently
       // played" in the session ledger (recommended ≠ played — only real
       // playback events move this state), and the moment to warm the buffer
@@ -588,7 +590,8 @@ export class MusicManager {
       title: track.title,
       artist: track.author,
       durationMs: track.durationMs,
-      provider: track.source === 'youtube' || track.source === 'soundcloud' ? 'query' : track.source,
+      provider:
+        track.source === 'youtube' || track.source === 'soundcloud' ? 'query' : track.source,
       url: track.uri,
       artworkUrl: track.artworkUrl,
     });
@@ -637,10 +640,21 @@ export class MusicManager {
    * orchestrator the resolver it needs, which is the only direction the
    * dependency runs in — the AI layer never imports the player.
    */
-  attachAutoplay(engine: AutoplayEngine, orchestrator: MusicOrchestrator): void {
+  attachAutoplay(
+    engine: AutoplayEngine,
+    orchestrator: MusicOrchestrator,
+    planner?: AutoplayPlanner,
+  ): void {
     this.#autoplay = engine;
     this.#autoplaySession = engine.session;
     orchestrator.setResolver(async (candidate) => this.resolveCandidate(candidate));
+    // The planner chooses canonical songs; this is where they become audio.
+    // Two resolvers because the planner's two pools carry different evidence:
+    // a known song has a runtime and a catalogue URL, a discovery has a name.
+    planner?.setResolvers({
+      resolveKnown: async (candidate) => this.resolveKnown(candidate),
+      resolveDiscovery: async (candidate) => this.resolveCandidate(candidate),
+    });
   }
 
   /** A queue/history track as the session store sees it. */
@@ -649,12 +663,31 @@ export class MusicManager {
     readonly author: string;
     readonly identifier: string;
     readonly sourceKey?: string;
+    readonly requestedById?: string;
+    readonly requestedByName?: string;
+    readonly origin?: QueuedTrack['origin'];
+    readonly autoplayKind?: QueuedTrack['autoplayKind'];
   }): SessionEntry {
     const identity = identityOf(track.author, track.title);
+    const origin =
+      track.requestedByName === undefined
+        ? undefined
+        : trackOrigin({
+            requestedByName: track.requestedByName,
+            ...(track.origin === undefined ? {} : { origin: track.origin }),
+          });
     return {
       key: identity.key,
       identifier: track.identifier,
       artistKey: identity.artistKey,
+      // Who put it on and, for autoplay's own picks, which pool it came from.
+      // The planner reads these back to continue the familiar/discovery
+      // rhythm across batches and to know whose library to draw from.
+      ...(origin === undefined ? {} : { origin }),
+      ...(track.autoplayKind === undefined ? {} : { kind: track.autoplayKind }),
+      ...(origin === 'user' && track.requestedById !== undefined
+        ? { requestedById: track.requestedById }
+        : {}),
       // A recommended track is known under two spellings: the YouTube upload
       // (computed above) and the Last.fm candidate it was picked as. Session
       // state carries both so the exclusion layer matches either vocabulary.
@@ -697,11 +730,12 @@ export class MusicManager {
    *     nothing more, so the single largest positive signal is unavailable and
    *     every score lands correspondingly lower. `AUTOPLAY_WEIGHTS` moves the
    *     threshold with it; the vetoes and filters are unchanged.
-   *   - **YouTube, not the SoundCloud-first order.** The mix-based autoplay
-   *     fallback in `pickAutoplayTracks` seeds from YouTube video ids carried
-   *     on played tracks, so resolving recommendations elsewhere would quietly
-   *     starve it. Recommendations are also generated from a YouTube-shaped
-   *     vocabulary to begin with.
+   *   - **The same provider order as a user request.** SoundCloud first,
+   *     YouTube as the fallback, HTTP untouched. The recommendation engine
+   *     never names a provider; it hands over a song and this decides where
+   *     the audio comes from. (This once pinned YouTube so the mix fallback
+   *     had video ids to seed from; that fallback is the last resort now and
+   *     not worth playing every recommendation from the noisier catalogue.)
    */
   async resolveCandidate(candidate: {
     readonly title: string;
@@ -721,7 +755,7 @@ export class MusicManager {
     });
 
     const resolved = await resolvePlayback<LavalinkCandidate>(wanted, this.#providerSearch(node), {
-      order: ['youtube'],
+      order: getResolutionSettings().order,
       weights: { youtube: AUTOPLAY_WEIGHTS, soundcloud: AUTOPLAY_WEIGHTS },
       duration: getResolutionSettings().duration,
       officialChannelTokens: getResolutionSettings().officialChannelTokens,
@@ -748,6 +782,128 @@ export class MusicManager {
     if (track.durationMs < 60_000 || track.durationMs > 900_000) return null;
 
     return track;
+  }
+
+  /**
+   * Turn a song the listener already knows into something playable.
+   *
+   * Known songs come from the library, playlists and history, and those rows
+   * carry what a bare recommendation lacks: a canonical runtime, and often
+   * the catalogue URL and the title exactly as the catalogue spelled it. That
+   * is the full evidence a user request has, so the match runs under the
+   * ordinary weights and the ordinary SoundCloud → YouTube order — the stored
+   * Lavalink blob and identifier are NOT replayed, because both go stale.
+   *
+   * Returns null when no provider has a confident match; the planner then
+   * tries its next candidate rather than playing a doubtful upload.
+   */
+  async resolveKnown(candidate: FamiliarCandidate): Promise<QueuedTrack | null> {
+    const node = this.shoukaku.getIdealNode();
+    if (node === undefined) return null;
+
+    const isCatalogue = candidate.source === 'spotify' || candidate.source === 'deezer';
+    const wanted = canonicalTrack({
+      title: candidate.title,
+      artist: candidate.artist,
+      durationMs: candidate.durationMs,
+      provider: isCatalogue ? candidate.source : 'query',
+      // Only a catalogue page is a canonical URL. A YouTube or SoundCloud
+      // page is where the audio once came from, not what the song is.
+      url: isCatalogue ? candidate.uri : null,
+      artworkUrl: candidate.artworkUrl,
+    });
+
+    const resolved = await this.#resolvePlayable(node, wanted, {
+      // No runtime on the row means the duration signal is unavailable, and
+      // the autoplay threshold is the honest bar for that case — but a match
+      // accepted under that lower bar must not be cached as THE answer for a
+      // later /play of the same song.
+      ...(candidate.durationMs > 0
+        ? {}
+        : { acceptScore: AUTOPLAY_WEIGHTS.acceptScore, bypassCache: true }),
+    });
+    if (resolved === null) return null;
+
+    const track: QueuedTrack = {
+      ...fromLavalinkTrack(resolved.candidate.track, {
+        id: this.#client.user?.id ?? '0',
+        name: 'Autoplay',
+      }),
+      // The listener knows this song by the stored identity, not by whatever
+      // the upload is titled.
+      title: candidate.title,
+      author: candidate.artist,
+      artworkUrl: candidate.artworkUrl ?? resolved.candidate.track.info.artworkUrl ?? null,
+      uri: isCatalogue ? candidate.uri : (resolved.candidate.track.info.uri ?? candidate.uri),
+      source: isCatalogue ? candidate.source : resolved.provider,
+      playbackSource: resolved.provider,
+      origin: 'autoplay',
+    };
+
+    if (track.isStream) return null;
+    if (track.durationMs < 60_000 || track.durationMs > 900_000) return null;
+    return track;
+  }
+
+  /**
+   * An explicit "not like": remember it, and make sure the song is gone from
+   * everywhere it could come back from — the queue, the prefetch buffer, and
+   * the session's exclusion set — under its canonical identity, so the same
+   * recording cannot return through another provider.
+   *
+   * Persistence is the caller's (the dislikes service) responsibility; this
+   * is the live-player half. Skipping the currently playing track is left to
+   * the caller too, because it is a voice action with its own permissions.
+   */
+  applyDislike(
+    guildId: string,
+    track: Pick<QueuedTrack, 'title' | 'author' | 'sourceKey'>,
+  ): {
+    readonly key: string;
+    readonly removedFromQueue: number;
+    readonly evictedFromBuffer: number;
+  } {
+    const identity = identityOf(track.author, track.title);
+    // Both spellings of the song: the upload's and, for a recommendation,
+    // the candidate's it was picked as.
+    const keys = new Set([
+      identity.key,
+      ...(track.sourceKey === undefined ? [] : [track.sourceKey]),
+    ]);
+
+    const player = this.#players.get(guildId);
+    const removed =
+      player === undefined
+        ? []
+        : player.removeUpcomingWhere((queued) => {
+            const queuedIdentity = identityOf(queued.author, queued.title);
+            return (
+              keys.has(queuedIdentity.key) ||
+              (queued.sourceKey !== undefined && keys.has(queued.sourceKey))
+            );
+          });
+    // The removed uploads' own spellings join the exclusion so the session
+    // recognises the song under every vocabulary it has been seen in.
+    for (const gone of removed) {
+      keys.add(identityOf(gone.author, gone.title).key);
+      if (gone.sourceKey !== undefined) keys.add(gone.sourceKey);
+    }
+
+    const evicted = this.#autoplay?.evict(guildId, keys) ?? 0;
+    void this.#autoplaySession?.recordDisliked(guildId, [...keys]).catch(() => undefined);
+
+    logger.info(
+      {
+        event: 'AUTOPLAY_DISLIKE',
+        guildId,
+        track: `${track.author} — ${track.title}`,
+        key: identity.key,
+        removedFromQueue: removed.length,
+        evictedFromBuffer: evicted,
+      },
+      'Track disliked; removed from future autoplay',
+    );
+    return { key: identity.key, removedFromQueue: removed.length, evictedFromBuffer: evicted };
   }
 
   /** Drop a guild's prefetched autoplay buffer — on stop or disconnect. */
@@ -820,7 +976,9 @@ export class MusicManager {
    * makes an answer acceptable. Both of those live in `playback-resolver.ts`,
    * where the canonical track is in scope.
    */
-  #providerSearch(node: Node): (query: string, provider: PlaybackProvider) => Promise<readonly LavalinkCandidate[]> {
+  #providerSearch(
+    node: Node,
+  ): (query: string, provider: PlaybackProvider) => Promise<readonly LavalinkCandidate[]> {
     return async (query, provider) => {
       const results = await this.#searchMany(node, query, provider);
       return results.map((track) => toCandidate(track));
@@ -855,17 +1013,21 @@ export class MusicManager {
   ): Promise<ResolvedPlayback<LavalinkCandidate> | null> {
     const settings = getResolutionSettings();
     const preference = options.preference ?? 'auto';
-    const { result } = await resolvePlayback<LavalinkCandidate>(wanted, this.#providerSearch(node), {
-      // An explicitly chosen source pins the walk to that one provider; there
-      // is no silent fall-through to somewhere the user did not ask for.
-      order: preference === 'auto' ? settings.order : [preference],
-      weights: settings.weights,
-      duration: settings.duration,
-      officialChannelTokens: settings.officialChannelTokens,
-      requestedVariants: options.requestedVariants,
-      acceptScore: options.acceptScore,
-      ...(options.bypassCache === true ? {} : { cache: this.#resolutionCache }),
-    });
+    const { result } = await resolvePlayback<LavalinkCandidate>(
+      wanted,
+      this.#providerSearch(node),
+      {
+        // An explicitly chosen source pins the walk to that one provider; there
+        // is no silent fall-through to somewhere the user did not ask for.
+        order: preference === 'auto' ? settings.order : [preference],
+        weights: settings.weights,
+        duration: settings.duration,
+        officialChannelTokens: settings.officialChannelTokens,
+        requestedVariants: options.requestedVariants,
+        acceptScore: options.acceptScore,
+        ...(options.bypassCache === true ? {} : { cache: this.#resolutionCache }),
+      },
+    );
     return result;
   }
 
@@ -1146,12 +1308,20 @@ export class MusicManager {
    * sane durations, and at most two picks per artist so the radio does not
    * collapse into one act's discography.
    */
-  async pickAutoplayTracks(guildId: string): Promise<readonly QueuedTrack[]> {
+  async pickAutoplayTracks(
+    guildId: string,
+    count: number = AUTOPLAY_PICK_TARGET,
+  ): Promise<readonly QueuedTrack[]> {
     const node = this.shoukaku.getIdealNode();
     if (node === undefined) return [];
+    const wanted = Math.max(1, Math.min(count, AUTOPLAY_MAX_PICKS));
 
     const history = await this.#store.recentHistory(guildId, 40);
-    if (history.length === 0) return [];
+    // The very first song of a fresh guild is still playing when the low-
+    // water refill first asks, and its history row is only written when it
+    // ends. What is playing IS the session; it seeds until history exists.
+    const current = this.#players.get(guildId)?.queue.current ?? null;
+    if (history.length === 0 && current === null) return [];
 
     // The recommendation engine goes first when it is configured: it knows the
     // guild's taste, its recent skips and the language it listens in, none of
@@ -1167,9 +1337,22 @@ export class MusicManager {
       // newest autoplay play joins only as discounted context. Seeding from
       // the raw last-4 plays here — origin-blind — was the primary source of
       // taste drift.
-      const seeds = selectAutoplaySeeds(history);
+      const seeds = selectAutoplaySeeds(
+        current === null
+          ? history
+          : [
+              {
+                title: current.title,
+                author: current.author,
+                identifier: current.identifier,
+                origin: trackOrigin(current),
+                skipped: false,
+              },
+              ...history,
+            ],
+      );
 
-      const recommended = await engine.take(guildId, AUTOPLAY_PICK_TARGET, seeds);
+      const recommended = await engine.take(guildId, wanted, seeds);
       if (recommended.length > 0) {
         logger.info(
           {
@@ -1221,7 +1404,7 @@ export class MusicManager {
 
     /** Keep a candidate only if it is fresh, playable and not over-represented. */
     const consider = (raw: LavalinkTrack): void => {
-      if (picks.length >= AUTOPLAY_PICK_TARGET) return;
+      if (picks.length >= wanted) return;
       const track: QueuedTrack = { ...fromLavalinkTrack(raw, requester), origin: 'autoplay' };
 
       const trackKey = identityOf(track.author, track.title).key;
@@ -1265,7 +1448,7 @@ export class MusicManager {
     const mixSeeds = (userMixable.length > 0 ? userMixable : mixable).slice(0, 2);
 
     for (const seed of mixSeeds) {
-      if (picks.length >= AUTOPLAY_PICK_TARGET) break;
+      if (picks.length >= wanted) break;
       try {
         const mix = await node.rest.resolve(
           `https://www.youtube.com/watch?v=${seed.identifier}&list=RD${seed.identifier}`,
@@ -1292,7 +1475,7 @@ export class MusicManager {
     }
 
     for (const seed of seedAuthors) {
-      if (picks.length >= AUTOPLAY_PICK_TARGET) break;
+      if (picks.length >= wanted) break;
 
       let response: LavalinkResponse | undefined;
       try {

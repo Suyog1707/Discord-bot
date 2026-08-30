@@ -23,6 +23,7 @@ import { getLogger, logger, type Logger } from '../lib/logger.js';
 import { PlayerCommandSubscriber } from '../music/command-subscriber.js';
 import { MusicManager } from '../music/music-manager.js';
 import { QueueStore } from '../music/queue-store.js';
+import { DislikesService } from '../services/dislikes-service.js';
 import { FavoritesService } from '../services/favorites-service.js';
 import { GuildService } from '../services/guild-service.js';
 import { PlaylistsService } from '../services/playlists-service.js';
@@ -68,6 +69,7 @@ export class BotClient extends Client {
     readonly guilds: GuildService;
     readonly queueStore: QueueStore;
     readonly favorites: FavoritesService;
+    readonly dislikes: DislikesService;
     readonly playlists: PlaylistsService;
     readonly spotify: SpotifyService;
   };
@@ -130,6 +132,7 @@ export class BotClient extends Client {
       guilds: new GuildService(this.prisma),
       queueStore: new QueueStore(this.prisma),
       favorites: new FavoritesService(this.prisma),
+      dislikes: new DislikesService(this.prisma),
       playlists: new PlaylistsService(this.prisma),
       spotify: new SpotifyService(this.prisma),
     };
@@ -158,9 +161,10 @@ export class BotClient extends Client {
     this.ai = createAiStack({
       env,
       prisma: this.prisma,
+      dislikes: this.services.dislikes,
       ...(this.#redis && { redis: this.#redis }),
     });
-    this.music?.attachAutoplay(this.ai.autoplay, this.ai.orchestrator);
+    this.music?.attachAutoplay(this.ai.autoplay, this.ai.orchestrator, this.ai.planner);
   }
 
   /**

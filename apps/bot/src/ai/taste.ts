@@ -205,7 +205,20 @@ export class UserTasteService {
    * anywhere here returns the empty profile: the recommender then falls back to
    * similarity and novelty alone, which is worse but still musical.
    */
-  async profile(scope: TasteScope): Promise<TasteProfile> {
+  async profile(
+    scope: TasteScope,
+    options: {
+      /**
+       * Whether a stale or missing row may be recomputed now. The recompute
+       * reads a thousand history rows and tags a dozen artists; on the
+       * synchronous playback path — a listener waiting in silence — a
+       * slightly old profile is worth more than a fresh one that arrives
+       * late. Default true; autoplay passes false for per-listener profiles
+       * unless it is running in the background.
+       */
+      readonly allowRefresh?: boolean;
+    } = {},
+  ): Promise<TasteProfile> {
     const key = `taste:${scopeKey(scope)}`;
     const cached = await this.#cache.get<TasteProfile>(key);
     if (cached !== null) return cached;
@@ -213,6 +226,20 @@ export class UserTasteService {
     try {
       const row = await this.#loadRow(scope);
       const stale = row === null || Date.now() - row.computedAt.getTime() > REFRESH_COOLDOWN_MS;
+
+      if (stale && options.allowRefresh === false) {
+        // Serve what exists without paying for a recompute; the next
+        // background pass refreshes it. Not cached, so that pass still runs.
+        if (row === null) return EMPTY_TASTE_PROFILE;
+        return {
+          artistAffinity: readAffinity(row.artistAffinity),
+          tagAffinity: readAffinity(row.tagAffinity),
+          languageAffinity: readAffinity(row.languageAffinity),
+          completionRate: row.completionRate,
+          sampleSize: row.sampleSize,
+          confidence: confidenceFor(row.sampleSize),
+        };
+      }
 
       const profile = stale
         ? await this.refresh(scope)
@@ -614,4 +641,94 @@ function completionOf(row: { readonly playedMs: number; readonly durationMs: num
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+/**
+ * The floor an individual profile's blend weight is held at.
+ *
+ * Weights are scaled by confidence, and a brand-new listener's confidence is
+ * exactly zero — so without a floor the whole blend can weigh nothing and the
+ * division below has no denominator. The floor is small enough that an empty
+ * profile never dominates a real one; it just keeps it in the room.
+ */
+const MIN_BLEND_WEIGHT = 0.05;
+
+/** Extra confidence per additional evidenced profile in a blend. Small on purpose. */
+const AGREEMENT_BONUS = 0.05;
+
+/**
+ * Merge several taste profiles into the one the scorer reads.
+ *
+ * Autoplay is playing for a room, not for a person. The guild's aggregate says
+ * what this server sounds like; each present listener's own profile says what
+ * *they* came for. Neither alone is right — guild-only is why the radio ignored
+ * whoever was actually in the channel, and listener-only would let one person's
+ * history hijack a shared queue — so the caller supplies both with weights and
+ * this blends them.
+ *
+ * Each profile's stated weight is multiplied by its own confidence, because a
+ * profile built from four plays should not argue with one built from four
+ * hundred merely because the caller asked for it loudly.
+ *
+ * A key missing from a profile counts as zero rather than being skipped. That
+ * matters in two ways: affinities are signed and centred on zero, so absence is
+ * genuinely neutral and a thin profile cannot project a full-strength opinion
+ * into the blend; and `languageAffinity` is a share distribution, which only
+ * stays a distribution if every profile divides by the same total.
+ *
+ * Confidence is the weighted mean of the inputs' confidence, with a small
+ * bonus per additional evidenced profile: several thin profiles are still
+ * thin — `dampen()` relies on this number to pull noise toward neutral, and
+ * a sum would let three near-empty listeners add up to total certainty.
+ *
+ * Pure — no I/O, no clock.
+ */
+export function blendProfiles(
+  profiles: readonly { readonly profile: TasteProfile; readonly weight: number }[],
+): TasteProfile {
+  if (profiles.length === 0) return EMPTY_TASTE_PROFILE;
+
+  const weighted = profiles.map(({ profile, weight }) => {
+    const stated = Math.max(0, weight);
+    return {
+      profile,
+      stated,
+      effective: Math.max(MIN_BLEND_WEIGHT, stated * profile.confidence),
+    };
+  });
+  const totalWeight = weighted.reduce((sum, entry) => sum + entry.effective, 0);
+
+  const blendMap = (
+    pick: (profile: TasteProfile) => Readonly<Record<string, number>>,
+  ): Record<string, number> => {
+    const totals: Record<string, number> = {};
+    for (const { profile, effective } of weighted) {
+      for (const [key, value] of Object.entries(pick(profile))) {
+        totals[key] = (totals[key] ?? 0) + effective * value;
+      }
+    }
+    for (const [key, total] of Object.entries(totals)) {
+      totals[key] = total / totalWeight;
+    }
+    return totals;
+  };
+
+  const completionRate =
+    weighted.reduce((sum, entry) => sum + entry.effective * entry.profile.completionRate, 0) /
+    totalWeight;
+
+  return {
+    artistAffinity: blendMap((profile) => profile.artistAffinity),
+    tagAffinity: blendMap((profile) => profile.tagAffinity),
+    languageAffinity: blendMap((profile) => profile.languageAffinity),
+    completionRate,
+    sampleSize: weighted.reduce((sum, entry) => sum + entry.profile.sampleSize, 0),
+    confidence: Math.min(
+      1,
+      weighted.reduce((sum, entry) => sum + entry.effective * entry.profile.confidence, 0) /
+        totalWeight +
+        AGREEMENT_BONUS *
+          Math.max(0, weighted.filter((entry) => entry.profile.confidence > 0).length - 1),
+    ),
+  };
 }

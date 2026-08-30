@@ -27,6 +27,7 @@ export type MusicButtonAction =
   | 'shuffle'
   | 'loop'
   | 'favorite'
+  | 'dislike'
   | 'queue'
   | 'lyrics'
   | 'autoplay'
