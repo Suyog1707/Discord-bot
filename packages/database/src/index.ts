@@ -19,14 +19,20 @@ export {
 
 export {
   addDislike,
+  countDislikes,
   DISLIKES_MAX_PER_USER,
+  DISLIKES_PAGE_LIMIT_DEFAULT,
+  DISLIKES_PAGE_LIMIT_MAX,
   dislikedArtistCountsFor,
   dislikedKeysFor,
   dislikesFor,
   isDisliked,
   listDislikes,
+  pageDislikes,
   removeDislike,
+  removeDislikes,
   type DislikeInput,
+  type DislikePage,
   type DislikeSource,
 } from './dislikes.js';
 

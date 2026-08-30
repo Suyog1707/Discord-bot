@@ -17,8 +17,11 @@ import 'server-only';
  */
 import {
   addDislike,
+  countDislikes,
   listDislikes as listDislikeRows,
+  pageDislikes,
   removeDislike,
+  removeDislikes,
 } from '@discord-music/database';
 import {
   encodePlayerCommand,
@@ -48,6 +51,47 @@ export interface DislikeView {
 
 /** Ceiling on one page of the list, in the spirit of `HISTORY_PAGE_SIZE`. */
 export const DISLIKES_PAGE_SIZE = 100;
+
+/**
+ * How many keys a bulk removal may still announce to a live player.
+ *
+ * A handful of removals is somebody fixing a mistake while the music plays, and
+ * the player should forget those keys now. A purge of fifty is list management:
+ * the planner re-reads dislikes from Postgres on its next generation pass, and
+ * the player's in-memory mirror ages out within minutes anyway, so fifty
+ * published commands would buy nothing and flood the command channel to buy it.
+ */
+const LIVE_COMMAND_MAX_KEYS = 10;
+
+/** `?cursor=&limit=` on the list route. */
+export const dislikePageQuerySchema = z.object({
+  cursor: z.string().min(1).max(200).optional(),
+  limit: z.coerce.number().int().min(1).max(DISLIKES_PAGE_SIZE).optional(),
+});
+
+export type DislikePageQuery = z.input<typeof dislikePageQuerySchema>;
+
+/**
+ * What a client may send when un-rejecting several songs at once.
+ *
+ * Capped at one page's worth of keys: the UI can only select what it has
+ * listed, and an unbounded array is an unbounded statement.
+ */
+export const dislikeRemoveInputSchema = z.object({
+  trackKeys: z.array(z.string().min(1).max(600)).min(1).max(DISLIKES_PAGE_SIZE),
+  guildId: snowflakeSchema.optional(),
+});
+
+export type DislikeRemoveInputBody = z.input<typeof dislikeRemoveInputSchema>;
+
+/** One page of the list, as the API hands it back. */
+export interface DislikePageView {
+  readonly items: readonly DislikeView[];
+  /** Send back as `?cursor=` for the next page; `null` at the end of the list. */
+  readonly nextCursor: string | null;
+  /** Present only on the first page — see `pageDislikesForUser`. */
+  readonly total?: number;
+}
 
 /**
  * What a client may send when rejecting a song.
@@ -101,20 +145,72 @@ async function publishToPlayer(command: unknown): Promise<void> {
   }
 }
 
-/** The listener's rejected songs, newest first. */
-export async function listDislikes(user: {
-  readonly discordId: string;
-}): Promise<readonly DislikeView[]> {
-  const rows = await listDislikeRows(getDb(), user.discordId, DISLIKES_PAGE_SIZE);
-
-  return rows.map((row) => ({
+/** A stored row as the dashboard renders it — internal ids stay in the database. */
+function toView(row: {
+  readonly trackKey: string;
+  readonly title: string;
+  readonly author: string;
+  readonly isrc: string | null;
+  readonly source: string;
+  readonly createdAt: Date;
+}): DislikeView {
+  return {
     trackKey: row.trackKey,
     title: row.title,
     author: row.author,
     isrc: row.isrc,
     source: row.source,
     createdAt: row.createdAt,
-  }));
+  };
+}
+
+/**
+ * The listener's rejected songs, newest first.
+ *
+ * The unpaginated read the server-rendered page still uses. New callers want
+ * `pageDislikesForUser`: at the 500-row cap this returns only the newest
+ * hundred, which is a view of the list rather than the list.
+ */
+export async function listDislikes(user: {
+  readonly discordId: string;
+}): Promise<readonly DislikeView[]> {
+  const rows = await listDislikeRows(getDb(), user.discordId, DISLIKES_PAGE_SIZE);
+
+  return rows.map(toView);
+}
+
+/**
+ * One page of rejected songs, newest first.
+ *
+ * `total` comes back only when no cursor was given. It is there to say how
+ * close this listener is to the 500 cap, which is a thing to show once at the
+ * top of the list — paying for a `COUNT` on every "Load more" would be spending
+ * a query per page on a number nobody re-reads.
+ *
+ * A cursor that is stale — the row behind it was just removed — is not an
+ * error; the database layer serves the first page for it, and the caller sees a
+ * list that starts over rather than a failure.
+ */
+export async function pageDislikesForUser(
+  user: { readonly discordId: string },
+  // `| undefined` explicitly: under `exactOptionalPropertyTypes` a parsed query
+  // object with absent keys typed as optional cannot be passed otherwise.
+  options: {
+    readonly cursor?: string | null | undefined;
+    readonly limit?: number | undefined;
+  } = {},
+): Promise<DislikePageView> {
+  const db = getDb();
+  const cursor = options.cursor ?? null;
+
+  const page = await pageDislikes(db, user.discordId, {
+    ...(options.limit === undefined ? {} : { limit: options.limit }),
+    ...(cursor === null ? {} : { cursor }),
+  });
+  const items = page.rows.map(toView);
+
+  if (cursor !== null) return { items, nextCursor: page.nextCursor };
+  return { items, nextCursor: page.nextCursor, total: await countDislikes(db, user.discordId) };
 }
 
 /**
@@ -184,6 +280,40 @@ export async function removeDislikeForUser(
       issuedBy: user.discordId,
       trackKey,
     });
+  }
+
+  return removed;
+}
+
+/**
+ * Un-reject several songs at once.
+ *
+ * Ownership lives in the database layer's `where`, so keys belonging to
+ * somebody else are counted as removals of nothing rather than rejected — the
+ * caller learns how many of *their* rows went away and nothing about anyone
+ * else's.
+ *
+ * Live players are told only about small removals (`LIVE_COMMAND_MAX_KEYS`).
+ * The commands are published for every requested key rather than only the ones
+ * that existed, because `removeDislikes` reports a total and not a per-key
+ * outcome; telling a player to forget a key it never held is a no-op.
+ *
+ * @returns How many rows were actually removed.
+ */
+export async function removeDislikesForUser(
+  user: { readonly discordId: string },
+  trackKeys: readonly string[],
+  guildId?: string,
+): Promise<number> {
+  const keys = [...new Set(trackKeys)];
+  const removed = await removeDislikes(getDb(), user.discordId, keys);
+
+  if (removed > 0 && guildId !== undefined && keys.length <= LIVE_COMMAND_MAX_KEYS) {
+    await Promise.all(
+      keys.map(async (trackKey) =>
+        publishToPlayer({ action: 'undislike', guildId, issuedBy: user.discordId, trackKey }),
+      ),
+    );
   }
 
   return removed;

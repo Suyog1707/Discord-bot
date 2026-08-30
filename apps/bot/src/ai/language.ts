@@ -175,6 +175,15 @@ export interface LanguageInput {
   readonly providerLanguage?: string | null;
   /** Community tags for the track or its artist. */
   readonly tags?: readonly string[];
+  /**
+   * Tags on the TRACK itself, as opposed to its artist. Scanned before
+   * `tags`: an artist who sings in three languages tells you little about
+   * one song, but a song tagged "hindi" by the people who listened to it is
+   * evidence about exactly the recording in question. This is the legitimate
+   * signal that rescues a transliterated title — and when the track carries
+   * no such tag, the answer stays unknown rather than guessed.
+   */
+  readonly trackTags?: readonly string[];
   /** ISO 3166-1 alpha-2 country for the primary artist, e.g. from MusicBrainz. */
   readonly artistCountry?: string | null;
   readonly title: string;
@@ -294,7 +303,9 @@ export function resolveLanguage(input: LanguageInput): ResolvedLanguage {
   // Every tag is scanned for a language-SPECIFIC token before any tag is
   // read for a nationality: tags arrive in popularity order, and "indian"
   // sitting ahead of "tamil" must not turn a Tamil song Hindi.
-  const tags = input.tags ?? [];
+  // Track-level evidence first, artist-level second — same rules for both,
+  // but a specific track tag wins before an artist tag is even read.
+  const tags = [...(input.trackTags ?? []), ...(input.tags ?? [])];
   let nationality: string | null = null;
   for (const tag of tags) {
     const matched = matchLanguageToken(tag);

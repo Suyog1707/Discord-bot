@@ -313,6 +313,20 @@ script. Two normalisations make that usable:
   language mismatch at medium or high confidence; an inferred guess can never
   cost a song its place.
 
+Track-level tags are the one legitimate rescue for a transliterated title:
+when artist evidence leaves the language below high confidence, the resolver
+fetches the song's OWN Last.fm tags (cached per song) and reads them under the
+same rules, ranked above artist tags. A song whose own tags carry no language
+stays `unknown` — accuracy over coverage, and unknown never blocks a
+recommendation.
+
+`TrackProfile.features` (`AudioFeatures`: bpm/energy/valence/danceability/
+acousticness, all optional) is the honest seam for the audio features no
+current provider exposes. It is `null` everywhere today; a future legitimate
+provider plugs into `TagSource.audioFeatures` and the engine — which already
+scores without any of it — gains one more optional signal with no redesign.
+Nothing fabricates these values.
+
 Behavioural similarity (`cooccurrence.ts`) stands in for audio similarity:
 songs the room plays within twenty minutes of each other, saves together, or
 lists together form a lightweight similarity graph, cached ten minutes. It adds
@@ -351,3 +365,5 @@ dashboard's **Not like** page lists and removes dislikes; its live player's 👎
 button posts the snapshot's `trackKey` and publishes a `dislike` player
 command so the bot applies the live effect (queue, buffer, session) and skips
 the track — provided the person is a listener in that session.
+
+> The 500-per-user dislike cap is deliberate (the same abuse guard favorites use); the dashboard pages the whole list and supports bulk removal.

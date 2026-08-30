@@ -60,6 +60,13 @@ export interface TrackProfile {
   /** Everything the profile was derived from, lowercased and deduped. */
   readonly rawTags: readonly string[];
   readonly provider: string | null;
+  /**
+   * Audio features from a legitimate provider, or null — which is the only
+   * value any current deployment produces. Scoring does not read this yet;
+   * it is the landing pad that keeps a future provider from forcing an
+   * engine redesign.
+   */
+  readonly features: AudioFeatures | null;
 }
 
 export interface TrackProfileInput {
@@ -86,9 +93,41 @@ export interface TrackProfileInput {
  * this module stays testable with a two-line fake. `artistCountry` is optional
  * because not every source has one.
  */
+/**
+ * Audio features, when a legitimate provider ever supplies them.
+ *
+ * Every field is optional and every field is honest: nothing in this
+ * codebase fabricates a BPM, and no current provider exposes one. The shape
+ * exists so that the day a real source appears it plugs into `TagSource`
+ * and lands on `TrackProfile.features` — and the recommendation engine,
+ * which already scores without any of this, starts reading it as one more
+ * optional signal instead of being redesigned around it.
+ */
+export interface AudioFeatures {
+  readonly bpm?: number;
+  readonly energy?: number;
+  readonly valence?: number;
+  readonly danceability?: number;
+  readonly acousticness?: number;
+}
+
+/**
+ * Where enrichment comes from. Everything beyond `artistTags` is optional:
+ * a resolver wired with only artist tags still produces full profiles, and
+ * each optional method is a seam for a richer, legitimate source —
+ * track-level tags today, audio features whenever a real provider exists.
+ */
 export interface TagSource {
   artistTags(artist: string): Promise<readonly string[]>;
   artistCountry?(artist: string): Promise<string | null>;
+  /** Tags on the track itself — stronger language/genre evidence than the artist's. */
+  trackTags?(artist: string, title: string): Promise<readonly string[]>;
+  /** Future seam. No current provider is wired; `TrackProfile.features` stays null. */
+  audioFeatures?(input: {
+    readonly title: string;
+    readonly artist: string;
+    readonly isrc?: string | null;
+  }): Promise<AudioFeatures | null>;
 }
 
 /** Artist facts do not change; the lookup is the only expensive part here. */
@@ -151,8 +190,9 @@ function buildProfile(
   input: TrackProfileInput,
   identity: TrackIdentity,
   enrichment: ArtistEnrichment,
+  trackTags: readonly string[] = [],
 ): TrackProfile {
-  const rawTags = mergeTags(input.tags ?? [], enrichment.tags);
+  const rawTags = mergeTags(mergeTags(input.tags ?? [], enrichment.tags), trackTags);
   const { genres, families, styles } = normaliseTags(rawTags);
 
   const credited = (input.artists ?? [])
@@ -164,13 +204,17 @@ function buildProfile(
 
   const language: ResolvedLanguage = resolveLanguage({
     providerLanguage: input.providerLanguage ?? null,
-    tags: rawTags,
+    tags: mergeTags(input.tags ?? [], enrichment.tags),
+    // The track's own tags outrank the artist's: they are about exactly this
+    // recording, which is what makes them safe for transliterated titles.
+    trackTags,
     artistCountry: enrichment.country,
     title: input.title,
     artist: input.artist,
   });
 
   return {
+    features: null,
     key: identity.key,
     artistKey: identity.artistKey,
     title: input.title.trim(),
@@ -218,7 +262,53 @@ export class TrackProfileResolver {
   async resolve(input: TrackProfileInput): Promise<TrackProfile> {
     const identity = identityOf(input.artist, input.title);
     const enrichment = await this.#enrich(identity.key, input.artist);
-    return buildProfile(input, identity, enrichment);
+    let profile = buildProfile(input, identity, enrichment);
+
+    // Track-level tags are only fetched when the artist-level evidence left
+    // the language below high confidence — they are one more request per
+    // SONG, and most songs do not need them. When they arrive they carry
+    // both language and genre evidence about exactly this recording.
+    if (this.#tags.trackTags !== undefined && profile.language.confidence !== 'high') {
+      const own = await this.#trackTags(identity.key, input.artist, input.title);
+      if (own.length > 0) {
+        profile = buildProfile(input, identity, enrichment, own);
+      }
+    }
+
+    // The future seam, exercised only when a legitimate provider is wired.
+    // Called through the source object so an implementation backed by a
+    // class keeps its `this`.
+    if (this.#tags.audioFeatures !== undefined) {
+      const features = await this.#tags
+        .audioFeatures({
+          title: input.title,
+          artist: input.artist,
+          ...(input.isrc === undefined ? {} : { isrc: input.isrc }),
+        })
+        .catch(() => null);
+      if (features !== null) profile = { ...profile, features };
+    }
+
+    return profile;
+  }
+
+  /** The track's own tags, cached per song beside the artist enrichment. */
+  async #trackTags(key: string, artist: string, title: string): Promise<readonly string[]> {
+    if (this.#tags.trackTags === undefined) return [];
+    const cached = await this.#cache.wrap<readonly string[]>(
+      `profile:track-tags:${key}`,
+      PROFILE_TTL_MS,
+      async () => {
+        try {
+          // Through the source object, never detached: a class-backed
+          // TagSource must keep its `this`.
+          return (await this.#tags.trackTags?.(artist, title)) ?? null;
+        } catch {
+          return null;
+        }
+      },
+    );
+    return cached ?? [];
   }
 
   /**

@@ -9,7 +9,12 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { getPrismaClient, pingDatabase, type PrismaClient } from '@discord-music/database';
-import { ConfigurationError, PLAYER_EVENT_CHANNEL } from '@discord-music/shared';
+import {
+  ConfigurationError,
+  PLAYER_EVENT_CHANNEL,
+  PLAYER_STATE_TTL_SECONDS,
+  playerStateKey,
+} from '@discord-music/shared';
 import {
   closeRedis,
   connectRedis,
@@ -151,6 +156,21 @@ export class BotClient extends Client {
             // the dashboard simply has no live stream (allowed in development).
             publishEvent: (payload) => {
               this.#redis?.publish(PLAYER_EVENT_CHANNEL, payload).catch(() => 0);
+            },
+            // The same payload, retained so a dashboard that connects between
+            // events still opens on the real state instead of an empty player.
+            // Every event is a full snapshot, so this is a plain last-write-
+            // wins SET with no ordering concerns: an out-of-order overwrite is
+            // impossible from one process, and a stale value is corrected by
+            // the very next event.
+            retainEvent: (guildId, payload) => {
+              if (this.#redis === undefined) return;
+              const key = playerStateKey(guildId);
+              if (payload === null) {
+                this.#redis.del(key).catch(() => 0);
+                return;
+              }
+              this.#redis.set(key, payload, 'EX', PLAYER_STATE_TTL_SECONDS).catch(() => 0);
             },
           });
 

@@ -104,3 +104,26 @@ export function decodePlayerEvent(raw: string): PlayerEvent | null {
     return null;
   }
 }
+
+/**
+ * Redis key holding the latest full snapshot for one guild.
+ *
+ * Because every published event is a **complete** state snapshot rather than a
+ * diff, retaining only the most recent one is all a late-joining dashboard
+ * needs: the value under this key is, by construction, exactly what the client
+ * would have converged to had it been listening the whole time. There is no
+ * log to replay and no ordering to reconcile — the newest write wins.
+ */
+export function playerStateKey(guildId: string): string {
+  return redisKey(REDIS_NAMESPACE.PLAYER, 'state', guildId);
+}
+
+/**
+ * Expiry for the retained snapshot.
+ *
+ * Disconnects delete the key outright, so this TTL is not the normal cleanup
+ * path — it only reaps guilds whose bot process died without ever emitting a
+ * disconnect event, so a stale "playing" snapshot cannot haunt the dashboard
+ * forever. Long enough to comfortably outlive a full listening session.
+ */
+export const PLAYER_STATE_TTL_SECONDS = 6 * 60 * 60;

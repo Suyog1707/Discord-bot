@@ -218,3 +218,23 @@ describe('languageFromProvider / languageFromCountry', () => {
     expect(languageFromCountry(null)).toBeNull();
   });
 });
+
+describe('resolveLanguage — track tags outrank artist tags', () => {
+  it("lets the track's own specific tag win over the artist's nationality", () => {
+    expect(
+      resolveLanguage({
+        title: 'Tum Mile',
+        artist: 'Some Singer',
+        tags: ['indian'],
+        trackTags: ['hindi'],
+      }),
+    ).toEqual({ language: 'hindi', confidence: 'high', source: 'tags' });
+  });
+
+  it('still refuses to guess when track tags carry no language at all', () => {
+    expect(
+      resolveLanguage({ title: 'Tum Mile', artist: 'Some Singer', trackTags: ['catchy', '2010s'] })
+        .language,
+    ).toBeNull();
+  });
+});

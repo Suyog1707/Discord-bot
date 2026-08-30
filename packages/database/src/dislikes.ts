@@ -154,6 +154,154 @@ export async function listDislikes(
   });
 }
 
+/** One page of a listener's rejected songs, newest first. */
+export interface DislikePage {
+  readonly rows: readonly DislikedTrack[];
+  /** Opaque cursor for the next page, or `null` when this was the last one. */
+  readonly nextCursor: string | null;
+}
+
+/** Widest page a caller may ask for; anything larger is clamped down to it. */
+export const DISLIKES_PAGE_LIMIT_MAX = 100;
+
+/** Page size when the caller expresses no preference. */
+export const DISLIKES_PAGE_LIMIT_DEFAULT = 50;
+
+/**
+ * Keys per `deleteMany`. A purge can name every key a page knows about, and one
+ * unbounded `IN` list is how a management action turns into a statement the
+ * database refuses to plan.
+ */
+const DELETE_CHUNK_SIZE = 200;
+
+/** Whatever the caller asked for, expressed as a page size we will serve. */
+function clampLimit(limit: number | undefined): number {
+  if (limit === undefined || !Number.isFinite(limit)) return DISLIKES_PAGE_LIMIT_DEFAULT;
+  return Math.min(DISLIKES_PAGE_LIMIT_MAX, Math.max(1, Math.trunc(limit)));
+}
+
+/**
+ * The cursor row id, but only when that row belongs to this listener.
+ *
+ * The ownership guard exists because Prisma's `cursor` locates a row by primary
+ * key and only then applies the `where`. The rows that come back are still
+ * filtered to this listener — nobody else's dislike can be read — but the
+ * *position* would be taken from a stranger's row, so a guessed id would decide
+ * which of the listener's own rows they are allowed to see. One extra indexed
+ * read (the row's `user.discordId`) closes that: a cursor is honoured only when
+ * it is theirs.
+ *
+ * An id that is not theirs, or no longer exists because the row was just
+ * removed, comes back `null`, which the caller reads as "start over" rather
+ * than as an error. A stale "Load more" click after a bulk purge must show the
+ * first page again, never a 500.
+ */
+async function ownedCursorId(
+  prisma: PrismaClient,
+  discordId: string,
+  cursor: string | null | undefined,
+): Promise<string | null> {
+  if (cursor === undefined || cursor === null || cursor.length === 0) return null;
+
+  const row = await prisma.dislikedTrack.findUnique({
+    where: { id: cursor },
+    select: { user: { select: { discordId: true } } },
+  });
+  return row?.user.discordId === discordId ? cursor : null;
+}
+
+/**
+ * One page of rejected songs, newest first, by keyset.
+ *
+ * Offsets are the wrong tool here: rows leave this list while it is being read
+ * — removing them is the entire point of the management page — and `skip: n`
+ * after a deletion silently swallows a row from the next page. Resuming from
+ * the last row seen keeps every row visible exactly once.
+ *
+ * `createdAt` alone cannot be that resume point: two dislikes land in the same
+ * millisecond often enough (a bulk import, a fast pair of button presses), and
+ * the pair would be ambiguous. The sort is therefore `(createdAt desc, id
+ * desc)` and the cursor is the row id — exactly the unique Prisma needs to
+ * position a cursor against that ordering.
+ *
+ * `take: limit + 1` answers "is there more" without a second query: the extra
+ * row is read, never returned, and its existence is what produces a cursor.
+ */
+export async function pageDislikes(
+  prisma: PrismaClient,
+  discordId: string,
+  options: {
+    /** 1..100, default 50. Out-of-range values are clamped, not rejected. */
+    readonly limit?: number;
+    /** `nextCursor` from the previous page. */
+    readonly cursor?: string | null;
+  } = {},
+): Promise<DislikePage> {
+  const take = clampLimit(options.limit);
+  const cursorId = await ownedCursorId(prisma, discordId, options.cursor);
+
+  const query = {
+    where: { user: { discordId } },
+    orderBy: [{ createdAt: 'desc' as const }, { id: 'desc' as const }],
+    take: take + 1,
+  };
+
+  const rows =
+    cursorId === null
+      ? await prisma.dislikedTrack.findMany(query)
+      : // The row can still disappear between the ownership read and this one,
+        // and Prisma throws when its cursor points at nothing. A vanished
+        // cursor is stale, not broken: serve the first page instead.
+        await prisma.dislikedTrack
+          .findMany({ ...query, cursor: { id: cursorId }, skip: 1 })
+          .catch(() => prisma.dislikedTrack.findMany(query));
+
+  const hasMore = rows.length > take;
+  const page = hasMore ? rows.slice(0, take) : rows;
+  const last = page.at(-1);
+
+  return { rows: page, nextCursor: hasMore && last !== undefined ? last.id : null };
+}
+
+/**
+ * How many songs this listener has rejected.
+ *
+ * Read once per first page rather than per page: it exists to tell somebody how
+ * close they are to `DISLIKES_MAX_PER_USER`, and a count that is a few seconds
+ * old still says that truthfully.
+ */
+export async function countDislikes(prisma: PrismaClient, discordId: string): Promise<number> {
+  return prisma.dislikedTrack.count({ where: { user: { discordId } } });
+}
+
+/**
+ * Un-reject many songs at once; returns how many rows actually went away.
+ *
+ * Ownership is the `where`, not a pre-read: `user: { discordId }` means another
+ * listener's row cannot be deleted or counted however the keys were obtained,
+ * which is the only guarantee worth having when the keys arrive from a client.
+ * Keys that were never disliked are simply not counted, so the call is
+ * idempotent — a double-submitted purge is not an error.
+ */
+export async function removeDislikes(
+  prisma: PrismaClient,
+  discordId: string,
+  trackKeys: readonly string[],
+): Promise<number> {
+  const keys = [...new Set(trackKeys)].filter((key) => key.length > 0);
+  if (keys.length === 0) return 0;
+
+  let removed = 0;
+  for (let index = 0; index < keys.length; index += DELETE_CHUNK_SIZE) {
+    const chunk = keys.slice(index, index + DELETE_CHUNK_SIZE);
+    const { count } = await prisma.dislikedTrack.deleteMany({
+      where: { user: { discordId }, trackKey: { in: chunk } },
+    });
+    removed += count;
+  }
+  return removed;
+}
+
 /** Whether this listener has already rejected that canonical key. */
 export async function isDisliked(
   prisma: PrismaClient,

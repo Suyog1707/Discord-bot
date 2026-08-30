@@ -83,13 +83,19 @@ export function createAiStack(options: {
   // MusicBrainz serialises at one request per second, and a refill that
   // waits on a queue of those is heard as silence. /ask's answers can afford
   // the artist's country.
+  // Track-level tags ride the same seam: they are the one legitimate signal
+  // that can name the language of a single transliterated song. Fetched only
+  // when artist evidence was not already conclusive, and cached per song.
+  const trackTags = async (artist: string, title: string): Promise<readonly string[]> =>
+    (await lastfm.trackTags(artist, title)).map((tag) => tag.name);
   const profiles = new TrackProfileResolver(
-    { artistTags: (artist) => recommender.artistTags(artist) },
+    { artistTags: (artist) => recommender.artistTags(artist), trackTags },
     cache,
   );
   const informProfiles = new TrackProfileResolver(
     {
       artistTags: (artist) => recommender.artistTags(artist),
+      trackTags,
       artistCountry: async (artist) => (await musicbrainz.canonicalArtist(artist)).country,
     },
     cache,

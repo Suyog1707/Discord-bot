@@ -226,6 +226,7 @@ export class MusicManager {
   #autoplaySession: AutoplaySessionStore | undefined;
 
   readonly #publishEvent: ((payload: string) => void) | undefined;
+  readonly #retainEvent: ((guildId: string, payload: string | null) => void) | undefined;
   readonly #controllers = new Map<string, ControllerMessage>();
   /** Insertion-ordered so the oldest entry is the one evicted at capacity. */
   /**
@@ -254,6 +255,13 @@ export class MusicManager {
     readonly spotify: SpotifyService;
     /** Serialised event sink; absent when Redis is not configured. */
     readonly publishEvent?: (payload: string) => void;
+    /**
+     * Sink for the *retained* copy of the same event: the latest snapshot a
+     * dashboard connecting later should be handed. `null` means the player is
+     * gone and the retained state must be dropped. Absent when Redis is not
+     * configured.
+     */
+    readonly retainEvent?: (guildId: string, payload: string | null) => void;
   }) {
     this.#client = options.client;
     this.#store = options.store;
@@ -261,6 +269,7 @@ export class MusicManager {
     this.#spotify = options.spotify;
     this.#node = options.node;
     this.#publishEvent = options.publishEvent;
+    this.#retainEvent = options.retainEvent;
 
     this.shoukaku = new Shoukaku(
       new Connectors.DiscordJS(options.client),
@@ -1622,7 +1631,13 @@ export class MusicManager {
   }
 
   #emitEvent(guildId: string, type: PlayerEventType, state: PlayerSnapshot | null): void {
-    this.#publishEvent?.(encodePlayerEvent({ type, guildId, sentAt: Date.now(), state }));
+    // Encoded once and used twice: the live broadcast and the retained copy
+    // must be byte-identical, and a second `Date.now()` would make them differ.
+    const payload = encodePlayerEvent({ type, guildId, sentAt: Date.now(), state });
+    this.#publishEvent?.(payload);
+    // A null state means the player is gone, so the retained snapshot must go
+    // with it rather than leave the dashboard greeting new tabs with a ghost.
+    this.#retainEvent?.(guildId, state === null ? null : payload);
     this.#controllers.get(guildId)?.onEvent(type, state);
   }
 

@@ -9,11 +9,13 @@
  * other way, so together they form a full-duplex control link.
  *
  * Each connection opens a dedicated Redis subscriber (a subscribing
- * connection cannot multiplex regular commands), closed on client abort.
+ * connection cannot multiplex regular commands), closed on client abort — so
+ * the opening snapshot is read over the shared command connection instead.
  */
 import {
   decodePlayerEvent,
   PLAYER_EVENT_CHANNEL,
+  playerStateKey,
   UpstreamError,
   type PlayerEvent,
 } from '@discord-music/shared';
@@ -25,6 +27,8 @@ import { requireUser } from '@/lib/auth/session';
 import { requireManagedGuild } from '@/lib/authz';
 import { getEnv } from '@/lib/env';
 import { getLogger } from '@/lib/logger';
+import { getRedis } from '@/lib/redis';
+import { initialPlayerEvent } from '@/lib/sse';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -104,6 +108,25 @@ export const GET = withErrorHandling(
         });
 
         request.signal.addEventListener('abort', close);
+
+        // Opening snapshot, deliberately read *after* subscribing: the bot
+        // retains the latest full state under a per-guild key, and reading it
+        // second means an event landing in the gap is merely delivered twice.
+        // Full-state events make that duplication harmless — a missed event is
+        // the only real failure, and subscribe-first rules it out. A read over
+        // the subscriber would be rejected (subscribed connections take no
+        // commands), so this uses the shared command client. Reconnects get a
+        // fresh snapshot by construction, with no extra resume protocol.
+        try {
+          const raw = (await getRedis()?.get(playerStateKey(guildId))) ?? null;
+          const initial = initialPlayerEvent(raw, guildId);
+          if (initial !== null) send(initial);
+        } catch (error) {
+          // A missing snapshot is not worth dropping a working stream over:
+          // the dashboard keeps its server-rendered state and the next event
+          // corrects it.
+          logger.warn({ err: error }, 'SSE initial snapshot read failed');
+        }
       },
       cancel() {
         subscriber.disconnect();
