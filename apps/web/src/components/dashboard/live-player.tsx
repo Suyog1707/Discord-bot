@@ -25,13 +25,19 @@ import {
   SkipBack,
   SkipForward,
   Square,
+  ThumbsDown,
   Volume2,
   X,
 } from 'lucide-react';
 import Image from 'next/image';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import type { ApiResponse, PlayerEvent, PlayerSnapshot } from '@discord-music/shared';
+import type {
+  ApiResponse,
+  PlayerEvent,
+  PlayerSnapshot,
+  TrackSnapshot,
+} from '@discord-music/shared';
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -115,6 +121,38 @@ export function LivePlayer({
       })
         .then(async (response) => {
           const body = (await response.json()) as ApiResponse<{ accepted: boolean }>;
+          if (!body.success) setError(body.error.message);
+        })
+        .catch(() => {
+          setError('Could not reach the server.');
+        });
+    },
+    [guildId],
+  );
+
+  /**
+   * "Not like this song" — a listener preference, not guild control, so it goes
+   * to the user route rather than the player one and needs no Manage Server.
+   * The bot picks it up over the same command channel and skips the track;
+   * `trackKey` is the bot's own canonical identity for the recording, so the
+   * rejection survives the same song arriving from a different provider.
+   */
+  const dislike = useCallback(
+    (current: TrackSnapshot) => {
+      setError(null);
+      fetch('/api/user/dislikes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: current.title,
+          author: current.author,
+          trackKey: current.trackKey,
+          guildId,
+          skipIfPlaying: true,
+        }),
+      })
+        .then(async (response) => {
+          const body = (await response.json()) as ApiResponse<{ added: boolean }>;
           if (!body.success) setError(body.error.message);
         })
         .catch(() => {
@@ -248,6 +286,16 @@ export function LivePlayer({
           }}
         >
           <SkipForward aria-hidden /> Skip
+        </Button>
+        <Button
+          size="sm"
+          variant="secondary"
+          title="Never recommend this song to me again"
+          onClick={() => {
+            dislike(track);
+          }}
+        >
+          <ThumbsDown aria-hidden /> Not like
         </Button>
         <Button
           size="sm"

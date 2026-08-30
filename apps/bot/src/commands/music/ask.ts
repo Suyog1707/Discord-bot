@@ -44,8 +44,10 @@ export default defineCommand({
   async execute({ interaction }) {
     const client = interaction.client as BotClient;
     const music = requireMusic(client);
-    const context = requireVoiceContext(interaction);
     const request = interaction.options.getString('request', true);
+    // A question needs no voice channel — only a request to play does, and
+    // that is decided below, once the sentence has been read.
+    const guildId = interaction.guildId ?? '';
 
     const requestedBy = {
       id: interaction.user.id,
@@ -55,19 +57,9 @@ export default defineCommand({
           : interaction.user.username,
     };
 
-    // Join and think at the same time: the gateway round trip for the voice
-    // connection is dead time if it waits for the recommendation.
-    const joining = music.getOrCreatePlayer({
-      guildId: context.guildId,
-      voiceChannelId: context.voiceChannelId,
-      textChannelId: interaction.channelId,
-      shardId: interaction.guild?.shardId ?? 0,
-    });
-    joining.catch(() => undefined);
-
     // Seed from what the room is already listening to, so "more like this"
     // has a "this" to work from.
-    const existing = music.getPlayer(context.guildId);
+    const existing = music.getPlayer(guildId);
     const seeds = [existing?.queue.current, ...(existing?.queue.tracks.slice(-3) ?? [])]
       .filter((track): track is NonNullable<typeof track> => track != null)
       .map((track) => ({
@@ -75,23 +67,42 @@ export default defineCommand({
         artist: track.author,
         identifier: track.identifier,
       }));
+    const current = existing?.queue.current ?? null;
 
-    const outcome = await client.ai.orchestrator.ask(
-      {
-        guildId: context.guildId,
-        userId: interaction.user.id,
-        text: request,
-        seeds,
-      },
-      async (candidate) => music.resolveCandidate(candidate),
-    );
+    // Decide first, without touching a playback provider: a question is
+    // answered right here and never joins voice or searches for audio.
+    const outcome = await client.ai.orchestrator.ask({
+      guildId,
+      userId: interaction.user.id,
+      text: request,
+      seeds,
+      current: current === null ? undefined : { title: current.title, artist: current.author },
+    });
 
-    const player = await joining;
+    if (outcome.plan.kind === 'inform') {
+      await interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x5865f2)
+            .setAuthor({ name: 'About that' })
+            .setDescription(outcome.plan.answer),
+        ],
+      });
+      return;
+    }
+
+    const context = requireVoiceContext(interaction);
+    const player = await music.getOrCreatePlayer({
+      guildId: context.guildId,
+      voiceChannelId: context.voiceChannelId,
+      textChannelId: interaction.channelId,
+      shardId: interaction.guild?.shardId ?? 0,
+    });
 
     // The parser decided this was a plain lookup — run it through the normal
     // path so URLs, playlists and Spotify links all keep working as usual.
-    if (outcome.directQuery !== null) {
-      const resolved = await music.resolve(outcome.directQuery, requestedBy);
+    if (outcome.plan.kind === 'direct') {
+      const resolved = await music.resolve(outcome.plan.query, requestedBy);
       const { startedPlayback } = await player.enqueue(resolved.tracks);
       const [first] = resolved.tracks;
       if (first === undefined) {
@@ -115,7 +126,21 @@ export default defineCommand({
       return;
     }
 
-    if (outcome.tracks.length === 0) {
+    // A recommendation is the one /ask outcome that genuinely needs playback:
+    // the songs it picks have to become audio, through the same SoundCloud →
+    // YouTube walk everything else uses.
+    const generated = await client.ai.orchestrator.recommend(
+      {
+        guildId: context.guildId,
+        userId: interaction.user.id,
+        seeds,
+        count: outcome.intent.quantity,
+        intent: outcome.intent,
+      },
+      async (candidate) => music.resolveCandidate(candidate),
+    );
+
+    if (generated.tracks.length === 0) {
       await interaction.editReply(
         'I understood the request but could not find tracks for it. ' +
           'Try naming an artist or genre, or play a song first so I have something to work from.',
@@ -125,10 +150,13 @@ export default defineCommand({
 
     // Re-stamp the requester: the engine builds tracks attributed to autoplay,
     // but these were asked for by a person and the queue should say so.
-    const attributed = outcome.tracks.map((track) => ({
+    const attributed = generated.tracks.map(({ autoplayKind: _kind, ...track }) => ({
       ...track,
       requestedById: requestedBy.id,
       requestedByName: requestedBy.name,
+      // Asked for by a person: these are their taste anchors, count toward
+      // their history and can make them the session's listener.
+      origin: 'user' as const,
     }));
 
     const { startedPlayback } = await player.enqueue(attributed);
@@ -167,7 +195,12 @@ export default defineCommand({
     await interaction.editReply({ embeds: [embed] });
 
     client.logger.debug(
-      { guildId: context.guildId, ...outcome.timings, strategies: outcome.strategies },
+      {
+        guildId: context.guildId,
+        ...outcome.timings,
+        ...generated.timings,
+        strategies: generated.strategies,
+      },
       'Ask pipeline timings',
     );
 

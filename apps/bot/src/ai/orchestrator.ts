@@ -46,15 +46,37 @@ export interface AskRequest {
   readonly text: string;
   /** Recent tracks to seed from — usually what is playing plus the last few. */
   readonly seeds: readonly TrackSeed[];
+  /** What is playing right now, for questions about "this song". */
+  readonly current?: { readonly title: string; readonly artist: string } | undefined;
 }
+
+/**
+ * What a request turned out to be. Only `recommend` and `direct` involve
+ * playback, and neither is resolved here: the orchestrator decides, the
+ * command acts. `inform` never touches a playback provider at all — it is a
+ * question, and the answer comes from the metadata services alone.
+ */
+export type AskPlan =
+  | { readonly kind: 'inform'; readonly answer: string }
+  | { readonly kind: 'direct'; readonly query: string }
+  | { readonly kind: 'recommend' };
 
 export interface AskOutcome {
   readonly intent: MusicIntent;
-  /** Set when the request resolved to a plain lookup rather than a recommendation. */
-  readonly directQuery: string | null;
-  readonly tracks: readonly QueuedTrack[];
+  readonly plan: AskPlan;
   readonly timings: Readonly<Record<string, number>>;
   readonly strategies: readonly string[];
+}
+
+/** Read-only metadata a question can be answered from. */
+export interface InformSources {
+  readonly artistTags: (artist: string) => Promise<readonly string[]>;
+  readonly similarArtists: (artist: string) => Promise<readonly string[]>;
+  readonly profile?: (input: { readonly title: string; readonly artist: string }) => Promise<{
+    readonly genres: readonly string[];
+    readonly language: { readonly value: string | null; readonly confidence: string };
+    readonly releaseYear: number | null;
+  }>;
 }
 
 export interface OrchestratorServices {
@@ -71,6 +93,8 @@ export interface OrchestratorServices {
    * the anti-duplicate guarantees only hold if no path bypasses them.
    */
   readonly session?: AutoplaySessionStore;
+  /** Metadata readers for informational questions; defaults to Last.fm. */
+  readonly inform?: InformSources;
 }
 
 export class MusicOrchestrator {
@@ -86,16 +110,30 @@ export class MusicOrchestrator {
   }
 
   /**
-   * Handle a natural-language request end to end.
+   * Decide what a natural-language request is.
    *
-   * The LLM runs once, at the top, and then never again — everything after it is
-   * local ranking over a batched candidate pool.
+   * The LLM runs once, at the top, and then never again. Nothing here resolves
+   * playback: a question is answered from metadata, a named track becomes a
+   * lookup for the caller, and a recommendation is left for the caller to
+   * generate with its own resolver — so an informational `/ask` never costs a
+   * provider search.
    */
-  async ask(request: AskRequest, resolve: TrackResolver): Promise<AskOutcome> {
+  async ask(request: AskRequest): Promise<AskOutcome> {
     const startedAt = Date.now();
 
     const parsed = await this.#services.intent.parse(request.text);
     const intent = parsed.intent;
+    const timings = { intentMs: parsed.latencyMs };
+
+    if (intent.intent === 'inform') {
+      const answer = await this.#answer(intent.query, request.current);
+      return {
+        intent,
+        plan: { kind: 'inform', answer },
+        strategies: ['inform'],
+        timings: { ...timings, totalMs: Date.now() - startedAt },
+      };
+    }
 
     // A named track is a lookup, not a recommendation. Handing it to the
     // ranking engine would be slower and worse: the user already told us the
@@ -103,10 +141,9 @@ export class MusicOrchestrator {
     if (intent.intent === 'play_specific' && intent.query !== null) {
       return {
         intent,
-        directQuery: intent.query,
-        tracks: [],
+        plan: { kind: 'direct', query: intent.query },
         strategies: ['direct'],
-        timings: { intentMs: parsed.latencyMs, totalMs: Date.now() - startedAt },
+        timings: { ...timings, totalMs: Date.now() - startedAt },
       };
     }
 
@@ -121,34 +158,77 @@ export class MusicOrchestrator {
     ) {
       return {
         intent,
-        directQuery: intent.query ?? request.text,
-        tracks: [],
+        plan: { kind: 'direct', query: intent.query ?? request.text },
         strategies: ['direct-fallback'],
-        timings: { intentMs: parsed.latencyMs, totalMs: Date.now() - startedAt },
+        timings: { ...timings, totalMs: Date.now() - startedAt },
       };
     }
 
-    const result = await this.recommend(
-      {
-        guildId: request.guildId,
-        ...(request.userId === undefined ? {} : { userId: request.userId }),
-        seeds: request.seeds,
-        count: intent.quantity,
-        intent,
-      },
-      resolve,
-    );
-
     return {
       intent,
-      directQuery: null,
-      tracks: result.tracks,
-      strategies: result.strategies,
-      timings: {
-        intentMs: parsed.latencyMs,
-        ...result.timings,
-        totalMs: Date.now() - startedAt,
-      },
+      plan: { kind: 'recommend' },
+      strategies: ['recommend'],
+      timings: { ...timings, totalMs: Date.now() - startedAt },
+    };
+  }
+
+  /**
+   * Answer a question from metadata alone.
+   *
+   * The subject is what the user named, or the playing track. Tags, similar
+   * artists and — when a profile resolver is wired — normalised genre,
+   * language and year. No playback provider is consulted for any of it.
+   */
+  async #answer(
+    subject: string | null,
+    current: { readonly title: string; readonly artist: string } | undefined,
+  ): Promise<string> {
+    const sources = this.#services.inform ?? this.#defaultInform();
+
+    const target =
+      subject === null
+        ? current === undefined
+          ? null
+          : {
+              title: current.title,
+              artist: current.artist,
+              label: `**${current.title}** by **${current.artist}**`,
+            }
+        : { title: '', artist: subject, label: `**${subject}**` };
+    if (target === null) {
+      return 'Nothing is playing right now — ask about a song or artist by name, or play something first.';
+    }
+
+    const [tags, similar, profile] = await Promise.all([
+      sources.artistTags(target.artist).catch(() => [] as readonly string[]),
+      sources.similarArtists(target.artist).catch(() => [] as readonly string[]),
+      target.title.length > 0 && sources.profile !== undefined
+        ? sources.profile({ title: target.title, artist: target.artist }).catch(() => null)
+        : Promise.resolve(null),
+    ]);
+
+    const lines: string[] = [target.label];
+    if (profile !== null) {
+      if (profile.genres.length > 0) lines.push(`Genre: ${profile.genres.join(', ')}`);
+      if (profile.language.value !== null) {
+        lines.push(
+          `Language: ${profile.language.value}${profile.language.confidence === 'high' ? '' : ` (${profile.language.confidence} confidence)`}`,
+        );
+      }
+      if (profile.releaseYear !== null) lines.push(`Released: ${String(profile.releaseYear)}`);
+    }
+    if (tags.length > 0) lines.push(`Tags: ${tags.slice(0, 6).join(', ')}`);
+    if (similar.length > 0) lines.push(`Similar artists: ${similar.slice(0, 6).join(', ')}`);
+    if (lines.length === 1) lines.push('I could not find anything about that.');
+    return lines.join('\n');
+  }
+
+  #defaultInform(): InformSources {
+    const lastfm = this.#services.lastfm;
+    return {
+      artistTags: async (artist) => (await lastfm.artistTags(artist)).map((tag) => tag.name),
+      similarArtists: async (artist) =>
+        (await lastfm.similarArtists(artist, 8)).map((entry) => entry.name),
     };
   }
 

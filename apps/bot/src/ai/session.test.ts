@@ -459,6 +459,17 @@ describe('AutoplaySessionStore — autoplay cadence', () => {
     expect(snap.reservedKeys.has('bad')).toBe(false);
   });
 
+  it('puts the primary listener first, ahead of whoever requested most recently', async () => {
+    const store = new AutoplaySessionStore();
+    await store.recordPlayed('guild', userEntry('p1', '222222222222222222'));
+    await store.setListener('guild', '111111111111111111');
+
+    const snap = await store.snapshot('guild');
+
+    expect(snap.primaryListenerId).toBe('111111111111111111');
+    expect(snap.listenerIds).toEqual(['111111111111111111', '222222222222222222']);
+  });
+
   it('forgets a dislike so a forgiven song is eligible again this session', async () => {
     const store = new AutoplaySessionStore();
     await store.recordDisliked('guild', ['bad', 'worse']);

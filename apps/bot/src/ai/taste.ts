@@ -25,6 +25,7 @@ import type { PrismaClient } from '@discord-music/database';
 import { getLogger } from '../lib/logger.js';
 
 import type { CacheService } from './cache.js';
+import { normaliseTags } from './genre-taxonomy.js';
 import { languageFromTag } from './language.js';
 import type { LastFmService, LastFmTag } from './lastfm.js';
 import { type MusicBrainzService, normaliseArtist, primaryArtist } from './musicbrainz.js';
@@ -511,6 +512,22 @@ export class UserTasteService {
 
     for (const { artist, tags } of tagLists) {
       const affinity = artistAffinity[artist] ?? 0;
+      // Normalised genre and family keys sit alongside the raw tags, so a
+      // candidate tagged "hindi film songs" and one tagged "bollywood" read
+      // the same affinity instead of two unrelated ones.
+      // Derived from the same top-eight tags the raw loop reads, weighted by
+      // the strongest tag that produced them, and never written when the raw
+      // loop is about to write the very same key — a genre inferred from
+      // evidence must not outweigh the evidence.
+      const evidence = tags.slice(0, 8);
+      const rawNames = new Set(evidence.map((tag) => tag.name));
+      const normalised = normaliseTags(evidence.map((tag) => tag.name));
+      const strongest = evidence.reduce((best, tag) => Math.max(best, tag.count), 0);
+      const genreStrength = Math.min(1, strongest / 100) * 0.8;
+      for (const key of new Set([...normalised.genres, ...normalised.families])) {
+        if (rawNames.has(key)) continue;
+        tagAffinity[key] = (tagAffinity[key] ?? 0) + affinity * genreStrength;
+      }
       // Last.fm counts are 0–100 relative to the artist's top tag.
       for (const tag of tags.slice(0, 8)) {
         const strength = Math.min(1, tag.count / 100);

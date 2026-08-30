@@ -124,3 +124,20 @@ describe('IntentService', () => {
     expect(complete).not.toHaveBeenCalled();
   });
 });
+
+describe('parseIntentHeuristically — questions', () => {
+  it('reads a question as inform with the named subject', () => {
+    const intent = parseIntentHeuristically('who is similar to Karan Aujla?');
+    expect(intent.intent).toBe('inform');
+    expect(intent.query).toBe('Karan Aujla');
+  });
+
+  it('reads a question about the playing track as inform with no subject', () => {
+    expect(parseIntentHeuristically('what genre is this').query).toBeNull();
+    expect(parseIntentHeuristically('what genre is this').intent).toBe('inform');
+  });
+
+  it('does not mistake a play request with a mood for a question', () => {
+    expect(parseIntentHeuristically('play something chill').intent).toBe('recommend');
+  });
+});

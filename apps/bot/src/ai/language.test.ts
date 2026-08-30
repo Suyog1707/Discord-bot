@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
-import { languageFromTag, languageFromTags, languageFromText } from './language.js';
+import {
+  languageFromCountry,
+  languageFromProvider,
+  languageFromTag,
+  languageFromTags,
+  languageFromText,
+  resolveLanguage,
+} from './language.js';
 
 describe('languageFromTag', () => {
   // The bug this file exists for: a real guild listening to Indian hip hop
@@ -82,5 +89,132 @@ describe('languageFromText', () => {
   it('returns null for Latin script — transliteration says nothing', () => {
     expect(languageFromText('Tum Hi Ho')).toBeNull();
     expect(languageFromText('Shape of You')).toBeNull();
+  });
+});
+
+describe('resolveLanguage', () => {
+  const song = { title: 'Kesariya', artist: 'Arijit Singh' };
+
+  // A provider that publishes a language field measured it; nothing inferred
+  // below should be allowed to argue with it.
+  it('prefers an explicit provider language over every inference', () => {
+    expect(
+      resolveLanguage({ ...song, providerLanguage: 'en', tags: ['bollywood', 'hindi'] }),
+    ).toEqual({ language: 'english', confidence: 'high', source: 'provider' });
+  });
+
+  it('accepts provider language codes with a region or a full name', () => {
+    expect(resolveLanguage({ ...song, providerLanguage: 'hi-IN' }).language).toBe('hindi');
+    expect(resolveLanguage({ ...song, providerLanguage: 'Hindi' }).language).toBe('hindi');
+    expect(resolveLanguage({ ...song, providerLanguage: '  ' }).source).not.toBe('provider');
+  });
+
+  it('trusts a tag that names a language', () => {
+    expect(resolveLanguage({ ...song, tags: ['chill', 'hindi'] })).toEqual({
+      language: 'hindi',
+      confidence: 'high',
+      source: 'tags',
+    });
+  });
+
+  // "british" says where the artist is from, not what they sing in. It is still
+  // the best signal available for anglophone music — nobody tags "english" —
+  // but it must not carry the same weight as a language tag.
+  it('downgrades a nationality tag to low, which the scorer refuses to act on', () => {
+    // "british" says where the artist is from, not what language a song is
+    // in — and "indian" alone must never turn a Tamil catalogue Hindi.
+    expect(resolveLanguage({ ...song, tags: ['british'] })).toEqual({
+      language: 'english',
+      confidence: 'low',
+      source: 'tags',
+    });
+    expect(resolveLanguage({ ...song, tags: ['indian pop'] }).confidence).toBe('low');
+  });
+
+  it('lets a specific tag win over an earlier nationality tag', () => {
+    expect(resolveLanguage({ ...song, tags: ['indian', 'tamil'] })).toEqual({
+      language: 'tamil',
+      confidence: 'high',
+      source: 'tags',
+    });
+  });
+
+  it('lets the title script outrank a nationality tag', () => {
+    expect(
+      resolveLanguage({ title: 'தமிழ் பாடல்', artist: 'Someone', tags: ['indian'] }).language,
+    ).toBe('tamil');
+  });
+
+  it('falls back to the artist country only where it is unambiguous', () => {
+    expect(resolveLanguage({ title: 'Ditto', artist: 'NewJeans', artistCountry: 'KR' })).toEqual({
+      language: 'korean',
+      confidence: 'medium',
+      source: 'artist',
+    });
+    expect(resolveLanguage({ ...song, artistCountry: 'BR' }).language).toBe('portuguese');
+  });
+
+  // India has a couple of dozen recording languages; the US and the UK are full
+  // of artists who do not record in English. Guessing from these is how Tamil
+  // and Punjabi tracks got buried in a Hindi session.
+  it('reads nothing into a multilingual country', () => {
+    for (const country of ['IN', 'US', 'GB']) {
+      expect(resolveLanguage({ ...song, artistCountry: country })).toEqual({
+        language: null,
+        confidence: 'none',
+        source: 'none',
+      });
+    }
+  });
+
+  // The free signal: available before any network call.
+  it('reads the writing system when nothing else speaks', () => {
+    expect(resolveLanguage({ title: 'तुम ही हो', artist: 'Arijit Singh' })).toEqual({
+      language: 'hindi',
+      confidence: 'medium',
+      source: 'script',
+    });
+    expect(resolveLanguage({ title: 'Ditto', artist: '뉴진스' }).language).toBe('korean');
+  });
+
+  it('returns a clean unknown rather than guessing', () => {
+    expect(resolveLanguage({ title: 'Shape of You', artist: 'Ed Sheeran' })).toEqual({
+      language: null,
+      confidence: 'none',
+      source: 'none',
+    });
+    expect(resolveLanguage({ title: '', artist: '', tags: [] })).toEqual({
+      language: null,
+      confidence: 'none',
+      source: 'none',
+    });
+  });
+
+  it('never throws on missing or malformed fields', () => {
+    expect(() =>
+      resolveLanguage({
+        title: '',
+        artist: '',
+        providerLanguage: null,
+        tags: [],
+        artistCountry: null,
+      }),
+    ).not.toThrow();
+  });
+});
+
+describe('languageFromProvider / languageFromCountry', () => {
+  it('maps codes and passes names through', () => {
+    expect(languageFromProvider('ko')).toBe('korean');
+    expect(languageFromProvider('pt_BR')).toBe('portuguese');
+    expect(languageFromProvider('Punjabi')).toBe('punjabi');
+    expect(languageFromProvider(null)).toBeNull();
+    expect(languageFromProvider('')).toBeNull();
+  });
+
+  it('answers only for countries with a lopsided recording language', () => {
+    expect(languageFromCountry('jp')).toBe('japanese');
+    expect(languageFromCountry('IN')).toBeNull();
+    expect(languageFromCountry(null)).toBeNull();
   });
 });

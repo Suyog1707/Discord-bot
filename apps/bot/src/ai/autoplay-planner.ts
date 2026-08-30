@@ -28,6 +28,11 @@ import { getLogger } from '../lib/logger.js';
 import type { QueuedTrack } from '../music/track.js';
 
 import {
+  neighbourhoodScore,
+  type CooccurrenceService,
+  type CooccurrenceSignals,
+} from './cooccurrence.js';
+import {
   explainFamiliar,
   scoreFamiliar,
   type FamiliarCandidate,
@@ -43,6 +48,7 @@ import {
   type InterleaveConfig,
 } from './interleave.js';
 import { languageFromText } from './language.js';
+import { TrackProfileResolver, type TrackProfile } from './track-profile.js';
 import { MusicOrchestrator } from './orchestrator.js';
 import type { RecommendationExclusions, RecommendationService, TrackSeed } from './recommender.js';
 import type { ScoredCandidate } from './scoring.js';
@@ -174,8 +180,27 @@ interface PlannerServices {
   readonly familiar: FamiliarPoolService;
   readonly recommender: RecommendationService;
   readonly dislikes?: DislikeSource;
+  /** Behavioural similarity — what the room plays, saves and lists together. */
+  readonly cooccurrence?: CooccurrenceService;
+  /**
+   * Metadata enrichment: normalised genres, families and a confidence-aware
+   * language for each known candidate on the shortlist. Optional so the
+   * planner runs on raw tags when no resolver is wired.
+   */
+  readonly profiles?: TrackProfileResolver;
   readonly config?: Partial<PlannerConfig>;
 }
+
+/**
+ * How much "the room plays these together" moves a score. Known songs get the
+ * larger share: behaviour is the strongest evidence there is about what fits
+ * next when no audio features exist. A discovery only gets an artist-level
+ * nudge — by definition the room has no behaviour on the song itself.
+ */
+const BEHAVIOUR_FAMILIAR_WEIGHT = 0.12;
+const BEHAVIOUR_DISCOVERY_WEIGHT = 0.05;
+
+const EMPTY_SIGNALS: CooccurrenceSignals = { tracks: new Map(), artists: new Map() };
 
 /** One cooldown regime for a pool-building pass. */
 interface Cooldown {
@@ -245,11 +270,13 @@ export class AutoplayPlanner implements AutoplayGenerator {
     const listenerIds = snapshot.listenerIds.slice(0, this.#config.maxListeners);
 
     // Taste, recency, the known pool and the dislike ledger are independent reads.
-    const [profile, recent, pool, dislikes] = await Promise.all([
+    const [profile, recent, pool, dislikes, behaviour] = await Promise.all([
       this.#blendedProfile(guildId, listenerIds, options),
       this.#services.taste.recentContext(guildId),
       this.#services.familiar.pool(guildId, listenerIds),
       this.#dislikes(listenerIds, snapshot),
+      this.#services.cooccurrence?.signals(guildId, listenerIds).catch(() => EMPTY_SIGNALS) ??
+        Promise.resolve(EMPTY_SIGNALS),
     ]);
     const disliked = dislikes.keys;
     const dislikedArtists = dislikes.artistCounts;
@@ -274,6 +301,9 @@ export class AutoplayPlanner implements AutoplayGenerator {
       pool,
       disliked,
       dislikedArtists,
+      behaviour,
+      seedKeys: seeds.map((seed) => identityOf(seed.artist, seed.title).key),
+      seedArtists,
       scoringContext,
       options,
       now,
@@ -360,6 +390,7 @@ export class AutoplayPlanner implements AutoplayGenerator {
         'artistAffinity',
         'context',
         'recencyRest',
+        'behaviour',
       ]),
     }));
     const discoveryQueue: SlotCandidate[] = discoveryRanked.map((entry) => ({
@@ -467,6 +498,59 @@ export class AutoplayPlanner implements AutoplayGenerator {
     context: FamiliarScoringContext,
   ): Promise<readonly ScoredFamiliar[]> {
     if (shortlist.length === 0) return shortlist;
+
+    // With a profile resolver the shortlist gets the full TrackProfile:
+    // raw tags plus normalised genres and families (so "Bollywood" and
+    // "Hindi Film Songs" land on one affinity key) and a language with a
+    // confidence the scorer respects. Enrichment is fetched ONCE PER ARTIST
+    // — forty shortlist entries by six artists cost six lookups, not forty —
+    // and each song's own profile is then derived without I/O.
+    const profiles = this.#services.profiles;
+    if (profiles !== undefined) {
+      const byArtist = new Map<string, Promise<TrackProfile | null>>();
+      const enrichmentFor = (candidate: FamiliarCandidate): Promise<TrackProfile | null> => {
+        const artistKey = identityOf(candidate.artist, candidate.title).artistKey;
+        let pending = byArtist.get(artistKey);
+        if (pending === undefined) {
+          pending = profiles
+            .resolve({
+              title: candidate.title,
+              artist: candidate.artist,
+              durationMs: candidate.durationMs,
+              provider: candidate.source,
+            })
+            .catch(() => null);
+          byArtist.set(artistKey, pending);
+        }
+        return pending;
+      };
+      return Promise.all(
+        shortlist.map(async (entry) => {
+          const candidate = entry.candidate;
+          const enriched = await enrichmentFor(candidate);
+          if (enriched === null) return entry;
+          // The artist's tags apply to every song; the language is resolved
+          // per song, because the title's script is the song's own.
+          const own = TrackProfileResolver.fromMetadata({
+            title: candidate.title,
+            artist: candidate.artist,
+            durationMs: candidate.durationMs,
+            provider: candidate.source,
+            tags: enriched.rawTags,
+          });
+          const tags = [...new Set([...own.rawTags, ...own.genres, ...own.families])];
+          return scoreFamiliar(
+            {
+              ...candidate,
+              ...(tags.length === 0 ? {} : { tags }),
+              language: { value: own.language.value, confidence: own.language.confidence },
+            },
+            context,
+          );
+        }),
+      );
+    }
+
     const artists = [...new Set(shortlist.map((entry) => entry.candidate.artist))];
     const tagsByArtist = new Map<string, readonly string[]>();
     await Promise.all(
@@ -626,6 +710,9 @@ export class AutoplayPlanner implements AutoplayGenerator {
       readonly pool: readonly FamiliarCandidate[];
       readonly disliked: ReadonlySet<string>;
       readonly dislikedArtists: ReadonlyMap<string, number>;
+      readonly behaviour: CooccurrenceSignals;
+      readonly seedKeys: readonly string[];
+      readonly seedArtists: readonly string[];
       readonly scoringContext: FamiliarScoringContext;
       readonly options: { readonly background: boolean };
       readonly now: number;
@@ -693,7 +780,14 @@ export class AutoplayPlanner implements AutoplayGenerator {
         input.scoringContext,
       )
     )
-      .map((entry) => this.#withArtistPenalty(entry, input.dislikedArtists))
+      // Entries the enrichment left untouched already carry their penalty
+      // from pass one; only rescored ones need it applied again.
+      .map((entry) =>
+        roughlyRanked.includes(entry)
+          ? entry
+          : this.#withArtistPenalty(entry, input.dislikedArtists),
+      )
+      .map((entry) => this.#withBehaviour(entry, input))
       .filter((entry) => entry.score >= this.#config.familiarMinScore)
       .sort((a, b) => b.score - a.score);
     const familiarStrong = familiarRanked.filter(
@@ -719,8 +813,19 @@ export class AutoplayPlanner implements AutoplayGenerator {
           )
         ).flatMap((entry) => {
           const penalty = this.#artistPenaltyFor(entry.artistKey, input.dislikedArtists);
-          if (penalty === 0) return [entry];
-          const final = entry.breakdown.final - penalty;
+          // Behaviour on the artist only: a discovery is, by definition, a
+          // song the room has never played.
+          const boost =
+            BEHAVIOUR_DISCOVERY_WEIGHT *
+            neighbourhoodScore(
+              input.behaviour,
+              entry.trackKey,
+              entry.artistKey,
+              [],
+              input.seedArtists,
+            );
+          if (penalty === 0 && boost === 0) return [entry];
+          const final = Math.min(1, entry.breakdown.final - penalty + boost);
           return final >= this.#config.discoveryMinScore
             ? [{ ...entry, breakdown: { ...entry.breakdown, final } }]
             : [];
@@ -767,6 +872,31 @@ export class AutoplayPlanner implements AutoplayGenerator {
   #artistPenaltyFor(artistKey: string, dislikedArtists: ReadonlyMap<string, number>): number {
     const count = dislikedArtists.get(artistKey) ?? 0;
     return DISLIKED_ARTIST_PENALTY * Math.min(DISLIKED_ARTIST_PENALTY_CAP, count);
+  }
+
+  /**
+   * Behavioural fit for a known song: how often the room has played it near
+   * the seeds, saved it alongside them, or listed it with them. Recorded in
+   * the breakdown so "why this one?" can name behaviour as the reason.
+   */
+  #withBehaviour(
+    entry: ScoredFamiliar,
+    input: {
+      readonly behaviour: CooccurrenceSignals;
+      readonly seedKeys: readonly string[];
+      readonly seedArtists: readonly string[];
+    },
+  ): ScoredFamiliar {
+    const fit = neighbourhoodScore(
+      input.behaviour,
+      entry.trackKey,
+      entry.artistKey,
+      input.seedKeys,
+      input.seedArtists,
+    );
+    if (fit === 0) return entry;
+    const score = Math.min(1, entry.score + BEHAVIOUR_FAMILIAR_WEIGHT * fit);
+    return { ...entry, score, breakdown: { ...entry.breakdown, behaviour: fit, final: score } };
   }
 
   #withArtistPenalty(

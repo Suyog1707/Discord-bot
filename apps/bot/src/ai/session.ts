@@ -43,6 +43,12 @@ const DEFAULT_RESERVATION_TTL_SECONDS = 20 * 60;
 const MAX_GUILD_SESSIONS = 500;
 /** Session dislikes kept per guild; the durable record has no such cap. */
 const MAX_SESSION_DISLIKES = 500;
+/**
+ * How long the session mirror of a dislike stays authoritative. Long enough
+ * to outlive any cached read of the durable store; short enough that a
+ * removal made where this room cannot hear it takes effect within a song.
+ */
+const SESSION_DISLIKE_TTL_MS = 10 * 60_000;
 
 /** Half-life-shaped decay: how many "recent plays back" still counts as fatigue. */
 const FATIGUE_TAU = 6;
@@ -155,9 +161,12 @@ export interface SessionSnapshot {
    * Distinct Discord ids of the people whose requests are in this session,
    * most recently heard first, capped at {@link MAX_LISTENERS}. This is the
    * answer to "who is this radio for" — without it, personalisation has only
-   * the guild's aggregate taste to work from.
+   * the guild's aggregate taste to work from. The primary listener (set
+   * explicitly, persisted with the queue) always comes first.
    */
   readonly listenerIds: readonly string[];
+  /** The explicit session owner, when one is set. */
+  readonly primaryListenerId: string | null;
   readonly outcomes: SessionOutcomes;
 }
 
@@ -180,8 +189,15 @@ export interface SessionStoreOptions {
 interface GuildSession {
   recent: SessionEntry[];
   queued: SessionEntry[];
-  /** Canonical keys disliked this session. Persisted separately in the DB. */
-  disliked: Set<string>;
+  /**
+   * Canonical keys disliked this session → when. A MIRROR, not the record:
+   * it bridges the moment between a click and the next database read, and
+   * ages out so a dislike withdrawn from the dashboard (which cannot reach
+   * this room) stops applying once the durable store no longer has it.
+   */
+  disliked: Map<string, number>;
+  /** Discord id of the primary listener; mirrored from the persisted queue. */
+  primaryListenerId: string | null;
   /** trackKey -> expiry timestamp (ms), pruned lazily. */
   reservations: Map<string, number>;
   outcomes: SessionOutcomes;
@@ -207,6 +223,10 @@ function outcomesKey(guildId: string): string {
 
 function dislikedKey(guildId: string): string {
   return `${SESSION_PREFIX}${guildId}:disliked`;
+}
+
+function listenerKey(guildId: string): string {
+  return `${SESSION_PREFIX}${guildId}:listener`;
 }
 
 function reservationKey(guildId: string, trackKey: string): string {
@@ -275,9 +295,16 @@ function autoplayKindsOf(
 function listenersOf(
   recent: readonly SessionEntry[],
   queued: readonly SessionEntry[],
+  primary: string | null = null,
 ): readonly string[] {
   const listeners: string[] = [];
   const seen = new Set<string>();
+  // The explicit owner leads: a claimed session follows its owner even when
+  // somebody else's request happens to be the most recent.
+  if (primary !== null && !ANONYMOUS_REQUESTERS.has(primary)) {
+    seen.add(primary);
+    listeners.push(primary);
+  }
   for (const entry of [...recent, ...queued]) {
     const id = entry.requestedById;
     if (entry.origin !== 'user' || id === undefined) continue;
@@ -353,9 +380,46 @@ export class AutoplaySessionStore {
       recentEntries: recent,
       dislikedKeys: await this.#readDisliked(guildId, session),
       recentAutoplayKinds: autoplayKindsOf(recent, queued),
-      listenerIds: listenersOf(recent, queued),
+      listenerIds: listenersOf(recent, queued, await this.#readListener(guildId, session)),
+      primaryListenerId: session.primaryListenerId,
       outcomes,
     };
+  }
+
+  /**
+   * Set (or clear) the session's primary listener. Written through to Redis
+   * so a restart with Redis remembers the owner even before the persisted
+   * queue is reloaded.
+   */
+  async setListener(guildId: string, discordId: string | null): Promise<void> {
+    const session = this.#touch(guildId);
+    session.primaryListenerId = discordId;
+
+    if (this.#redis === undefined) return;
+    try {
+      if (discordId === null) await this.#redis.del(listenerKey(guildId));
+      else await this.#redis.set(listenerKey(guildId), discordId, 'EX', this.#ttlSeconds);
+    } catch (error) {
+      this.#redisErrors += 1;
+      logger.debug(
+        { err: error, guildId },
+        'Writing listener to Redis failed; memory tier holds it',
+      );
+    }
+  }
+
+  async #readListener(guildId: string, session: GuildSession): Promise<string | null> {
+    if (session.primaryListenerId !== null || this.#redis === undefined) {
+      return session.primaryListenerId;
+    }
+    try {
+      const raw = await this.#redis.get(listenerKey(guildId));
+      if (raw !== null) session.primaryListenerId = raw;
+    } catch (error) {
+      this.#redisErrors += 1;
+      logger.debug({ err: error, guildId }, 'Reading listener from Redis failed; using memory');
+    }
+    return session.primaryListenerId;
   }
 
   /**
@@ -373,12 +437,13 @@ export class AutoplaySessionStore {
     // durable per-user record is what carries it into other rooms. Bounded
     // like the recent ring; a session that dislikes hundreds of songs keeps
     // the newest.
+    const now = this.#now();
     for (const key of keys) {
-      session.disliked.add(key);
+      session.disliked.set(key, now);
       session.reservations.delete(key);
     }
     while (session.disliked.size > MAX_SESSION_DISLIKES) {
-      const oldest = session.disliked.values().next();
+      const oldest = session.disliked.keys().next();
       if (oldest.done === true) break;
       session.disliked.delete(oldest.value);
     }
@@ -387,7 +452,10 @@ export class AutoplaySessionStore {
 
     try {
       const pipeline = this.#redis.multi();
-      pipeline.sadd(dislikedKey(guildId), ...keys);
+      pipeline.hset(
+        dislikedKey(guildId),
+        Object.fromEntries(keys.map((key) => [key, String(now)])),
+      );
       pipeline.expire(dislikedKey(guildId), this.#ttlSeconds);
       for (const key of keys) pipeline.del(reservationKey(guildId, key));
       await pipeline.exec();
@@ -408,7 +476,7 @@ export class AutoplaySessionStore {
     if (this.#redis === undefined || keys.length === 0) return;
 
     try {
-      await this.#redis.srem(dislikedKey(guildId), ...keys);
+      await this.#redis.hdel(dislikedKey(guildId), ...keys);
     } catch (error) {
       this.#redisErrors += 1;
       logger.debug(
@@ -419,16 +487,26 @@ export class AutoplaySessionStore {
   }
 
   async #readDisliked(guildId: string, session: GuildSession): Promise<ReadonlySet<string>> {
-    if (this.#redis === undefined) return new Set(session.disliked);
-
-    try {
-      const raw = await this.#redis.smembers(dislikedKey(guildId));
-      for (const key of raw) session.disliked.add(key);
-    } catch (error) {
-      this.#redisErrors += 1;
-      logger.debug({ err: error, guildId }, 'Reading dislikes from Redis failed; using memory');
+    if (this.#redis !== undefined) {
+      try {
+        const raw = await this.#redis.hgetall(dislikedKey(guildId));
+        for (const [key, at] of Object.entries(raw)) {
+          const parsed = Number(at);
+          if (Number.isFinite(parsed) && !session.disliked.has(key))
+            session.disliked.set(key, parsed);
+        }
+      } catch (error) {
+        this.#redisErrors += 1;
+        logger.debug({ err: error, guildId }, 'Reading dislikes from Redis failed; using memory');
+      }
     }
-    return new Set(session.disliked);
+    const cutoff = this.#now() - SESSION_DISLIKE_TTL_MS;
+    const live = new Set<string>();
+    for (const [key, at] of session.disliked) {
+      if (at >= cutoff) live.add(key);
+      else session.disliked.delete(key);
+    }
+    return live;
   }
 
   /**
@@ -597,6 +675,7 @@ export class AutoplaySessionStore {
         queuedKey(guildId),
         outcomesKey(guildId),
         dislikedKey(guildId),
+        listenerKey(guildId),
       );
     } catch (error) {
       this.#redisErrors += 1;
@@ -680,7 +759,8 @@ export class AutoplaySessionStore {
       session = {
         recent: [],
         queued: [],
-        disliked: new Set(),
+        disliked: new Map(),
+        primaryListenerId: null,
         reservations: new Map(),
         outcomes: emptyOutcomes(),
         touchedAt: now,

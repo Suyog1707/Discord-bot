@@ -6,7 +6,12 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   plugins: [react()],
   resolve: {
-    alias: { '@': resolve(import.meta.dirname, './src') },
+    alias: {
+      '@': resolve(import.meta.dirname, './src'),
+      // See test/server-only-stub.ts: Next owns this specifier, Vitest cannot
+      // resolve it, and the services under test all import it.
+      'server-only': resolve(import.meta.dirname, './test/server-only-stub.ts'),
+    },
   },
   test: {
     name: 'web',

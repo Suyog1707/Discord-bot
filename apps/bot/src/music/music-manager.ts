@@ -201,6 +201,8 @@ export interface JoinOptions {
   readonly voiceChannelId: string;
   readonly textChannelId: string;
   readonly shardId: number;
+  /** Primary listener to start with — the restore path passes the persisted one. */
+  readonly listenerId?: string | null;
 }
 
 export class MusicManager {
@@ -468,12 +470,20 @@ export class MusicManager {
       stayConnected: settings.stayConnected,
       autoplayEnabled: settings.autoplayEnabled,
       autoplayLowWaterMark: getEnv().AUTOPLAY_LOW_WATER_MARK,
+      listenerId: options.listenerId ?? null,
       autoplayTargetQueueSize: getEnv().AUTOPLAY_TARGET_QUEUE_SIZE,
       onSelfDestruct: async (guildId, reason) => {
         logger.info({ guildId, reason }, 'Player self-destructing');
         await this.destroyPlayer(guildId);
       },
       onAutoplayRequest: (guildId, count) => this.pickAutoplayTracks(guildId, count),
+      // The session ledger follows the queue's owner: whose library and
+      // dislikes the planner reads is decided here, not by whoever's request
+      // happens to be the most recent.
+      onListenerChange: (guildId, listenerId) => {
+        void this.#autoplaySession?.setListener(guildId, listenerId).catch(() => undefined);
+        logger.info({ event: 'AUTOPLAY_LISTENER', guildId, listenerId }, 'Autoplay listener set');
+      },
       // A track actually started: this is the moment it becomes "recently
       // played" in the session ledger (recommended ≠ played — only real
       // playback events move this state), and the moment to warm the buffer
@@ -857,18 +867,21 @@ export class MusicManager {
    */
   applyDislike(
     guildId: string,
-    track: Pick<QueuedTrack, 'title' | 'author' | 'sourceKey'>,
+    track: Pick<QueuedTrack, 'title' | 'author' | 'sourceKey'> | { readonly trackKey: string },
   ): {
     readonly key: string;
     readonly removedFromQueue: number;
     readonly evictedFromBuffer: number;
   } {
-    const identity = identityOf(track.author, track.title);
-    // Both spellings of the song: the upload's and, for a recommendation,
-    // the candidate's it was picked as.
+    // Callers arrive with either a queued track (Discord) or just the
+    // canonical key (the dashboard, which only has the snapshot). Both
+    // spellings of a queued song count: the upload's and, for a
+    // recommendation, the candidate's it was picked as.
+    const primaryKey =
+      'trackKey' in track ? track.trackKey : identityOf(track.author, track.title).key;
     const keys = new Set([
-      identity.key,
-      ...(track.sourceKey === undefined ? [] : [track.sourceKey]),
+      primaryKey,
+      ...('trackKey' in track || track.sourceKey === undefined ? [] : [track.sourceKey]),
     ]);
 
     const player = this.#players.get(guildId);
@@ -896,14 +909,34 @@ export class MusicManager {
       {
         event: 'AUTOPLAY_DISLIKE',
         guildId,
-        track: `${track.author} — ${track.title}`,
-        key: identity.key,
+        track: 'trackKey' in track ? track.trackKey : `${track.author} — ${track.title}`,
+        key: primaryKey,
         removedFromQueue: removed.length,
         evictedFromBuffer: evicted,
       },
       'Track disliked; removed from future autoplay',
     );
-    return { key: identity.key, removedFromQueue: removed.length, evictedFromBuffer: evicted };
+    return { key: primaryKey, removedFromQueue: removed.length, evictedFromBuffer: evicted };
+  }
+
+  /**
+   * Whether a person has a say in a guild's live session: its primary
+   * listener, or somebody whose request is in the queue. Gates the live half
+   * of a dashboard dislike, which arrives with nothing but a guild id.
+   */
+  isSessionListener(guildId: string, discordId: string): boolean {
+    const player = this.#players.get(guildId);
+    if (player === undefined) return false;
+    if (player.listenerId === discordId) return true;
+    return player.queue.tracks.some(
+      (track) => trackOrigin(track) === 'user' && track.requestedById === discordId,
+    );
+  }
+
+  /** A dislike withdrawn: the session mirror must stop excluding the song. */
+  forgetDislike(guildId: string, trackKey: string): void {
+    void this.#autoplaySession?.forgetDisliked(guildId, [trackKey]).catch(() => undefined);
+    logger.info({ event: 'AUTOPLAY_UNDISLIKE', guildId, key: trackKey }, 'Dislike withdrawn');
   }
 
   /** Drop a guild's prefetched autoplay buffer — on stop or disconnect. */
@@ -1319,9 +1352,25 @@ export class MusicManager {
     const history = await this.#store.recentHistory(guildId, 40);
     // The very first song of a fresh guild is still playing when the low-
     // water refill first asks, and its history row is only written when it
-    // ends. What is playing IS the session; it seeds until history exists.
-    const current = this.#players.get(guildId)?.queue.current ?? null;
-    if (history.length === 0 && current === null) return [];
+    // ends. What is playing IS the session; it seeds until history exists —
+    // and so does a restored queue whose history was pruned or unreadable:
+    // the tracks it holds are what the room was listening to.
+    const player = this.#players.get(guildId);
+    const current = player?.queue.current ?? null;
+    const queued: AnchorHistoryEntry[] =
+      history.length > 0 || player === undefined
+        ? []
+        : [...player.queue.tracks]
+            .reverse()
+            .slice(0, 10)
+            .map((track) => ({
+              title: track.title,
+              author: track.author,
+              identifier: track.identifier,
+              origin: trackOrigin(track),
+              skipped: false,
+            }));
+    if (history.length === 0 && current === null && queued.length === 0) return [];
 
     // The recommendation engine goes first when it is configured: it knows the
     // guild's taste, its recent skips and the language it listens in, none of
@@ -1337,9 +1386,9 @@ export class MusicManager {
       // newest autoplay play joins only as discounted context. Seeding from
       // the raw last-4 plays here — origin-blind — was the primary source of
       // taste drift.
-      const seeds = selectAutoplaySeeds(
-        current === null
-          ? history
+      const seeds = selectAutoplaySeeds([
+        ...(current === null
+          ? []
           : [
               {
                 title: current.title,
@@ -1348,9 +1397,10 @@ export class MusicManager {
                 origin: trackOrigin(current),
                 skipped: false,
               },
-              ...history,
-            ],
-      );
+            ]),
+        ...history,
+        ...queued,
+      ]);
 
       const recommended = await engine.take(guildId, wanted, seeds);
       if (recommended.length > 0) {
@@ -1520,22 +1570,49 @@ export class MusicManager {
         const channel = guild.channels.cache.get(persisted.voiceChannelId);
         if (channel?.isVoiceBased() !== true) continue;
 
+        // Who this radio is for comes back with the queue: the persisted
+        // owner, or failing that the most recent person who requested one of
+        // the restored tracks.
+        const listener =
+          persisted.listenerId ??
+          [...persisted.tracks]
+            .reverse()
+            .find((track) => trackOrigin(track) === 'user' && track.requestedById !== '0')
+            ?.requestedById ??
+          null;
         const player = await this.getOrCreatePlayer({
           guildId,
           voiceChannelId: persisted.voiceChannelId,
           textChannelId: persisted.textChannelId,
           shardId: guild.shardId,
+          listenerId: listener,
         });
         player.queue.restore(persisted.tracks, persisted.currentIndex, persisted.loopMode);
         await player.setVolume(persisted.volume);
+        if (listener !== null) {
+          void this.#autoplaySession?.setListener(guildId, listener).catch(() => undefined);
+        }
 
         // Resume from the track after the last known one — the position within
         // the old track is stale by now, and skipping forward beats replaying.
+        // The session mirror is synced AFTER the cursor moves, so its queued
+        // set reflects what is actually still ahead. A queue that had already
+        // reached its end does not stay silent: with autoplay on, the restored
+        // listener's taste continues it.
         const next = player.queue.skip();
-        if (next !== null) await player.jumpTo(player.queue.currentIndex);
+        this.#syncSessionQueue(guildId);
+        if (next !== null) {
+          await player.jumpTo(player.queue.currentIndex);
+        } else if (player.autoplayEnabled) {
+          const resumed = await player.resumeAutoplay();
+          logger.info(
+            { guildId, resumed, listener },
+            '24/7: restored queue was finished; autoplay asked to continue',
+          );
+        }
 
         logger.info(
-          { guildId, tracks: persisted.tracks.length },
+          { guildId, tracks: persisted.tracks.length, listener },
           '24/7: rejoined voice and restored the queue',
         );
       } catch (error) {

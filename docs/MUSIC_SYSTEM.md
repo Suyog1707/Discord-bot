@@ -293,3 +293,61 @@ normal SoundCloud → YouTube walk with its stored runtime as evidence
 artist, goes through the same walk under the autoplay threshold
 (`MusicManager.resolveCandidate`). Stored Lavalink blobs are never replayed —
 they go stale.
+
+### Track profiles — features without audio features
+
+No provider here exposes BPM, energy or a formal genre. Instead every known
+candidate on the shortlist gets a `TrackProfile` (`apps/bot/src/ai/track-profile.ts`)
+built only from data that exists: catalogue metadata (title, artists, album,
+runtime, ISRC, release year), Last.fm/MusicBrainz artist tags, and the title's
+script. Two normalisations make that usable:
+
+- **Genre taxonomy** (`genre-taxonomy.ts`): a data-driven rule table maps raw
+  tags onto ~40 normalised genres and families, so "Bollywood", "Hindi Film
+  Songs", "filmi" and "Hindi Music" are one affinity key instead of four. The
+  taste profile writes the normalised keys alongside raw tags; unmatched tags
+  survive as styles.
+- **Language resolver** (`language.ts` → `resolveLanguage`): provider language
+  (high) → language-specific tags (high) / nationality tags (medium) → artist
+  country (medium) → title script (medium) → none. The scorer only penalises a
+  language mismatch at medium or high confidence; an inferred guess can never
+  cost a song its place.
+
+Behavioural similarity (`cooccurrence.ts`) stands in for audio similarity:
+songs the room plays within twenty minutes of each other, saves together, or
+lists together form a lightweight similarity graph, cached ten minutes. It adds
+a bounded boost to known candidates that co-occur with the seeds and an
+artist-level nudge to discoveries. The resolver is an interface
+(`TagSource`), so a legitimate audio-feature source can be added later without
+touching the engine.
+
+### Listener identity
+
+Autoplay plays for a person, not a channel. The **primary listener** is the
+first person to request a track (or whoever ran `/autoplay claim`); their
+history, library, playlists, taste and dislikes lead the blend. It is stored
+on the persisted queue (`queues.listenerId`) together with each track's
+requester, origin and cadence half (`queue_tracks.requestedById / origin /
+autoplayKind`), so a 24/7 restore after a restart rejoins with the same
+listener, re-syncs the session ledger from the restored tracks, and — if the
+saved queue had already finished — resumes personalised autoplay without
+waiting for a new request. `/autoplay listener` shows who it follows.
+
+### `/ask` — questions are answered, requests are played
+
+`/ask` first decides what a sentence is. A question ("who sings this", "what
+genre is this", "which artists are similar to X") is an `inform` intent and is
+answered from metadata alone — the track profile, tags and similar artists —
+without joining voice or touching a playback provider. A named track becomes a
+normal `/play` lookup, and a mood/genre request goes through the recommender
+and, only then, the SoundCloud → YouTube walk.
+
+### Dislikes from the dashboard
+
+Discord buttons, `/dislike` and the dashboard all persist through one
+implementation, `packages/database/src/dislikes.ts`, keyed by the canonical
+identity now shared in `@discord-music/shared` (`music-identity`). The
+dashboard's **Not like** page lists and removes dislikes; its live player's 👎
+button posts the snapshot's `trackKey` and publishes a `dislike` player
+command so the bot applies the live effect (queue, buffer, session) and skips
+the track — provided the person is a listener in that session.

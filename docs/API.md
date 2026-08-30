@@ -23,6 +23,8 @@ Every route is rate-limited per user; 429 responses include `Retry-After`.
 | GET              | `/api/server/:guildId/analytics`    | 30-day listening analytics                                                                          |
 | POST             | `/api/player/:guildId`              | Live control: `{action: pause\|resume\|skip\|stop\|shuffle}` or `{action: "volume", volume: 0-200}` |
 | GET              | `/api/music/:guildId/history`       | Recent plays                                                                                        |
+| GET/POST         | `/api/user/dislikes`                | List / add "not like" tracks                                                                        |
+| DELETE           | `/api/user/dislikes/:trackKey`      | Un-reject one track (key URL-encoded)                                                               |
 | GET/POST         | `/api/playlist`                     | List / create playlists                                                                             |
 | GET/PATCH/DELETE | `/api/playlist/:id`                 | Read / rename+visibility / delete                                                                   |
 | POST             | `/api/playlist/:id/tracks`          | Append a track                                                                                      |
@@ -36,3 +38,10 @@ Guild-scoped routes require the caller to have Manage Server on that guild
 
 `POST /api/player/*` relays to the bot over Redis pub/sub; without Redis (or a
 running bot) it returns `UPSTREAM_UNAVAILABLE`.
+
+`/api/user/dislikes` is the listener's own preference, so it needs no Manage
+Server. `POST` takes `{ title, author, isrc?, trackKey?, guildId?, skipIfPlaying? }`
+and, when `guildId` is given, also relays a `dislike` command to that guild's
+live player; `DELETE` accepts `?guildId=` to relay `undislike`. The relay is
+best-effort — the stored row is the dislike, and autoplay honours it on its next
+pass whether or not a player was listening.

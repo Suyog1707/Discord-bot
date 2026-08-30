@@ -24,6 +24,7 @@ import { getLogger } from '../lib/logger.js';
 import type { QueuedTrack } from '../music/track.js';
 
 import type { CacheService } from './cache.js';
+import { normaliseTags } from './genre-taxonomy.js';
 import { identityOf, trackKeyOf } from './identity.js';
 import type { MusicIntent } from './intent.js';
 import { languageFromTags, languageFromText } from './language.js';
@@ -847,7 +848,14 @@ export class RecommendationService {
     return candidates.map((candidate) => {
       const artistTags = tagsByArtist.get(normaliseArtist(primaryArtist(candidate.artist))) ?? [];
       if (artistTags.length === 0) return candidate;
-      return { ...candidate, tags: [...new Set([...(candidate.tags ?? []), ...artistTags])] };
+      // Normalised genre/family keys travel with the raw tags so the taste
+      // profile's affinity matches either spelling of a genre.
+      const merged = [...new Set([...(candidate.tags ?? []), ...artistTags])];
+      const normalised = normaliseTags(merged);
+      return {
+        ...candidate,
+        tags: [...new Set([...merged, ...normalised.genres, ...normalised.families])],
+      };
     });
   }
 

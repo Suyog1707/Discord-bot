@@ -1,6 +1,15 @@
 'use client';
 
-import { BarChart3, Heart, History, Home, ListMusic, Server, Settings } from 'lucide-react';
+import {
+  BarChart3,
+  Heart,
+  History,
+  Home,
+  ListMusic,
+  Server,
+  Settings,
+  ThumbsDown,
+} from 'lucide-react';
 import { usePathname } from 'next/navigation';
 
 import { AppLink } from '@/components/navigation/app-link';
@@ -13,6 +22,7 @@ const NAV_ITEMS = [
   { href: '/dashboard/servers', label: 'Servers', icon: Server, exact: false },
   { href: '/dashboard/playlists', label: 'Playlists', icon: ListMusic, exact: false },
   { href: '/dashboard/favorites', label: 'Favorites', icon: Heart, exact: false },
+  { href: '/dashboard/dislikes', label: 'Not like', icon: ThumbsDown, exact: false },
   { href: '/dashboard/history', label: 'History', icon: History, exact: false },
   { href: '/dashboard/analytics', label: 'Analytics', icon: BarChart3, exact: false },
   { href: '/dashboard/settings', label: 'Settings', icon: Settings, exact: false },

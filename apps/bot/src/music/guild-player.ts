@@ -24,7 +24,8 @@ import {
   renderPlatformLinks,
   type PlatformLinks,
 } from './platform-links.js';
-import { formatTrackDuration, trackLink, type QueuedTrack } from './track.js';
+import { identityOf } from '../ai/identity.js';
+import { formatTrackDuration, trackLink, trackOrigin, type QueuedTrack } from './track.js';
 import { TrackQueue } from './track-queue.js';
 
 /**
@@ -140,6 +141,13 @@ export interface GuildPlayerOptions {
   readonly stayConnected: boolean;
   /** Smart autoplay: ask for more tracks when the queue drains. */
   readonly autoplayEnabled: boolean;
+  /** Discord id of the primary listener, when restored from a persisted queue. */
+  readonly listenerId?: string | null;
+  /**
+   * Called when the primary listener changes — first request, a claim, or a
+   * restore — so the session ledger follows the queue's owner.
+   */
+  readonly onListenerChange?: (guildId: string, listenerId: string | null) => void;
   /**
    * Queue refill thresholds. When the upcoming count is at or below the
    * low-water mark a refill starts; it fills back up to the target. Refilling
@@ -217,6 +225,13 @@ export class GuildPlayer {
   #stayConnected: boolean;
   #autoplayEnabled: boolean;
   /**
+   * The primary listener: whose history, library, playlists and dislikes
+   * autoplay follows. Set by the first person to request a track, changed by
+   * `/autoplay claim`, persisted with the queue and restored with it.
+   */
+  #listenerId: string | null;
+  readonly #onListenerChange: ((guildId: string, listenerId: string | null) => void) | undefined;
+  /**
    * The refill (low-water or drain) currently running, or null. A promise
    * rather than a flag so the drain path can WAIT for a refill that is
    * already on its way instead of misreading "busy" as "exhausted".
@@ -284,6 +299,8 @@ export class GuildPlayer {
     this.#idleTimeoutSeconds = options.idleTimeoutSeconds;
     this.#stayConnected = options.stayConnected;
     this.#autoplayEnabled = options.autoplayEnabled;
+    this.#listenerId = options.listenerId ?? null;
+    this.#onListenerChange = options.onListenerChange;
     this.#autoplayLowWaterMark = Math.max(
       1,
       options.autoplayLowWaterMark ?? DEFAULT_LOW_WATER_MARK,
@@ -352,6 +369,35 @@ export class GuildPlayer {
     this.#emit('STAY_CONNECTED_CHANGE');
   }
 
+  /** Discord id of the primary listener, or null before anyone has requested. */
+  get listenerId(): string | null {
+    return this.#listenerId;
+  }
+
+  /**
+   * Change the primary listener. Explicit — a claim, or a restore — so a
+   * room's radio only changes hands on purpose, never because somebody else
+   * happened to request the latest song.
+   */
+  setListener(listenerId: string | null): void {
+    if (this.#listenerId === listenerId) return;
+    this.#listenerId = listenerId;
+    this.#onListenerChange?.(this.guildId, listenerId);
+    this.#persist();
+    this.#emit('LISTENER_CHANGE');
+  }
+
+  /**
+   * Resume autoplay on a parked player — the restore path, when the saved
+   * queue had nothing left to play. Returns true when music started.
+   */
+  async resumeAutoplay(): Promise<boolean> {
+    if (this.isPlaying) return true;
+    const outcome = await this.#tryAutoplay();
+    if (outcome === 'continued') this.#clearIdleTimer();
+    return outcome === 'continued';
+  }
+
   get autoplayEnabled(): boolean {
     return this.#autoplayEnabled;
   }
@@ -394,6 +440,14 @@ export class GuildPlayer {
     options: { readonly next?: boolean } = {},
   ): Promise<{ position: number; startedPlayback: boolean }> {
     const position = this.queue.add(tracks, options);
+    // The first person to put music on owns the session until somebody
+    // claims it. Autoplay's own picks and restored placeholders never do.
+    if (this.#listenerId === null) {
+      const requester = tracks.find(
+        (track) => trackOrigin(track) === 'user' && /^\d{15,22}$/u.test(track.requestedById),
+      );
+      if (requester !== undefined) this.setListener(requester.requestedById);
+    }
     this.#persist();
     this.#emit('QUEUE_UPDATE');
 
@@ -595,7 +649,10 @@ export class GuildPlayer {
       this.#autoplayRetryTimer = undefined;
     }
     this.#player.removeAllListeners();
-    await this.#store.flush(this.guildId, this.queue, this.paused);
+    await this.#store.flush(this.guildId, this.queue, this.paused, this.#listenerId, {
+      voiceChannelId: this.#voiceChannelId,
+      textChannelId: this.#textChannelId,
+    });
   }
 
   /** Voice-state hook: the bot is alone (or not) in its channel. */
@@ -1222,6 +1279,9 @@ export class GuildPlayer {
       isStream: track.isStream,
       source: track.source,
       requestedByName: track.requestedByName,
+      // The canonical identity, so a dashboard "not like" names the same song
+      // the bot would, whichever provider streamed it.
+      trackKey: track.sourceKey ?? identityOf(track.author, track.title).key,
     });
     const upcoming = this.queue.upcoming;
 
@@ -1235,6 +1295,7 @@ export class GuildPlayer {
       stayConnected: this.#stayConnected,
       activeFilter: this.#activeFilter,
       voiceChannelId: this.#voiceChannelId,
+      listenerId: this.#listenerId,
       upcoming: upcoming.slice(0, 100).map(toView),
       upcomingTotal: upcoming.length,
     };
@@ -1254,6 +1315,7 @@ export class GuildPlayer {
       paused: this.paused,
       voiceChannelId: this.#voiceChannelId,
       textChannelId: this.#textChannelId,
+      listenerId: this.#listenerId,
     });
   }
 

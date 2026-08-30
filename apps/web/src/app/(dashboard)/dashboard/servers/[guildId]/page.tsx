@@ -1,3 +1,4 @@
+import { identityOf } from '@discord-music/shared';
 import { isAppError } from '@discord-music/shared';
 import type { Metadata } from 'next';
 import Image from 'next/image';
@@ -57,6 +58,9 @@ export default async function ServerDetailPage({
     isStream: track.isStream,
     source: 'queue',
     requestedByName: 'queue',
+    // The canonical key the bot itself would use, so a "not like" pressed
+    // before the first live snapshot arrives names the same song.
+    trackKey: track.sourceKey ?? identityOf(track.author, track.title).key,
   });
   const upcoming = queueTracks.filter((track) => track.position > currentIndex);
   const initialSnapshot =
@@ -103,7 +107,9 @@ export default async function ServerDetailPage({
           <div className="mt-1 flex items-center gap-2">
             <Badge variant="success">Bot active</Badge>
             <Button variant="link" size="sm" asChild className="h-auto p-0">
-              <AppLink href={`/dashboard/analytics?guild=${detail.discordId}`}>View analytics →</AppLink>
+              <AppLink href={`/dashboard/analytics?guild=${detail.discordId}`}>
+                View analytics →
+              </AppLink>
             </Button>
           </div>
         </div>

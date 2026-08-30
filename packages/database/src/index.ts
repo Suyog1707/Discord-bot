@@ -17,6 +17,19 @@ export {
   type CreatePrismaClientOptions,
 } from './client.js';
 
+export {
+  addDislike,
+  DISLIKES_MAX_PER_USER,
+  dislikedArtistCountsFor,
+  dislikedKeysFor,
+  dislikesFor,
+  isDisliked,
+  listDislikes,
+  removeDislike,
+  type DislikeInput,
+  type DislikeSource,
+} from './dislikes.js';
+
 export { Prisma, PrismaClient } from '@prisma/client';
 
 export type {

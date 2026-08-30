@@ -21,7 +21,7 @@
  * stream. Keeping those apart is what makes "the same song, from whichever
  * source can actually play it" expressible at all.
  */
-import { identityOf } from '../ai/identity.js';
+import { identityOf, normaliseIsrc } from '@discord-music/shared';
 
 /** Which catalogue identified this recording. `query` means "nobody did". */
 export type MetadataProvider = 'spotify' | 'apple-music' | 'deezer' | 'query';
@@ -61,15 +61,12 @@ export interface CanonicalTrack {
   readonly artworkUrl: string | null;
 }
 
-/** ISRCs are compared case-insensitively and without the cosmetic dashes. */
-export function normaliseIsrc(value: string | null | undefined): string | null {
-  if (value == null) return null;
-  const cleaned = value.replace(/[^A-Za-z0-9]/gu, '').toUpperCase();
-  // A well-formed ISRC is CC-XXX-YY-NNNNN: 12 alphanumerics. Anything else is
-  // a provider putting something other than an ISRC in the ISRC field, and a
-  // wrong "strongest identifier" is worse than no identifier.
-  return /^[A-Z]{2}[A-Z0-9]{3}\d{7}$/u.test(cleaned) ? cleaned : null;
-}
+/**
+ * ISRC normalisation lives in `@discord-music/shared` alongside canonical
+ * identity — the dashboard stores dislikes with the same normalised code.
+ * Re-exported so importers of this module are unaffected.
+ */
+export { normaliseIsrc };
 
 /** Split a joined credit string ("A, B & C feat. D") into individual names. */
 export function splitArtists(artist: string): readonly string[] {

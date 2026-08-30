@@ -346,3 +346,21 @@ describe('DislikesService.artistCountsFor', () => {
     expect(stub.dislikedTrack.findMany).not.toHaveBeenCalled();
   });
 });
+
+describe('DislikesService — canonical key override', () => {
+  // The one branch the whole provider-independence story rests on: a caller
+  // that KNOWS the canonical key (an autoplay discovery's sourceKey, the
+  // dashboard's snapshot trackKey) stores under it, not under the upload's
+  // decorated spelling.
+  it('stores under a supplied trackKey instead of deriving one from the title', async () => {
+    const { service } = serviceWith();
+    await service.add(
+      '111111111111111111',
+      'ann',
+      { title: 'Song (Official Video)', author: 'Artist - Topic', trackKey: 'artist::song' },
+      'button',
+    );
+    const rows = await service.list('111111111111111111');
+    expect(rows[0]?.trackKey).toBe('artist::song');
+  });
+});

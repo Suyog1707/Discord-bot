@@ -81,6 +81,31 @@ export const playerCommandSchema = z.discriminatedUnion('action', [
     mode: z.enum(['off', 'track', 'queue']),
   }),
   z.object({
+    /**
+     * "Not like this song" from the dashboard. The key is canonical
+     * (`identityOf(author, title).key`, or the track's `sourceKey`) rather than
+     * a provider id, because the dislike is about the recording — the bot has
+     * to recognise the same song when it comes back from another source.
+     */
+    action: z.literal('dislike'),
+    guildId: snowflakeSchema,
+    issuedBy: snowflakeSchema,
+    trackKey: z.string().min(1),
+    /**
+     * Rejecting what is playing right now should also stop it playing. Default
+     * true: the button sits next to the player, and leaving the song running
+     * after a thumbs-down reads as the click having done nothing.
+     */
+    skipIfPlaying: z.boolean().default(true),
+  }),
+  z.object({
+    /** Undo, from the preferences page. */
+    action: z.literal('undislike'),
+    guildId: snowflakeSchema,
+    issuedBy: snowflakeSchema,
+    trackKey: z.string().min(1),
+  }),
+  z.object({
     /** Settings changed on the dashboard that a live player applies in place. */
     action: z.literal('sync-settings'),
     guildId: snowflakeSchema,

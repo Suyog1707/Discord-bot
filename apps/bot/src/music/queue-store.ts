@@ -14,7 +14,7 @@ import {
 import type { LoopMode, MusicSource } from '@discord-music/shared';
 
 import { getLogger } from '../lib/logger.js';
-import { trackOrigin, type QueuedTrack } from './track.js';
+import { trackOrigin, type QueuedTrack, type TrackOrigin } from './track.js';
 import type { TrackQueue } from './track-queue.js';
 
 const logger = getLogger('queue-store');
@@ -54,6 +54,18 @@ export interface PersistedQueue {
   readonly volume: number;
   readonly voiceChannelId: string;
   readonly textChannelId: string;
+  /** Discord id of the primary listener, when one was recorded. */
+  readonly listenerId: string | null;
+}
+
+/** Everything about a queue that is not the track list. */
+export interface QueueSaveState {
+  readonly volume: number;
+  readonly paused: boolean;
+  readonly voiceChannelId: string | null;
+  readonly textChannelId: string | null;
+  /** Discord id of the primary listener; null when nobody has requested yet. */
+  readonly listenerId?: string | null;
 }
 
 export interface HistorySeed {
@@ -85,16 +97,7 @@ export class QueueStore {
   }
 
   /** Schedule a debounced snapshot of the queue for this guild. */
-  scheduleSave(
-    discordGuildId: string,
-    queue: TrackQueue,
-    state: {
-      readonly volume: number;
-      readonly paused: boolean;
-      readonly voiceChannelId: string | null;
-      readonly textChannelId: string | null;
-    },
-  ): void {
+  scheduleSave(discordGuildId: string, queue: TrackQueue, state: QueueSaveState): void {
     const existing = this.#pendingSaves.get(discordGuildId);
     if (existing !== undefined) clearTimeout(existing);
 
@@ -119,7 +122,16 @@ export class QueueStore {
   }
 
   /** Flush a pending save immediately (shutdown path). */
-  async flush(discordGuildId: string, queue: TrackQueue, paused: boolean): Promise<void> {
+  async flush(
+    discordGuildId: string,
+    queue: TrackQueue,
+    paused: boolean,
+    listenerId: string | null = null,
+    channels: { readonly voiceChannelId: string | null; readonly textChannelId: string | null } = {
+      voiceChannelId: null,
+      textChannelId: null,
+    },
+  ): Promise<void> {
     const existing = this.#pendingSaves.get(discordGuildId);
     if (existing !== undefined) {
       clearTimeout(existing);
@@ -131,11 +143,33 @@ export class QueueStore {
       loopMode: queue.loopMode,
       volume: 100,
       paused,
-      voiceChannelId: null,
-      textChannelId: null,
+      // The channels are what `stayConnectedGuildIds` restores by. A graceful
+      // shutdown that erased them made every 24/7 queue unrestorable — the
+      // restore path only ever ran after a crash.
+      voiceChannelId: channels.voiceChannelId,
+      textChannelId: channels.textChannelId,
+      listenerId,
     }).catch((error: unknown) => {
       logger.warn({ err: error, guildId: discordGuildId }, 'Queue flush failed');
     });
+  }
+
+  /**
+   * Internal User row ids for a set of Discord ids. Restoring a queue needs
+   * the requester of every track — that is where listener identity comes from
+   * after a restart — and the rows reference internal ids. One query for the
+   * whole queue, never one per track; people the database has not met are
+   * simply unattributed (recordHistory creates their row the first time a
+   * track they requested ends).
+   */
+  async #userIdsFor(discordIds: ReadonlySet<string>): Promise<ReadonlyMap<string, string>> {
+    const ids = [...discordIds].filter((id) => /^\d{15,22}$/u.test(id));
+    if (ids.length === 0) return new Map();
+    const rows = await this.#prisma.user.findMany({
+      where: { discordId: { in: ids } },
+      select: { id: true, discordId: true },
+    });
+    return new Map(rows.map((row) => [row.discordId, row.id]));
   }
 
   async #save(
@@ -148,6 +182,7 @@ export class QueueStore {
       readonly paused: boolean;
       readonly voiceChannelId: string | null;
       readonly textChannelId: string | null;
+      readonly listenerId?: string | null;
     },
   ): Promise<void> {
     const guild = await this.#prisma.guild.findUnique({
@@ -159,6 +194,15 @@ export class QueueStore {
     const queueId =
       guild.queue?.id ??
       (await this.#prisma.queue.create({ data: { guildId: guild.id }, select: { id: true } })).id;
+
+    const people = new Set<string>();
+    for (const track of snapshot.tracks) {
+      if (trackOrigin(track) === 'user') people.add(track.requestedById);
+    }
+    if (snapshot.listenerId != null) people.add(snapshot.listenerId);
+    const userIds = await this.#userIdsFor(people);
+    const listenerRowId =
+      snapshot.listenerId == null ? null : (userIds.get(snapshot.listenerId) ?? null);
 
     // Replace-all inside one transaction: simplest correct model for a list
     // that reorders arbitrarily, and queue sizes are bounded by LIMITS.
@@ -173,6 +217,7 @@ export class QueueStore {
           paused: snapshot.paused,
           voiceChannelId: snapshot.voiceChannelId,
           textChannelId: snapshot.textChannelId,
+          listenerId: listenerRowId,
         },
       }),
       ...(snapshot.tracks.length > 0
@@ -192,6 +237,11 @@ export class QueueStore {
                 source: TO_DB_SOURCE[track.source],
                 playbackSource:
                   track.playbackSource === undefined ? null : TO_DB_SOURCE[track.playbackSource],
+                origin: trackOrigin(track),
+                autoplayKind: track.autoplayKind ?? null,
+                sourceKey: track.sourceKey ?? null,
+                requestedById:
+                  trackOrigin(track) === 'user' ? (userIds.get(track.requestedById) ?? null) : null,
               })),
             }),
           ]
@@ -241,32 +291,58 @@ export class QueueStore {
   async loadPersisted(discordGuildId: string): Promise<PersistedQueue | null> {
     const queue = await this.#prisma.queue.findFirst({
       where: { guild: { discordId: discordGuildId } },
-      include: { tracks: { orderBy: { position: 'asc' } } },
+      include: {
+        listener: { select: { discordId: true } },
+        tracks: {
+          orderBy: { position: 'asc' },
+          include: {
+            requestedBy: { select: { discordId: true, username: true, globalName: true } },
+          },
+        },
+      },
     });
     if (queue?.voiceChannelId == null || queue.tracks.length === 0) return null;
 
     return {
-      tracks: queue.tracks.map((track) => ({
-        encoded: track.encoded,
-        identifier: track.identifier,
-        title: track.title,
-        author: track.author,
-        durationMs: track.durationMs,
-        uri: track.uri,
-        artworkUrl: track.artworkUrl,
-        isStream: track.isStream,
-        source: FROM_DB_SOURCE[track.source],
-        ...(track.playbackSource === null
-          ? {}
-          : { playbackSource: FROM_DB_SOURCE[track.playbackSource] }),
-        requestedById: '0',
-        requestedByName: 'Restored',
-      })),
+      tracks: queue.tracks.map((track): QueuedTrack => {
+        // A track with a recorded requester comes back as theirs; autoplay's
+        // own picks come back as autoplay's, with the cadence half they
+        // filled. Only rows written before attribution existed are "Restored".
+        const origin: TrackOrigin = track.origin === 'autoplay' ? 'autoplay' : 'user';
+        const requester = track.requestedBy;
+        const kind =
+          track.autoplayKind === 'familiar' || track.autoplayKind === 'discovery'
+            ? track.autoplayKind
+            : undefined;
+        return {
+          encoded: track.encoded,
+          identifier: track.identifier,
+          title: track.title,
+          author: track.author,
+          durationMs: track.durationMs,
+          uri: track.uri,
+          artworkUrl: track.artworkUrl,
+          isStream: track.isStream,
+          source: FROM_DB_SOURCE[track.source],
+          ...(track.playbackSource === null
+            ? {}
+            : { playbackSource: FROM_DB_SOURCE[track.playbackSource] }),
+          requestedById: origin === 'autoplay' ? '0' : (requester?.discordId ?? '0'),
+          requestedByName:
+            origin === 'autoplay'
+              ? 'Autoplay'
+              : (requester?.globalName ?? requester?.username ?? 'Restored'),
+          origin,
+          ...(kind === undefined ? {} : { autoplayKind: kind }),
+          ...(track.sourceKey === null ? {} : { sourceKey: track.sourceKey }),
+        };
+      }),
       currentIndex: Math.min(queue.currentIndex, queue.tracks.length - 1),
       loopMode: FROM_DB_LOOP[queue.loopMode],
       volume: queue.volume,
       voiceChannelId: queue.voiceChannelId,
       textChannelId: queue.textChannelId ?? '',
+      listenerId: queue.listener?.discordId ?? null,
     };
   }
 

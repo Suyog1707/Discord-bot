@@ -3,6 +3,9 @@ import { describe, expect, it, vi } from 'vitest';
 import type { QueuedTrack } from '../music/track.js';
 
 import { AutoplayPlanner, type PlannerResolvers } from './autoplay-planner.js';
+import { CacheService } from './cache.js';
+import type { CooccurrenceService, CooccurrenceSignals } from './cooccurrence.js';
+import { TrackProfileResolver } from './track-profile.js';
 import type { FamiliarCandidate, FamiliarSource } from './familiar-scoring.js';
 import type { FamiliarPoolService } from './familiar.js';
 import { identityOf } from './identity.js';
@@ -139,6 +142,10 @@ function harness(options: {
   readonly session?: AutoplaySessionStore;
   /** Tags the fake recommender returns per artist, for the enrichment pass. */
   readonly artistTags?: Readonly<Record<string, readonly string[]>>;
+  /** Behavioural signals the fake co-occurrence service returns. */
+  readonly behaviour?: CooccurrenceSignals;
+  /** A profile resolver; when given, the shortlist is enriched through it. */
+  readonly profiles?: TrackProfileResolver;
 }): Harness {
   const session = options.session ?? new AutoplaySessionStore();
   const profileCalls: Harness['profileCalls'] = [];
@@ -191,6 +198,14 @@ function harness(options: {
     taste,
     familiar: familiarService,
     recommender,
+    ...(options.behaviour === undefined
+      ? {}
+      : {
+          cooccurrence: {
+            signals: vi.fn(() => Promise.resolve(options.behaviour)),
+          } as unknown as CooccurrenceService,
+        }),
+    ...(options.profiles === undefined ? {} : { profiles: options.profiles }),
     ...(options.config === undefined ? {} : { config: options.config }),
   });
   planner.setResolvers({
@@ -623,5 +638,74 @@ describe('AutoplayPlanner — resolution and provider independence', () => {
     await expect(planner.generate('guild', seeds, 1, { background: false })).rejects.toThrow(
       /resolvers/u,
     );
+  });
+});
+
+describe('AutoplayPlanner — behavioural similarity and track profiles', () => {
+  it('pulls forward the known song the room habitually plays right after the seed', async () => {
+    const seedKey = identityOf('Seed Artist', 'Seed Song').key;
+    const pool = [
+      familiar('Artist Far', 'Unrelated', ['library']),
+      familiar('Artist Near', 'Played Together', ['library']),
+    ];
+    const nearKey = identityOf('Artist Near', 'Played Together').key;
+    const behaviour: CooccurrenceSignals = {
+      tracks: new Map([[nearKey, new Map([[seedKey, 1]])]]),
+      artists: new Map(),
+    };
+    const h = harness({ pool, behaviour });
+
+    const generated = await h.planner.generate('guild', seeds, 1, { background: false });
+
+    expect(generated[0]?.track.title).toBe('Played Together');
+  });
+
+  it('matches taste affinity through normalised genres, whatever the raw tag spelling', async () => {
+    // The listener's profile learned "bollywood"; one candidate's artist is
+    // tagged "hindi film songs", another "british indie". Only the normalised
+    // genre key bridges the first spelling to the profile.
+    const profile: TasteProfile = {
+      ...EMPTY_TASTE_PROFILE,
+      tagAffinity: { bollywood: 0.9, indian: 0.6 },
+      confidence: 1,
+      sampleSize: 100,
+    };
+    const tagsFor: Record<string, readonly string[]> = {
+      'Desi Singer': ['hindi film songs', 'filmi'],
+      'Indie Band': ['british', 'indie rock'],
+    };
+    const profiles = new TrackProfileResolver(
+      { artistTags: (artist) => Promise.resolve(tagsFor[artist] ?? []) },
+      new CacheService(),
+    );
+    const pool = [
+      familiar('Indie Band', 'Grey Skies', ['library']),
+      familiar('Desi Singer', 'Dil Ki Baat', ['library']),
+    ];
+    const h = harness({ pool, profile, profiles });
+
+    const generated = await h.planner.generate('guild', seeds, 1, { background: false });
+
+    expect(generated[0]?.track.title).toBe('Dil Ki Baat');
+  });
+
+  it('does not let a low-confidence language guess cost a song its place', async () => {
+    // A Hindi session (Devanagari seed). One candidate is transliterated with
+    // no tags at all — its language is unknown, not English — and must not be
+    // penalised below an equally scored one.
+    const hindiSeeds: readonly TrackSeed[] = [{ title: 'तुम ही हो', artist: 'Arijit Singh' }];
+    const profiles = new TrackProfileResolver(
+      { artistTags: () => Promise.resolve([]) },
+      new CacheService(),
+    );
+    const pool = [
+      familiar('Some Singer', 'Tum Mile', ['library']),
+      familiar('Other Singer', 'Kabhi Kabhi', ['library']),
+    ];
+    const h = harness({ pool, profiles });
+
+    const generated = await h.planner.generate('guild', hindiSeeds, 2, { background: false });
+
+    expect(generated).toHaveLength(2);
   });
 });

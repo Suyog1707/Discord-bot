@@ -38,7 +38,14 @@ export const musicIntentSchema = z.object({
    * intent step earns its latency.
    */
   intent: z
-    .enum(['play_specific', 'recommend', 'generate_playlist', 'continue_taste', 'unknown'])
+    .enum([
+      'play_specific',
+      'recommend',
+      'generate_playlist',
+      'continue_taste',
+      'inform',
+      'unknown',
+    ])
     .default('unknown'),
   /** A concrete title/artist to look up, when the user named one. */
   query: z.string().max(300).nullable().default(null),
@@ -77,7 +84,7 @@ export interface IntentResult {
 
 const SYSTEM_PROMPT = `You convert a Discord music request into JSON. Respond with the object only.
 
-Fields: intent (play_specific|recommend|generate_playlist|continue_taste|unknown),
+Fields: intent (play_specific|recommend|generate_playlist|continue_taste|inform|unknown),
 query (string|null), mood (string[]), genre (string[]), activity (string|null),
 language (string|null), era (string|null), artists (string[]),
 excludeArtists (string[]), quantity (int), usePersonalHistory (bool),
@@ -87,6 +94,10 @@ Rules:
 - Never invent song titles. query holds only what the user literally named.
 - intent is play_specific when they named a track, album or artist to play now.
 - intent is continue_taste for "more like this" or "keep the vibe going".
+- intent is inform when they ask a QUESTION about music rather than asking to
+  play anything: "who sings this", "what genre is this song", "what is playing",
+  "which artists are similar to X", "tell me about Y". query then holds the
+  subject they asked about (an artist or song), or null for the playing track.
 - quantity defaults to 10; read a stated number ("queue 250 songs" -> 250).
 - language only when the user says it. Do not infer it from an artist's name.
 - avoidRecent true for "haven't heard", "something new", "fresh".
@@ -156,6 +167,30 @@ export function parseIntentHeuristically(raw: string): MusicIntent {
     parsedQuantity !== null && Number.isFinite(parsedQuantity)
       ? Math.min(Math.max(parsedQuantity, 1), MAX_REQUESTED_TRACKS)
       : DEFAULT_RECOMMENDATION_COUNT;
+
+  // A question is answered, not played. Detected before anything else:
+  // "who sings something similar" is still a question, and sending it to
+  // the recommender would queue ten songs instead of answering.
+  // A question, and not a request wearing a question mark: "can you play
+  // some lofi?" and "do you have punjabi songs" want music, not an answer.
+  const asksAQuestion =
+    /^(who|what|which|when|where|why|how|is|are|does|do|did|tell me|can you tell)\b/u.test(text) &&
+    !/\b(play|queue|put on|add|start|give me|have|want)\b/u.test(text);
+  if (asksAQuestion) {
+    // From the raw text, not the lowercased one: the subject is shown back
+    // to the person and "karan aujla" reads wrong.
+    const subject = /\b(?:about|by|of|to|like)\s+(.+?)\??$/iu.exec(raw.trim())?.[1]?.trim() ?? null;
+    return musicIntentSchema.parse({
+      intent: 'inform',
+      query:
+        subject === null ||
+        subject.length === 0 ||
+        /\b(this|it|that|the (current|playing) (song|track))\b/u.test(subject)
+          ? null
+          : subject,
+      language: language ?? null,
+    });
+  }
 
   const continuesTaste =
     /\b(more like|similar|keep (it |the )?(going|vibe)|same (vibe|taste))\b/u.test(text);

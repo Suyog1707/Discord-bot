@@ -57,17 +57,19 @@ model User {
   createdAt     DateTime  @default(now()) @db.Timestamptz(3)
   updatedAt     DateTime  @updatedAt @db.Timestamptz(3)
 
-  accounts      Account[]
-  sessions      Session[]
-  playlists     Playlist[]
-  verifications Verification[]
-  guildMembers  GuildMember[]
-  queueTracks   QueueTrack[]
-  songHistory   SongHistory[]
-  favorites     FavoriteTrack[]
-  dislikes      DislikedTrack[]
-  spotify       SpotifyAccount?
-  tasteProfile  TasteProfile?
+  accounts        Account[]
+  sessions        Session[]
+  playlists       Playlist[]
+  verifications   Verification[]
+  guildMembers    GuildMember[]
+  queueTracks     QueueTrack[]
+  songHistory     SongHistory[]
+  favorites       FavoriteTrack[]
+  dislikes        DislikedTrack[]
+  spotify         SpotifyAccount?
+  tasteProfile    TasteProfile?
+  /// Queues this user is the primary listener of. Autoplay follows their taste.
+  listeningQueues Queue[]         @relation("QueueListener")
 
   @@index([createdAt])
   @@map("users")
@@ -241,12 +243,19 @@ model Queue {
   loopMode       LoopMode @default(OFF)
   shuffled       Boolean  @default(false)
   paused         Boolean  @default(false)
+  /// The primary listener: whose history, library, playlists and dislikes
+  /// drive autoplay for this queue. Set when a person first requests a track
+  /// (or claims the session), persisted so a 24/7 restore after a restart
+  /// still knows who it is playing for.
+  listenerId     String?
   createdAt      DateTime @default(now()) @db.Timestamptz(3)
   updatedAt      DateTime @updatedAt @db.Timestamptz(3)
 
-  guild  Guild        @relation(fields: [guildId], references: [id], onDelete: Cascade)
-  tracks QueueTrack[]
+  guild    Guild        @relation(fields: [guildId], references: [id], onDelete: Cascade)
+  listener User?        @relation("QueueListener", fields: [listenerId], references: [id], onDelete: SetNull)
+  tracks   QueueTrack[]
 
+  @@index([listenerId])
   @@map("queues")
 }
 
@@ -275,6 +284,17 @@ model QueueTrack {
   /// metadata layer identified.
   playbackSource MusicSource?
   requestedById  String?
+  /// "user" or "autoplay" — who put it on. Restoring a queue needs this so
+  /// autoplay's picks are not mistaken for taste anchors, and so listener
+  /// identity can be derived from the tracks people actually requested.
+  origin         String       @default("user")
+  /// For autoplay picks, which half of the cadence they filled
+  /// ("familiar" | "discovery"); null for user requests.
+  autoplayKind   String?
+  /// Canonical key of the candidate an autoplay pick was chosen as, when it
+  /// differs from the upload's own spelling. A dislike is keyed on this, so
+  /// losing it across a restart would split one song into two identities.
+  sourceKey      String?
   createdAt      DateTime     @default(now()) @db.Timestamptz(3)
 
   queue       Queue @relation(fields: [queueId], references: [id], onDelete: Cascade)

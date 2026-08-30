@@ -805,3 +805,87 @@ describe('AutoplayPlanner — a skip is not a dislike', () => {
     expect(generated.map((entry) => entry.track.title)).toEqual(['Fresh Song', 'Rejected Song']);
   });
 });
+
+describe('AutoplayPlanner — surviving a restart', () => {
+  /**
+   * A restart loses the in-memory session. What survives is the persisted
+   * queue: tracks with their requester and, for autoplay picks, their kind.
+   * The music manager re-syncs those into a fresh session store, and the
+   * planner must pick up the listener AND the cadence from that alone.
+   */
+  it("continues the same listener's radio and cadence from a restored queue", async () => {
+    const before = harness({
+      pool: library(30),
+      discoverySupply: regeneratingDiscoveries(12).supply,
+    });
+    const played = (await playThrough(before, 6)).flat();
+    expect(played).toHaveLength(12);
+
+    // --- restart: new store, only the persisted queue's tracks come back ---
+    const restored = new AutoplaySessionStore({ now: () => clock });
+    const listenerId = '111111111111111111';
+    await restored.setListener('guild', listenerId);
+    await restored.syncQueue('guild', [
+      {
+        ...entryOf(playable('Someone', 'Their Request')),
+        origin: 'user',
+        requestedById: listenerId,
+      },
+      ...played.slice(-3).map((track) => ({
+        ...entryOf(track),
+        origin: 'autoplay' as const,
+        ...(track.autoplayKind === undefined ? {} : { kind: track.autoplayKind }),
+      })),
+    ]);
+    const snap = await restored.snapshot('guild');
+    expect(snap.listenerIds[0]).toBe(listenerId);
+    expect(snap.recentAutoplayKinds.length).toBe(3);
+
+    const after = harness({
+      pool: library(30),
+      discoverySupply: regeneratingDiscoveries(12).supply,
+      session: restored,
+    });
+    const continued = (await playThrough(after, 6)).flat();
+
+    expect(continued).toHaveLength(12);
+    // The three restored autoplay picks are queued, so they cannot be served again.
+    const queuedKeys = new Set(played.slice(-3).map(keyOf));
+    expect(continued.some((track) => queuedKeys.has(keyOf(track)))).toBe(false);
+    // Cadence held across the restart: never two discoveries in a row.
+    const kinds = continued.map((track) => track.autoplayKind);
+    for (let index = 1; index < kinds.length; index += 1) {
+      expect(kinds[index] === 'discovery' && kinds[index - 1] === 'discovery').toBe(false);
+    }
+  });
+
+  it('respects a dislike made after the restart, and forgets it when withdrawn', async () => {
+    const session = new AutoplaySessionStore({ now: () => clock });
+    const favourite = familiar('Loved Artist', 'Loved Song', ['library'], {
+      plays: 9,
+      userPlays: 9,
+      completions: 9,
+      lastPlayedAt: null,
+    });
+    const h = harness({ pool: [favourite, ...library(3)], session });
+
+    const first = await h.planner.generate('guild', seeds, 1, { background: false });
+    expect(first[0]?.track.title).toBe('Loved Song');
+    await session.release(
+      'guild',
+      first.map((entry) => entry.reservedKey),
+    );
+
+    await session.recordDisliked('guild', [identityOf(favourite.artist, favourite.title).key]);
+    const disliked = await h.planner.generate('guild', seeds, 1, { background: false });
+    expect(disliked[0]?.track.title).not.toBe('Loved Song');
+    await session.release(
+      'guild',
+      disliked.map((entry) => entry.reservedKey),
+    );
+
+    await session.forgetDisliked('guild', [identityOf(favourite.artist, favourite.title).key]);
+    const forgiven = await h.planner.generate('guild', seeds, 1, { background: false });
+    expect(forgiven[0]?.track.title).toBe('Loved Song');
+  });
+});

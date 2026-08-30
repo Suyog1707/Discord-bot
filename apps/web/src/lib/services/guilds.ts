@@ -59,6 +59,13 @@ export interface QueueTrackView {
   readonly uri: string | null;
   readonly artworkUrl: string | null;
   readonly isStream: boolean;
+  /**
+   * Canonical key of the candidate an autoplay pick was chosen as, when the
+   * bot recorded one. The initial player snapshot derives its `trackKey`
+   * from this so a "not like" pressed before the first live event names the
+   * same recording the recommender knows.
+   */
+  readonly sourceKey: string | null;
 }
 
 export interface ServerDetail {
@@ -133,6 +140,7 @@ export async function getServerDetail(
               uri: track.uri,
               artworkUrl: track.artworkUrl,
               isStream: track.isStream,
+              sourceKey: track.sourceKey,
             })),
           },
   };

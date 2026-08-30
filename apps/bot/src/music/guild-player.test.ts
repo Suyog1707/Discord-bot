@@ -913,3 +913,63 @@ describe('GuildPlayer autoplay after parking and stopping', () => {
     expect(h.fetchChannel).toHaveBeenCalledWith('text-1');
   });
 });
+
+describe('GuildPlayer listener identity', () => {
+  it('adopts the first person who requests a track as the primary listener', async () => {
+    const h = harness();
+    const requested: QueuedTrack = { ...track('t1', 'One'), requestedById: '111111111111111111' };
+    expect(h.gp.listenerId).toBeNull();
+
+    await h.gp.enqueue([requested]);
+    await h.gp.enqueue([{ ...track('t2', 'Two'), requestedById: '222222222222222222' }]);
+
+    // First requester keeps the session; a later request does not steal it.
+    expect(h.gp.listenerId).toBe('111111111111111111');
+    expect(h.store.scheduleSave).toHaveBeenLastCalledWith(
+      'guild-1',
+      expect.anything(),
+      expect.objectContaining({ listenerId: '111111111111111111' }),
+    );
+  });
+
+  it('ignores autoplay picks and restored placeholders when choosing a listener', async () => {
+    const h = harness();
+    await h.gp.enqueue([
+      track('a1', 'Auto', 'autoplay'),
+      { ...track('r1', 'Restored'), requestedById: '0' },
+    ]);
+    expect(h.gp.listenerId).toBeNull();
+  });
+
+  it('changes hands only through an explicit claim, and reports it', async () => {
+    const h = harness();
+    await h.gp.enqueue([{ ...track('t1', 'One'), requestedById: '111111111111111111' }]);
+    h.gp.setListener('333333333333333333');
+    expect(h.gp.listenerId).toBe('333333333333333333');
+    expect(h.gp.snapshot().listenerId).toBe('333333333333333333');
+  });
+
+  it('resumes a parked queue through autoplay without a new request', async () => {
+    const h = harness({
+      autoplayEnabled: true,
+      autoplay: (_g, count) => Promise.resolve(picks(count)),
+    });
+    // A restored queue whose cursor is past its end: nothing to play.
+    h.gp.queue.restore([track('old', 'Old')], 0, 'off');
+    h.gp.queue.skip();
+    expect(h.gp.queue.current).toBeNull();
+
+    const resumed = await h.gp.resumeAutoplay();
+    await settle();
+
+    expect(resumed).toBe(true);
+    expect(h.autoplay).toHaveBeenCalledWith('guild-1', 4);
+    expect(played(h.player).length).toBeGreaterThan(0);
+  });
+
+  it('exposes the canonical track key in snapshots for dashboard actions', async () => {
+    const h = harness();
+    await h.gp.enqueue([{ ...track('t1', 'Blinding Lights'), author: 'The Weeknd' }]);
+    expect(h.gp.snapshot().current?.trackKey).toBe('weeknd::blinding lights');
+  });
+});

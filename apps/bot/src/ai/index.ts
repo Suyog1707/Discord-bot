@@ -16,6 +16,8 @@ import { getLogger } from '../lib/logger.js';
 import { AutoplayPlanner, type DislikeSource } from './autoplay-planner.js';
 import { AutoplayEngine } from './autoplay.js';
 import { CacheService } from './cache.js';
+import { CooccurrenceService } from './cooccurrence.js';
+import { TrackProfileResolver } from './track-profile.js';
 import { FamiliarPoolService } from './familiar.js';
 import { IntentService } from './intent.js';
 import { LastFmService } from './lastfm.js';
@@ -74,6 +76,25 @@ export function createAiStack(options: {
     new ShortlistReranker(llm),
   );
 
+  // Metadata enrichment: one resolver, one cache, shared by autoplay's known
+  // pool and by /ask's answers. Tags come from the recommender's cached
+  // artist-tag lookup and the artist's country from MusicBrainz.
+  // Two resolvers over one cache. Autoplay's runs on Last.fm tags alone:
+  // MusicBrainz serialises at one request per second, and a refill that
+  // waits on a queue of those is heard as silence. /ask's answers can afford
+  // the artist's country.
+  const profiles = new TrackProfileResolver(
+    { artistTags: (artist) => recommender.artistTags(artist) },
+    cache,
+  );
+  const informProfiles = new TrackProfileResolver(
+    {
+      artistTags: (artist) => recommender.artistTags(artist),
+      artistCountry: async (artist) => (await musicbrainz.canonicalArtist(artist)).country,
+    },
+    cache,
+  );
+
   // The session store is constructed BEFORE the orchestrator on purpose: the
   // orchestrator needs it so /ask runs under the same exclusions and
   // reservations as autoplay. Without it, the two paths race each other for
@@ -88,6 +109,12 @@ export function createAiStack(options: {
     musicbrainz,
     cache,
     session,
+    inform: {
+      artistTags: (artist) => recommender.artistTags(artist),
+      similarArtists: async (artist) =>
+        (await lastfm.similarArtists(artist, 8)).map((entry) => entry.name),
+      profile: (input) => informProfiles.resolve(input),
+    },
   });
 
   // Autoplay proper: the planner keeps the listener's own songs (library,
@@ -101,6 +128,10 @@ export function createAiStack(options: {
     familiar,
     recommender,
     ...(dislikes === undefined ? {} : { dislikes }),
+    // Behavioural similarity stands in for the audio features no provider
+    // exposes: what the room plays, saves and lists together.
+    cooccurrence: new CooccurrenceService(prisma, cache),
+    profiles,
     config: {
       repeatCooldownMs: env.AUTOPLAY_REPEAT_COOLDOWN_MINUTES * 60_000,
       interleave: {

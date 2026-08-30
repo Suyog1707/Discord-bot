@@ -52,6 +52,15 @@ export interface FamiliarCandidate {
   /** Number of distinct listeners who have it in library/playlist/history. */
   readonly listenerCount: number;
   readonly tags?: readonly string[];
+  /**
+   * Resolved language, when a TrackProfile supplied one. Confidence-aware:
+   * the penalty only fires on medium or high confidence, so a guess from a
+   * Latin-script title can never cost a song its place.
+   */
+  readonly language?: {
+    readonly value: string | null;
+    readonly confidence: 'high' | 'medium' | 'low' | 'none';
+  };
 }
 
 export interface FamiliarWeights {
@@ -343,8 +352,15 @@ function scoreLanguagePenalty(
   const sessionLanguage = context.sessionLanguage ?? dominantLanguage(context.profile);
   if (sessionLanguage === null) return 0;
 
+  // A resolved profile is authoritative when it is confident, and silent
+  // when it is not — weak inference must not be allowed to disqualify.
+  const resolved = candidate.language;
   const candidateLanguage =
-    languageFromText(`${candidate.title} ${candidate.artist}`) ?? languageFromTags(tags);
+    resolved === undefined
+      ? (languageFromText(`${candidate.title} ${candidate.artist}`) ?? languageFromTags(tags))
+      : resolved.confidence === 'high' || resolved.confidence === 'medium'
+        ? resolved.value
+        : null;
   if (candidateLanguage === null || candidateLanguage === sessionLanguage) return 0;
 
   return 0.35;

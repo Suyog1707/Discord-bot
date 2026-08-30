@@ -12,6 +12,7 @@
  */
 export * from './constants/index.js';
 export * from './errors/index.js';
+export * from './music-identity/index.js';
 export * from './net/index.js';
 export * from './player-commands/index.js';
 export * from './playlist-export/index.js';

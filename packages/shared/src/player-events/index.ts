@@ -28,6 +28,7 @@ export const PLAYER_EVENT_TYPES = [
   'PLAYER_CONNECT',
   'PLAYER_DISCONNECT',
   'AUTOPLAY_CHANGE',
+  'LISTENER_CHANGE',
   'FILTER_CHANGE',
   'VOLUME_CHANGE',
   'SEEK',
@@ -48,6 +49,12 @@ const trackSnapshotSchema = z.object({
   isStream: z.boolean(),
   source: z.string(),
   requestedByName: z.string(),
+  /**
+   * Canonical track identity (`artist::title`, the recommendation engine's
+   * key). Carried so a dashboard "not like" names the same song the bot
+   * would, whichever provider streamed it and however the upload was titled.
+   */
+  trackKey: z.string().optional(),
 });
 
 export type TrackSnapshot = z.infer<typeof trackSnapshotSchema>;
@@ -66,6 +73,8 @@ export const playerSnapshotSchema = z.object({
   stayConnected: z.boolean(),
   activeFilter: z.string().nullable(),
   voiceChannelId: z.string().nullable(),
+  /** Discord id of the primary listener autoplay follows; null until someone requests. */
+  listenerId: z.string().nullable().optional(),
   /** Upcoming tracks, capped — enough for every dashboard view. */
   upcoming: z.array(trackSnapshotSchema).max(100),
   upcomingTotal: z.number().int().min(0),

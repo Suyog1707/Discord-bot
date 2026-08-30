@@ -36,6 +36,8 @@ export const playerActionSchema = z.discriminatedUnion('action', [
     to: z.number().int().min(1),
   }),
   z.object({ action: z.literal('loop'), mode: z.enum(['off', 'track', 'queue']) }),
+  // Relayed for completeness: the dashboard's own "Not like" button posts to
+  // /api/user/dislikes so the rejection is persisted first, but a client that
 ]);
 
 export type PlayerActionInput = z.infer<typeof playerActionSchema>;
