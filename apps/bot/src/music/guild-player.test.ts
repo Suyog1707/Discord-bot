@@ -57,7 +57,7 @@ function picks(count: number, prefix = 'auto'): readonly QueuedTrack[] {
 type Handler = (payload: never) => void;
 
 interface PlayPayload {
-  readonly track: { readonly encoded: string };
+  readonly track: { readonly encoded: string; readonly userData?: { readonly playSeq: number } };
   readonly volume: number;
 }
 
@@ -238,11 +238,49 @@ function endNaturally(player: FakePlayer, ended = lastPlayed(player)): void {
   player.emit('end', { reason: 'finished', track: ended });
 }
 
+/**
+ * The track the fake node reports in an event, shaped the way a real Lavalink
+ * node shapes it.
+ *
+ * The `encoded` blob is deliberately NOT the blob that was handed to
+ * `playTrack`. Lavalink re-encodes the live track for every event it sends,
+ * and the playback position is part of that encoding, so the string that comes
+ * back when a song ends is never the string that was sent when it started.
+ * Modelling that faithfully is the whole point: a fake that echoed the blob
+ * back let a guard comparing `encoded` pass every test while wedging the
+ * player after one track in production.
+ */
+function lavalinkEventTrack(
+  encoded: string,
+  positionMs: number,
+  userData?: { readonly playSeq: number },
+): {
+  readonly encoded: string;
+  readonly info: { readonly identifier: string };
+  readonly userData?: { readonly playSeq: number };
+} {
+  return {
+    encoded: `${encoded}@${String(positionMs)}`,
+    // Fixtures use `encoded-<id>` for a track whose identifier is `<id>`.
+    info: { identifier: encoded.replace(/^encoded-/u, '') },
+    // Lavalink echoes whatever `userData` the track was played with.
+    ...(userData === undefined ? {} : { userData }),
+  };
+}
+
 /** The track the fake node is "playing": whatever `playTrack` was last given. */
-function lastPlayed(player: FakePlayer): { readonly encoded: string } | undefined {
+function lastPlayed(player: FakePlayer):
+  | {
+      readonly encoded: string;
+      readonly info: { readonly identifier: string };
+      readonly userData?: { readonly playSeq: number };
+    }
+  | undefined {
   const calls = player.playTrack.mock.calls;
   const last = calls[calls.length - 1]?.[0];
-  return last === undefined ? undefined : { encoded: last.track.encoded };
+  return last === undefined
+    ? undefined
+    : lavalinkEventTrack(last.track.encoded, player.position, last.track.userData);
 }
 
 /* ---------------------------------------------------------------------- tests */
@@ -497,6 +535,171 @@ describe('GuildPlayer queue mutation', () => {
     await settle();
 
     expect(h.gp.queue.currentIndex).toBe(1);
+    expect(played(h.player)).toEqual(['encoded-t1', 'encoded-t2']);
+  });
+});
+
+describe('GuildPlayer track-end correlation', () => {
+  /**
+   * The regression this suite exists for.
+   *
+   * Lavalink re-encodes the live track for every event it emits, and the
+   * playback position is part of that encoding, so the `encoded` blob reported
+   * when a song ends is never the blob that was handed over when it started.
+   * A guard that compared the two called every natural end "an end for some
+   * other track" and returned without advancing: the first song played, and
+   * the session then sat silent with a full queue. `lavalinkEventTrack` models
+   * that drift, so this asserts the property rather than the byte string.
+   */
+  it('starts the next queued track when the end reports a re-encoded blob', async () => {
+    const h = harness();
+    await h.gp.enqueue([track('t1', 'Song One'), track('t2', 'Song Two')]);
+    h.player.emit('start');
+    await settle();
+
+    const ended = lastPlayed(h.player);
+    expect(ended?.encoded).not.toBe('encoded-t1');
+    expect(ended?.info.identifier).toBe('t1');
+
+    endNaturally(h.player);
+    await settle();
+
+    expect(played(h.player)).toEqual(['encoded-t1', 'encoded-t2']);
+    expect(h.gp.queue.current?.identifier).toBe('t2');
+  });
+
+  it('advances the cursor exactly once for one natural end', async () => {
+    const h = harness();
+    await h.gp.enqueue([track('t1', 'Song One'), track('t2', 'Song Two'), track('t3', 'Three')]);
+    h.player.emit('start');
+    await settle();
+    expect(h.gp.queue.currentIndex).toBe(0);
+
+    endNaturally(h.player);
+    await settle();
+
+    expect(h.gp.queue.currentIndex).toBe(1);
+    expect(played(h.player)).toHaveLength(2);
+  });
+
+  it('ignores an end naming a track the queue has already moved past', async () => {
+    const h = harness();
+    await h.gp.enqueue([track('t1', 'Song One'), track('t2', 'Song Two'), track('t3', 'Three')]);
+    h.player.emit('start');
+    await settle();
+
+    endNaturally(h.player);
+    await settle();
+    expect(h.gp.queue.current?.identifier).toBe('t2');
+
+    // A duplicate of the FIRST track's end, arriving late. It names t1, which
+    // is no longer current, so it must not push the queue on to t3.
+    h.player.position = TRACK_MS;
+    h.player.emit('end', { reason: 'finished', track: lavalinkEventTrack('encoded-t1', TRACK_MS) });
+    await settle();
+
+    expect(h.gp.queue.current?.identifier).toBe('t2');
+    expect(played(h.player)).toEqual(['encoded-t1', 'encoded-t2']);
+  });
+
+  it('tells two plays of the same song apart', async () => {
+    // The case an identifier cannot answer: the SAME track queued twice. A
+    // duplicated end for the first play must not be read as the end of the
+    // second, or the queue advances past a song that never played.
+    const h = harness();
+    await h.gp.enqueue([
+      track('t1', 'Song One'),
+      track('t1', 'Song One Again'),
+      track('t2', 'Two'),
+    ]);
+    h.player.emit('start');
+    await settle();
+
+    const firstPlay = lastPlayed(h.player);
+    expect(firstPlay?.userData?.playSeq).toBe(1);
+
+    endNaturally(h.player);
+    await settle();
+    expect(played(h.player)).toHaveLength(2);
+
+    // The first play's end, arriving again. Same identifier as what is now
+    // playing; only the play token distinguishes them.
+    h.player.emit('end', { reason: 'finished', track: firstPlay });
+    await settle();
+
+    expect(played(h.player)).toHaveLength(2);
+    expect(h.gp.queue.current?.title).toBe('Song One Again');
+  });
+
+  it('ignores a repeat of the end for the play that is current', async () => {
+    const h = harness();
+    await h.gp.enqueue([track('t1', 'Song One'), track('t2', 'Song Two'), track('t3', 'Three')]);
+    h.player.emit('start');
+    await settle();
+
+    const ended = lastPlayed(h.player);
+    endNaturally(h.player, ended);
+    await settle();
+    endNaturally(h.player, ended);
+    await settle();
+
+    expect(played(h.player)).toEqual(['encoded-t1', 'encoded-t2']);
+    expect(h.gp.queue.currentIndex).toBe(1);
+  });
+
+  it('does not let a duplicated end restart the music after a stop', async () => {
+    // `stop()` empties the queue, so `current` is null and the identity guard
+    // cannot help. Without the per-play guard the repeat would re-enter the
+    // end handler with `#stopRequested` already spent and hand straight over
+    // to autoplay — the music would come back after /stop.
+    const h = harness({
+      autoplayEnabled: true,
+      autoplay: (_g, count) => Promise.resolve(picks(count)),
+    });
+    await h.gp.enqueue([track('t1', 'Song One')]);
+    h.player.emit('start');
+    await settle();
+    h.autoplay.mockClear();
+
+    await h.gp.stop();
+    await settle();
+    const afterStop = played(h.player).length;
+
+    h.player.emit('end', { reason: 'stopped', track: lastPlayed(h.player) });
+    await settle();
+
+    expect(played(h.player)).toHaveLength(afterStop);
+    expect(h.autoplay).not.toHaveBeenCalled();
+  });
+
+  it('ignores an end for a play this process never started', async () => {
+    // A resumed Lavalink session can replay its last event at a player that
+    // has not been handed a track yet. Advancing on it would skip the first
+    // track of the queue that is about to be restored.
+    const h = harness();
+    h.player.emit('end', {
+      reason: 'finished',
+      track: lavalinkEventTrack('encoded-ghost', TRACK_MS),
+    });
+    await settle();
+
+    expect(played(h.player)).toHaveLength(0);
+    expect(h.gp.queue.currentIndex).toBe(-1);
+  });
+
+  it('does not treat a load failure that never played as a duplicate', async () => {
+    const h = harness();
+    await h.gp.enqueue([track('t1', 'Song One'), track('t2', 'Song Two')]);
+    // No 'start': the source refused the track outright. The end still has to
+    // advance the queue — a track that never produced a frame is exactly the
+    // case the duplicate guard must not swallow, or one unplayable song would
+    // end the session.
+    h.player.emit('end', {
+      reason: 'loadFailed',
+      track: lavalinkEventTrack('encoded-t1', 0),
+    });
+    await settle();
+
     expect(played(h.player)).toEqual(['encoded-t1', 'encoded-t2']);
   });
 });

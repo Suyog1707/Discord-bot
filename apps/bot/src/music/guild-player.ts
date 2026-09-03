@@ -117,6 +117,26 @@ function truncate(value: string | undefined, limit: number): string | undefined 
 }
 
 /**
+ * The play token Lavalink echoed back, when it echoed one.
+ *
+ * Lavalink v4 stores arbitrary `userData` next to a track and returns it on
+ * every event for that track, untouched. That makes it the one exact answer
+ * to "which play is this the end of" — immune to the same song being queued
+ * twice in a row or looped, where the track's own identifier cannot tell two
+ * plays apart.
+ *
+ * Read defensively on purpose: shoukaku's `Track` type does not declare the
+ * field, and a node that does not send it is not an error — the caller falls
+ * back to comparing identifiers, which is correct for every case except
+ * back-to-back copies of one song.
+ */
+function playTokenOf(track: unknown): number | undefined {
+  const value = (track as { readonly userData?: { readonly playSeq?: unknown } } | null)?.userData
+    ?.playSeq;
+  return typeof value === 'number' ? value : undefined;
+}
+
+/**
  * The exception class name from Lavalink's stringified throwable, so failures
  * can be grouped by type without parsing the whole message at read time.
  */
@@ -246,6 +266,33 @@ export class GuildPlayer {
    * handler is about to advance and start the right one itself.
    */
   #endInFlight = false;
+  /**
+   * Monotonic id of the current play, bumped by every `#playTrack` and sent
+   * to Lavalink as the track's `userData`.
+   *
+   * This is the correlation handle for end events, and it exists because
+   * nothing Lavalink reports about a track identifies the PLAY. The `encoded`
+   * blob is not even a stable identity for the track: Lavalink re-encodes the
+   * live `AudioTrack` for every event, and the last eight bytes of the
+   * encoding are the playback POSITION, so the string that comes back when a
+   * song ends never equals the string handed over when it started. The
+   * identifier is stable but names the song, not the play, so it cannot tell
+   * two plays of one song apart. The token can.
+   */
+  #playSeq = 0;
+  /**
+   * The play whose end has already been processed. Starts equal to `#playSeq`
+   * so an end for a play this process never started — a resumed Lavalink
+   * session replaying its last event — is ignored rather than advancing a
+   * queue that is about to be restored anyway.
+   */
+  #endedPlaySeq = 0;
+  /**
+   * Whether the "this node does not echo play tokens" warning has been said.
+   * The condition is a property of the Lavalink build, not of one track, so
+   * it is worth saying once and never again.
+   */
+  #warnedNoPlayToken = false;
   #activeFilter: FilterPresetName | 'speed' | 'pitch' | null = null;
   readonly #onAutoplayRequest: (guildId: string, count: number) => Promise<readonly QueuedTrack[]>;
   readonly #autoplayLowWaterMark: number;
@@ -681,7 +728,7 @@ export class GuildPlayer {
       // The other half of the pair the TRACK_END line completes. Together they
       // answer "what was playing, where did its audio come from, and how much
       // of it actually arrived" without needing to correlate across services.
-      this.#logger.debug(
+      this.#logger.info(
         {
           event: 'TRACK_START',
           title: track.title,
@@ -715,7 +762,15 @@ export class GuildPlayer {
     });
 
     this.#player.on('end', (event) => {
-      void this.#handleTrackEnd(event.reason, event.track.encoded);
+      // `info.identifier` and the echoed play token — deliberately NOT
+      // `event.track.encoded`. See `#playSeq`: the encoded blob carries the
+      // playback position, so it changes between the play and the end of
+      // every track that actually ran.
+      void this.#handleTrackEnd(
+        event.reason,
+        event.track.info.identifier,
+        playTokenOf(event.track),
+      );
     });
 
     this.#player.on('exception', (event) => {
@@ -764,7 +819,9 @@ export class GuildPlayer {
       // lets the end handler treat it as the source failure it is and try
       // another provider, rather than silently moving to the next song.
       this.#failureBeforeEnd = 'stuck';
-      void this.#player.stopTrack();
+      void this.#player.stopTrack().catch((error: unknown) => {
+        this.#logger.warn({ err: error }, 'Stopping a stuck track failed');
+      });
     });
 
     this.#player.on('closed', (event) => {
@@ -772,7 +829,11 @@ export class GuildPlayer {
     });
   }
 
-  async #handleTrackEnd(reason: string, endedEncoded?: string): Promise<void> {
+  async #handleTrackEnd(
+    reason: string,
+    endedIdentifier?: string,
+    endedPlay?: number,
+  ): Promise<void> {
     // 'replaced' means we started another track ourselves (jump, previous, a
     // source rescue): audio IS playing. `#playing` must survive untouched —
     // clearing it here left the flag false for the whole replacement track,
@@ -783,25 +844,78 @@ export class GuildPlayer {
       return;
     }
 
-    // A track can only end once. Two `end` events for one track — a
-    // duplicated gateway event, or a late one landing after the queue has
-    // already advanced — used to advance the queue twice: the second arrived
-    // while the next track's `playTrack` was in flight, cleared `#playing`,
-    // wrote a history row for a song that never played a frame, and moved
-    // on again. Lavalink names the track in every end event, and a track
-    // that is no longer `current` has, by definition, already been dealt
-    // with. (Not keyed on "between playTrack and start": a load failure
-    // ends a track that never started, and must still advance the queue.)
+    // A track can only end once, and only the play that is current can end.
+    // Two guards, because they answer different questions.
+    //
+    // WHICH PLAY IS THIS THE END OF?
+    //
+    // Preferably the node tells us: `#playTrack` attaches the play token as
+    // Lavalink `userData`, and Lavalink echoes it back on every event for
+    // that track. That is exact — it tells apart two plays of the SAME song
+    // (a looped track, or one song queued twice), which nothing derived from
+    // the track itself can do.
+    //
+    // Without it, fall back to the track's `identifier`. Note what that is
+    // NOT: the `encoded` blob, which is what this guard used to compare.
+    // Lavalink re-encodes the live track for every event and writes the
+    // playback position into the encoding, so `encoded` at the end of a song
+    // is never `encoded` at its start — the guard called EVERY natural end
+    // stale and the session stopped dead after one track. Only `loadFailed`
+    // still matched, which is why broken tracks kept advancing while working
+    // ones did not.
+    //
+    // HAS THIS PLAY ALREADY ENDED?
+    //
+    // The duplicate protection: two `end` events for ONE play — a duplicated
+    // gateway event, or a late one landing while the next `playTrack` is in
+    // flight — used to advance the queue twice, clearing `#playing` and
+    // writing a history row for a song that never played a frame.
+    // Silence here is the evidence the exact correlation is live; this line
+    // is what tells an operator it is not, and that back-to-back copies of one
+    // song fall back to identifier matching.
+    if (endedPlay === undefined && !this.#warnedNoPlayToken) {
+      this.#warnedNoPlayToken = true;
+      this.#logger.warn(
+        { event: 'PLAY_TOKEN_MISSING', reason },
+        'Lavalink did not echo the play token; correlating track ends on identifier instead',
+      );
+    }
+
     const current = this.queue.current;
-    const stale =
-      endedEncoded !== undefined && current !== null && endedEncoded !== current.encoded;
-    if (stale) {
-      this.#logger.debug(
-        { event: 'TRACK_END_IGNORED', reason, current: current.title },
+    const staleCause =
+      endedPlay !== undefined
+        ? endedPlay === this.#playSeq
+          ? null
+          : 'not-current-play'
+        : endedIdentifier !== undefined &&
+            current !== null &&
+            endedIdentifier !== current.identifier
+          ? 'not-current-track'
+          : null;
+    if (staleCause !== null) {
+      this.#logger.info(
+        {
+          event: 'TRACK_END_IGNORED',
+          cause: staleCause,
+          reason,
+          ended: endedIdentifier,
+          endedPlay,
+          playSeq: this.#playSeq,
+          current: current?.identifier,
+          currentTitle: current?.title,
+        },
         'Ignored a track end for a track that is not the one playing',
       );
       return;
     }
+    if (this.#endedPlaySeq === this.#playSeq) {
+      this.#logger.info(
+        { event: 'TRACK_END_IGNORED', cause: 'duplicate', reason, playSeq: this.#playSeq },
+        'Ignored a duplicate track end for a play that has already ended',
+      );
+      return;
+    }
+    this.#endedPlaySeq = this.#playSeq;
 
     this.#endInFlight = true;
     try {
@@ -844,7 +958,7 @@ export class GuildPlayer {
     // for every end — not only the failures, because "it ended normally" is
     // itself the claim that has to be checkable.
     const failureKind = failureBefore ?? (truncated ? 'truncated' : null);
-    this.#logger[failureKind === null ? 'debug' : 'warn'](
+    this.#logger[failureKind === null ? 'info' : 'warn'](
       {
         event: 'TRACK_END',
         reason,
@@ -1199,10 +1313,29 @@ export class GuildPlayer {
   }
 
   async #playTrack(track: QueuedTrack): Promise<void> {
+    // A new play, so the end that eventually arrives is a different end from
+    // the last one. Bumped before the request goes out: a `loadFailed` end
+    // can arrive for a track that never produced a single frame, and it still
+    // has to be processed.
+    this.#playSeq += 1;
     try {
       this.#playing = true;
+      this.#logger.info(
+        {
+          event: 'PLAYBACK_START_REQUEST',
+          playSeq: this.#playSeq,
+          title: track.title,
+          identifier: track.identifier,
+          playbackSource: track.playbackSource ?? track.source,
+          upcoming: this.queue.upcoming.length,
+        },
+        'Handing the next track to Lavalink',
+      );
       await this.#player.playTrack({
-        track: { encoded: track.encoded },
+        // `userData` rides along with the track and comes back on every event
+        // Lavalink sends about it, which is what makes the end of THIS play
+        // distinguishable from the end of an earlier play of the same song.
+        track: { encoded: track.encoded, userData: { playSeq: this.#playSeq } },
         volume: this.#volume,
       });
     } catch (error) {
@@ -1263,7 +1396,10 @@ export class GuildPlayer {
         await channel.send(payload);
       }
     } catch (error) {
-      this.#logger.debug({ err: error }, 'Channel notification failed');
+      this.#logger.warn(
+        { err: error, channelId: this.#textChannelId },
+        'Channel notification failed',
+      );
     }
   }
 
@@ -1305,7 +1441,7 @@ export class GuildPlayer {
     try {
       this.#onEvent?.(type, this.#destroyed ? null : this.snapshot());
     } catch (error) {
-      this.#logger.debug({ err: error, type }, 'Player event sink failed');
+      this.#logger.warn({ err: error, type }, 'Player event sink failed');
     }
   }
 

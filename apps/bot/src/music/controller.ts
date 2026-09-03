@@ -14,6 +14,7 @@ import {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
+  RESTJSONErrorCodes,
   StringSelectMenuBuilder,
   type Client,
   type Message,
@@ -30,6 +31,26 @@ import { MUSIC_BUTTON_PREFIX, MUSIC_FILTER_SELECT_ID } from './now-playing-view.
 const EDIT_THROTTLE_MS = 4_000;
 /** Progress refresh cadence while a track plays with no other events. */
 const PROGRESS_TICK_MS = 20_000;
+
+/**
+ * Whether a failed edit means the message no longer exists — the only case
+ * where sending a replacement is the right answer.
+ */
+function isMissingMessage(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return code === RESTJSONErrorCodes.UnknownMessage || code === RESTJSONErrorCodes.UnknownChannel;
+}
+
+/** Identity of a failure, for deciding whether it is the same news again. */
+function failureKeyOf(error: unknown): string {
+  const err = error as { readonly code?: unknown; readonly message?: unknown } | null;
+  // Only the shapes Discord actually uses; anything else contributes nothing
+  // rather than stringifying an object into the key.
+  const code =
+    typeof err?.code === 'string' || typeof err?.code === 'number' ? String(err.code) : '';
+  const message = typeof err?.message === 'string' ? err.message : '';
+  return `${code}:${message}`;
+}
 
 function progressBar(positionMs: number, durationMs: number): string {
   const slots = 16;
@@ -56,9 +77,17 @@ function controls(state: PlayerSnapshot | null, disabled: boolean) {
       .setStyle(style)
       .setDisabled(disabled);
 
+  // Discord allows at most five components per action row, and rejects the
+  // entire message when a row exceeds it. `autoplay` lives here rather than
+  // with the other toggles because that row is already full at five.
   const volumeRow = new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(
     button('voldown', '🔉'),
     button('volup', '🔊'),
+    button(
+      'autoplay',
+      '♾️',
+      state?.autoplayEnabled === true ? ButtonStyle.Success : ButtonStyle.Secondary,
+    ),
   );
   const dashboardUrl = getEnv().DASHBOARD_URL;
   if (dashboardUrl !== undefined) {
@@ -107,11 +136,6 @@ function controls(state: PlayerSnapshot | null, disabled: boolean) {
       button('dislike', '👎'),
       button('queue', '📜'),
       button('lyrics', '🎵'),
-      button(
-        'autoplay',
-        '♾️',
-        state?.autoplayEnabled === true ? ButtonStyle.Success : ButtonStyle.Secondary,
-      ),
     ),
     volumeRow,
     new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(filterSelect),
@@ -210,6 +234,19 @@ export class ControllerMessage {
    * passes both conclude they must send — the uncontrolled-duplicate bug.
    */
   #applyChain: Promise<void> = Promise.resolve();
+  /**
+   * Whether the "channel is not sendable" warning has already been logged.
+   * The condition is static for the life of the controller, while the apply
+   * that discovers it repeats on every progress tick.
+   */
+  #warnedUnsendable = false;
+  /**
+   * The last failure already reported, so a permanent condition — a missing
+   * permission on the configured channel — is stated once instead of on every
+   * event and every progress tick for the life of the session. A *changed*
+   * failure is always new news and always logged.
+   */
+  #lastFailureKey: string | null = null;
   #trailingEdit: NodeJS.Timeout | undefined;
   #progressTick: NodeJS.Timeout | undefined;
   #destroyed = false;
@@ -280,7 +317,15 @@ export class ControllerMessage {
         return this.#applyEdit(this.#pendingState);
       })
       .catch((error: unknown) => {
-        this.#logger.debug({ err: error }, 'Controller update failed');
+        // Never `debug`. A GUI that cannot render is invisible by definition,
+        // so the log line is the only evidence it was ever attempted — this
+        // is exactly how a rejected six-button row went unnoticed. Repeats of
+        // one unchanging failure drop to `debug` so a broken guild cannot
+        // drown the log it needs to be visible in.
+        const key = failureKeyOf(error);
+        const repeat = key === this.#lastFailureKey;
+        this.#lastFailureKey = key;
+        this.#logger[repeat ? 'debug' : 'warn']({ err: error }, 'Controller update failed');
       });
     return this.#applyChain;
   }
@@ -319,8 +364,16 @@ export class ControllerMessage {
       try {
         await this.#message.edit(payload);
         return;
-      } catch {
-        // Deleted by a moderator or channel gone — recreate below.
+      } catch (error) {
+        // Only "it is gone" justifies posting a replacement. Treating every
+        // failure as a deletion turned one rejected payload into an endless
+        // edit-fails-then-send-fails cycle, and a rate limit into a duplicate
+        // GUI. Unknown Message / Unknown Channel are recoverable; anything
+        // else (a malformed payload, a missing permission) would fail exactly
+        // the same way on a fresh message, so it is re-thrown for the caller
+        // to log with its real cause.
+        if (!isMissingMessage(error)) throw error;
+        this.#logger.info({ messageId: this.#message.id }, 'Player GUI was deleted; reposting');
         this.#message = null;
       }
     }
@@ -328,10 +381,21 @@ export class ControllerMessage {
     // The GUI a fresh message carries is always the complete interface —
     // `render` returns the full embed and every control row.
     const channel = await this.#client.channels.fetch(this.#channelId);
-    if (channel?.isSendable() !== true) return;
+    if (channel?.isSendable() !== true) {
+      if (!this.#warnedUnsendable) {
+        this.#warnedUnsendable = true;
+        this.#logger.warn(
+          { resolved: channel !== null },
+          'Player GUI channel is not sendable; no controller message',
+        );
+      }
+      return;
+    }
     this.#message = await channel.send({
       embeds: payload.embeds ?? [],
       components: payload.components ?? [],
     });
+    this.#lastFailureKey = null;
+    this.#logger.info({ messageId: this.#message.id }, 'Player GUI posted');
   }
 }

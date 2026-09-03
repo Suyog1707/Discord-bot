@@ -1,5 +1,5 @@
 import type { PlayerSnapshot } from '@discord-music/shared';
-import type { Client } from 'discord.js';
+import { RESTJSONErrorCodes, type Client } from 'discord.js';
 import { describe, expect, it, vi } from 'vitest';
 
 import { ControllerMessage } from './controller.js';
@@ -9,6 +9,11 @@ async function settle(): Promise<void> {
   for (let i = 0; i < 5; i += 1) {
     await new Promise((resolve) => setTimeout(resolve, 1));
   }
+}
+
+/** Just enough of a rendered payload to assert component shape. */
+interface ComponentPayload {
+  readonly components?: readonly { readonly toJSON: () => { readonly components: unknown[] } }[];
 }
 
 interface FakeMessage {
@@ -168,7 +173,11 @@ describe('ControllerMessage', () => {
     controller.onEvent('TRACK_START', snapshot('Song A'));
     await settle();
     const gui = channel.messages[0];
-    gui?.edit.mockRejectedValue(new Error('Unknown Message'));
+    gui?.edit.mockRejectedValue(
+      Object.assign(new Error('Unknown Message'), {
+        code: RESTJSONErrorCodes.UnknownMessage,
+      }),
+    );
 
     controller.onEvent('TRACK_START', snapshot('Song B'));
     await settle();
@@ -188,6 +197,80 @@ describe('ControllerMessage', () => {
     await settle();
 
     expect(channel.send).toHaveBeenCalledTimes(1);
+    await controller.destroy();
+  });
+
+  /**
+   * The limit that broke the player GUI outright: Discord accepts at most five
+   * components per action row and rejects the ENTIRE message when a row goes
+   * over, so one button too many made the controller unsendable — and because
+   * the controller is registered before it ever tries to send, the per-track
+   * announcement fallback was disabled too and nothing appeared in chat at all.
+   * discord.js's builders do not enforce this, so the test has to.
+   */
+  it('keeps every action row within Discord five-component limit', async () => {
+    const channel = fakeChannel('chan-1');
+    const controller = new ControllerMessage(fakeClient(channel), 'guild-1', 'chan-1');
+
+    // Both cards: the idle one sent on connect, and the playing one.
+    controller.onEvent('PLAYER_CONNECT', null);
+    await settle();
+    controller.onEvent('TRACK_START', snapshot('Song A'));
+    await settle();
+
+    const payloads = [
+      ...channel.send.mock.calls.map(([payload]) => payload as ComponentPayload),
+      ...channel.messages.flatMap((message) =>
+        message.edit.mock.calls.map(([payload]) => payload as ComponentPayload),
+      ),
+    ];
+    expect(payloads.length).toBeGreaterThan(0);
+
+    for (const payload of payloads) {
+      const rows = payload.components ?? [];
+      expect(rows.length).toBeLessThanOrEqual(5);
+      for (const row of rows) {
+        expect(row.toJSON().components.length).toBeLessThanOrEqual(5);
+      }
+    }
+    await controller.destroy();
+  });
+
+  it('does not post a replacement when an edit failed for any other reason', async () => {
+    const channel = fakeChannel('chan-1');
+    const controller = new ControllerMessage(fakeClient(channel), 'guild-1', 'chan-1');
+
+    controller.onEvent('TRACK_START', snapshot('Song A'));
+    await settle();
+    const gui = channel.messages[0];
+    // A rejected payload or a missing permission fails the same way on a new
+    // message, so reposting would only duplicate the GUI.
+    gui?.edit.mockRejectedValue(
+      Object.assign(new Error('Missing Permissions'), {
+        code: RESTJSONErrorCodes.MissingPermissions,
+      }),
+    );
+
+    controller.onEvent('TRACK_START', snapshot('Song B'));
+    await settle();
+
+    expect(channel.send).toHaveBeenCalledTimes(1);
+    await controller.destroy();
+  });
+
+  it('survives a channel that refuses the message, without throwing', async () => {
+    const channel = fakeChannel('chan-1');
+    channel.send.mockRejectedValue(new Error('Invalid Form Body'));
+    const controller = new ControllerMessage(fakeClient(channel), 'guild-1', 'chan-1');
+
+    // A GUI failure must never reach the caller: the player event sink is on
+    // the playback path.
+    expect(() => {
+      controller.onEvent('TRACK_START', snapshot('Song A'));
+    }).not.toThrow();
+    await settle();
+
+    expect(channel.send).toHaveBeenCalled();
     await controller.destroy();
   });
 
