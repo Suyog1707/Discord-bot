@@ -1,6 +1,5 @@
 /** `/shuffle` — shuffle the upcoming tracks. */
 import { ValidationError } from '@discord-music/shared';
-import { MessageFlags } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -27,9 +26,8 @@ export default defineCommand({
     }
 
     player.shuffle();
-    await interaction.reply({
+    await interaction.editReply({
       content: `🔀 Shuffled **${String(player.queue.upcoming.length)}** tracks.`,
-      flags: MessageFlags.Ephemeral,
     });
   },
 });

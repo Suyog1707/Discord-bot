@@ -24,6 +24,12 @@ export type AnySlashCommandBuilder =
 export const COMMAND_CATEGORIES = ['general', 'music', 'queue', 'playlist', 'settings'] as const;
 export type CommandCategory = (typeof COMMAND_CATEGORIES)[number];
 
+/** Visibility of the deferred acknowledgement Discord shows while a command runs. */
+export type DeferralMode = 'public' | 'ephemeral';
+
+/** Applied when a command does not declare {@link CommandDefinition.deferral}. */
+export const DEFAULT_DEFERRAL: DeferralMode = 'ephemeral';
+
 /** Everything a handler needs, passed explicitly rather than reached for globally. */
 export interface CommandContext {
   readonly interaction: ChatInputCommandInteraction;
@@ -53,20 +59,44 @@ export interface CommandDefinition {
   /** Hide from `/help` and from production command deployment. */
   readonly devOnly?: boolean;
   /**
-   * Acknowledge the interaction with `deferReply` *before* any guard runs.
+   * How the interaction is acknowledged, always *before* any guard runs.
    *
    * Discord invalidates an interaction that is not acknowledged within three
    * seconds (`10062 Unknown interaction`). Guards reach Redis and Postgres,
    * both of which are remote in production, so a command that acknowledges
-   * itself is only acknowledged *after* two network round-trips. Declaring
-   * deferral moves the acknowledgement in front of all of that.
+   * itself is only acknowledged *after* two network round-trips. Deferral
+   * moves the acknowledgement in front of all of that.
    *
-   * A command that declares this must not call `deferReply` itself, and must
-   * respond with `editReply`/`followUp`.
+   * Defaults to `'ephemeral'`, because that is what all but a handful of
+   * commands want and because the safe choice must be the one you get for
+   * free — the alternative was 31 commands silently racing the deadline.
+   *
+   * Visibility is fixed at acknowledgement time and cannot be changed later,
+   * so a command whose subcommands differ passes a function instead. It is
+   * called before any I/O and must stay synchronous and side-effect free;
+   * read `interaction.options`, nothing more.
+   *
+   * A command must never call `deferReply` itself, and must respond with
+   * `editReply`/`followUp`.
    */
-  readonly deferral?: 'public' | 'ephemeral';
+  readonly deferral?: DeferralMode | ((interaction: ChatInputCommandInteraction) => DeferralMode);
   execute(context: CommandContext): Promise<void>;
   autocomplete?(context: AutocompleteContext): Promise<void>;
+}
+
+/**
+ * Resolve the acknowledgement mode for one invocation.
+ *
+ * Kept separate from the dispatcher so the defaulting rule — the thing that
+ * decides whether a command races Discord's three-second window — is testable
+ * on its own.
+ */
+export function resolveDeferral(
+  command: Pick<CommandDefinition, 'deferral'>,
+  interaction: ChatInputCommandInteraction,
+): DeferralMode {
+  if (typeof command.deferral === 'function') return command.deferral(interaction);
+  return command.deferral ?? DEFAULT_DEFERRAL;
 }
 
 /**

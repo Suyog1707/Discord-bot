@@ -1,6 +1,5 @@
 /** `/previous` — go back to the previously played track. */
 import { ValidationError } from '@discord-music/shared';
-import { MessageFlags } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -29,9 +28,8 @@ export default defineCommand({
       throw new ValidationError('There is no earlier track — this is the start of the queue.');
     }
 
-    await interaction.reply({
+    await interaction.editReply({
       content: `⏮️ Back to **${track.title}**.`,
-      flags: MessageFlags.Ephemeral,
     });
   },
 });

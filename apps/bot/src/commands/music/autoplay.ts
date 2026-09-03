@@ -1,5 +1,5 @@
 /** `/autoplay` — continue with personalised tracks when the queue ends, and who it plays for. */
-import { MessageFlags, PermissionFlagsBits } from 'discord.js';
+import { PermissionFlagsBits } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -46,21 +46,19 @@ export default defineCommand({
       const music = requireMusic(client);
       const player = requireActivePlayer(music, requireVoiceContext(interaction));
       player.setListener(interaction.user.id);
-      await interaction.reply({
+      await interaction.editReply({
         content: `🎧 Autoplay now follows **${interaction.user.username}**'s taste.`,
-        flags: MessageFlags.Ephemeral,
       });
       return;
     }
 
     if (subcommand === 'listener') {
       const listener = client.music?.getPlayer(guildId)?.listenerId ?? null;
-      await interaction.reply({
+      await interaction.editReply({
         content:
           listener === null
             ? '🎧 Nobody has claimed autoplay yet — the first person to request a song owns it, or use `/autoplay claim`.'
             : `🎧 Autoplay follows <@${listener}>'s taste. Use \`/autoplay claim\` to make it follow yours.`,
-        flags: MessageFlags.Ephemeral,
         allowedMentions: { parse: [] },
       });
       return;
@@ -68,9 +66,8 @@ export default defineCommand({
 
     // toggle — a guild-level setting, as before.
     if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-      await interaction.reply({
+      await interaction.editReply({
         content: 'You need **Manage Server** to turn autoplay on or off.',
-        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -79,11 +76,10 @@ export default defineCommand({
     await client.services.guilds.updateSettings(guildId, { autoplayEnabled: enabled });
     client.music?.getPlayer(guildId)?.setAutoplayEnabled(enabled);
 
-    await interaction.reply({
+    await interaction.editReply({
       content: enabled
         ? '📻 **Autoplay on** — when the queue ends I will continue with songs you like, plus the occasional discovery.'
         : '📻 **Autoplay off** — playback stops when the queue ends.',
-      flags: MessageFlags.Ephemeral,
     });
   },
 });

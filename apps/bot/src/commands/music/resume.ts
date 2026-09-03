@@ -1,5 +1,4 @@
 /** `/resume` — resume paused playback. */
-import { MessageFlags } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -22,14 +21,13 @@ export default defineCommand({
     const player = requireActivePlayer(music, requireVoiceContext(interaction));
 
     if (!player.paused) {
-      await interaction.reply({
+      await interaction.editReply({
         content: 'Playback is not paused.',
-        flags: MessageFlags.Ephemeral,
       });
       return;
     }
 
     await player.resume();
-    await interaction.reply({ content: '▶️ Resumed.', flags: MessageFlags.Ephemeral });
+    await interaction.editReply({ content: '▶️ Resumed.' });
   },
 });

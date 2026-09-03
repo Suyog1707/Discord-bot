@@ -1,5 +1,4 @@
 /** `/disconnect` — leave the voice channel entirely. */
-import { MessageFlags } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -25,6 +24,6 @@ export default defineCommand({
     requireActivePlayer(music, context);
 
     await music.destroyPlayer(context.guildId);
-    await interaction.reply({ content: '👋 Disconnected.', flags: MessageFlags.Ephemeral });
+    await interaction.editReply({ content: '👋 Disconnected.' });
   },
 });

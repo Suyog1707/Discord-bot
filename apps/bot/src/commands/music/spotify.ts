@@ -152,8 +152,6 @@ async function browsePlaylists(
     );
   }
 
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
   const all = await spotify.listPlaylists(interaction.user.id);
   const items =
     query === null
@@ -349,14 +347,12 @@ export default defineCommand({
     const client = interaction.client as BotClient;
     const spotify = client.services.spotify;
     const subcommand = interaction.options.getSubcommand(true);
-    const ephemeral = { flags: MessageFlags.Ephemeral } as const;
 
     if (subcommand === 'connect') {
       const account = await spotify.status(interaction.user.id);
       if (account !== null) {
-        await interaction.reply({
+        await interaction.editReply({
           content: `Already linked as **${account.displayName ?? account.spotifyId}** — \`/spotify playlists\` is ready.`,
-          ...ephemeral,
         });
         return;
       }
@@ -372,11 +368,10 @@ export default defineCommand({
                   .setURL(url),
               ),
             ];
-      await interaction.reply({
+      await interaction.editReply({
         content:
           'Linking happens on the dashboard (Spotify needs a browser sign-in): open **Settings → Spotify** and press Connect. Your playlists then work here too.',
         components: row,
-        ...ephemeral,
       });
       return;
     }
@@ -384,16 +379,15 @@ export default defineCommand({
     if (subcommand === 'disconnect') {
       const removed = await spotify.disconnect(interaction.user.id);
       if (!removed) throw new NotFoundError('No Spotify account is linked.');
-      await interaction.reply({ content: '🔌 Spotify unlinked.', ...ephemeral });
+      await interaction.editReply({ content: '🔌 Spotify unlinked.' });
       return;
     }
 
     if (subcommand === 'status') {
       const account = await spotify.status(interaction.user.id);
       if (account === null) {
-        await interaction.reply({
+        await interaction.editReply({
           content: 'Not linked. Run `/spotify connect` to get started.',
-          ...ephemeral,
         });
         return;
       }
@@ -416,7 +410,7 @@ export default defineCommand({
               .join(' '),
           },
         );
-      await interaction.reply({ embeds: [embed], ...ephemeral });
+      await interaction.editReply({ embeds: [embed] });
       return;
     }
 

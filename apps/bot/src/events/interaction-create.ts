@@ -9,6 +9,7 @@
 import { isAppError, LIMITS, toAppError } from '@discord-music/shared';
 import { EmbedBuilder, Events, GuildMember, MessageFlags } from 'discord.js';
 
+import { resolveDeferral } from '../core/command.js';
 import { defineEvent } from '../core/event.js';
 import { runGuards } from '../core/guards.js';
 import {
@@ -296,16 +297,18 @@ export default defineEvent({
     // acknowledgement is at risk, whatever the eventual outcome.
     const receivedAgeMs = startedAt - interaction.createdTimestamp;
 
-    // Acknowledge first when the command asks for it: everything below this
-    // point (guards included) performs remote I/O.
-    if (command.deferral !== undefined) {
-      const alive = await acknowledge(interaction, command.deferral, commandLogger);
-      if (!alive) return;
-      commandLogger.debug(
-        { ackMs: Date.now() - startedAt, receivedAgeMs, deferral: command.deferral },
-        'Interaction acknowledged',
-      );
-    }
+    // Acknowledge before anything else: every line below this point — guards
+    // included — performs remote I/O, and none of it may run inside Discord's
+    // three-second window. Commands opt out of nothing; they only choose
+    // whether the placeholder is public.
+    const deferral = resolveDeferral(command, interaction);
+
+    const alive = await acknowledge(interaction, deferral, commandLogger);
+    if (!alive) return;
+    commandLogger.debug(
+      { ackMs: Date.now() - startedAt, receivedAgeMs, deferral },
+      'Interaction acknowledged',
+    );
 
     // Guards cover guild-only, permissions, cooldowns and the DJ role.
     const guardStartedAt = Date.now();

@@ -5,7 +5,6 @@
  * deployment payload → gateway dispatch → reply. The real command surface
  * arrives in Phase 3.
  */
-import { MessageFlags } from 'discord.js';
 
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 
@@ -17,14 +16,12 @@ export default defineCommand({
   cooldownSeconds: 5,
 
   async execute({ interaction }) {
-    const sent = await interaction.reply({
-      content: 'Pinging…',
-      flags: MessageFlags.Ephemeral,
-      withResponse: true,
-    });
+    // The interaction is already acknowledged by the time execute runs, so the
+    // round trip is measured against the first message we actually put on the
+    // channel — which now includes the deferral the user really waited for.
+    const sent = await interaction.editReply({ content: 'Pinging…' });
 
-    const roundTripMs =
-      (sent.resource?.message?.createdTimestamp ?? Date.now()) - interaction.createdTimestamp;
+    const roundTripMs = sent.createdTimestamp - interaction.createdTimestamp;
     // -1 means the heartbeat has not completed yet, right after connecting.
     const websocketMs = Math.round(interaction.client.ws.ping);
 

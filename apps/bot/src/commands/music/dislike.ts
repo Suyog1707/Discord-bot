@@ -7,7 +7,7 @@
  * it, and it is pulled out of the queue and the prefetch buffer immediately.
  */
 import { NotFoundError, ValidationError } from '@discord-music/shared';
-import { EmbedBuilder, MessageFlags } from 'discord.js';
+import { EmbedBuilder } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -68,7 +68,7 @@ export default defineCommand({
         .setColor(0x5865f2)
         .setAuthor({ name: `${user.username}'s "not like" list` })
         .setDescription(lines.join('\n'));
-      await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+      await interaction.editReply({ embeds: [embed] });
       return;
     }
 
@@ -87,18 +87,16 @@ export default defineCommand({
       if (interaction.guildId !== null) {
         await client.ai.session.forgetDisliked(interaction.guildId, [target.trackKey]);
       }
-      await interaction.reply({
+      await interaction.editReply({
         content: `🗑️ **${target.title}** may be recommended again.`,
-        flags: MessageFlags.Ephemeral,
       });
       return;
     }
 
-    // add — a database write plus a Lavalink skip is more than Discord's
-    // three-second acknowledgement window can be trusted with.
+    // add — a database write plus a Lavalink skip, both well past Discord's
+    // three-second window. The framework has already acknowledged.
     const music = requireMusic(client);
     const player = requireActivePlayer(music, requireVoiceContext(interaction));
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const number = interaction.options.getInteger('number');
     const target =
       number === null ? player.queue.current : (player.queue.upcoming[number - 1] ?? null);

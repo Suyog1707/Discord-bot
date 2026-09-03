@@ -11,7 +11,7 @@
  * Requires Manage Server. All writes go through GuildService.
  */
 import { LIMITS, parseOrThrow, volumeSchema, z } from '@discord-music/shared';
-import { EmbedBuilder, MessageFlags, PermissionFlagsBits } from 'discord.js';
+import { EmbedBuilder, PermissionFlagsBits } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -107,7 +107,7 @@ export default defineCommand({
               inline: true,
             },
           );
-        await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+        await interaction.editReply({ embeds: [embed] });
         return;
       }
 
@@ -115,9 +115,8 @@ export default defineCommand({
         // Discord validates min/max client-side; parse again server-side anyway.
         const percent = parseOrThrow(volumeSchema, interaction.options.getInteger('percent', true));
         await guilds.updateSettings(guildId, { defaultVolume: percent });
-        await interaction.reply({
+        await interaction.editReply({
           content: `Default volume set to **${String(percent)}%**.`,
-          flags: MessageFlags.Ephemeral,
         });
         return;
       }
@@ -125,12 +124,11 @@ export default defineCommand({
       case 'dj-role': {
         const role = interaction.options.getRole('role');
         await guilds.updateSettings(guildId, { djRoleId: role?.id ?? null });
-        await interaction.reply({
+        await interaction.editReply({
           content:
             role === null
               ? 'DJ restriction cleared — everyone can control music.'
               : `Music control restricted to <@&${role.id}>.`,
-          flags: MessageFlags.Ephemeral,
         });
         return;
       }
@@ -138,9 +136,8 @@ export default defineCommand({
       case 'announce': {
         const enabled = interaction.options.getBoolean('enabled', true);
         await guilds.updateSettings(guildId, { announceNowPlaying: enabled });
-        await interaction.reply({
+        await interaction.editReply({
           content: `Now-playing announcements **${enabled ? 'enabled' : 'disabled'}**.`,
-          flags: MessageFlags.Ephemeral,
         });
         return;
       }
@@ -151,17 +148,15 @@ export default defineCommand({
           interaction.options.getInteger('seconds', true),
         );
         await guilds.updateSettings(guildId, { leaveOnEmptyAfter: seconds });
-        await interaction.reply({
+        await interaction.editReply({
           content: `I'll leave voice after **${String(seconds)}s** of inactivity.`,
-          flags: MessageFlags.Ephemeral,
         });
         return;
       }
 
       default: {
-        await interaction.reply({
+        await interaction.editReply({
           content: 'Unknown settings subcommand.',
-          flags: MessageFlags.Ephemeral,
         });
       }
     }

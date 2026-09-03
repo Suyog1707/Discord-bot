@@ -1,6 +1,5 @@
 /** `/swap` — swap two upcoming tracks. */
 import { ValidationError } from '@discord-music/shared';
-import { MessageFlags } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -47,9 +46,8 @@ export default defineCommand({
       );
     }
 
-    await interaction.reply({
+    await interaction.editReply({
       content: `🔀 Swapped positions ${String(first)} and ${String(second)}.`,
-      flags: MessageFlags.Ephemeral,
     });
   },
 });

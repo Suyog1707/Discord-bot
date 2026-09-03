@@ -1,5 +1,4 @@
 /** `/filter` — audio filter presets, speed and pitch. */
-import { MessageFlags } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -84,13 +83,13 @@ export default defineCommand({
           : active === 'speed' || active === 'pitch'
             ? `Custom ${active} filter active.`
             : `**${FILTER_LABELS[active]}** is active.`;
-      await interaction.reply({ content: label, flags: MessageFlags.Ephemeral });
+      await interaction.editReply({ content: label });
       return;
     }
 
     if (subcommand === 'off') {
       await player.setFilter(null, {});
-      await interaction.reply({ content: '🎚️ Filters removed.', flags: MessageFlags.Ephemeral });
+      await interaction.editReply({ content: '🎚️ Filters removed.' });
       return;
     }
 
@@ -100,18 +99,16 @@ export default defineCommand({
         subcommand,
         subcommand === 'speed' ? speedFilter(value) : pitchFilter(value),
       );
-      await interaction.reply({
+      await interaction.editReply({
         content: `🎚️ ${subcommand === 'speed' ? 'Speed' : 'Pitch'} set to ${String(value)}×.`,
-        flags: MessageFlags.Ephemeral,
       });
       return;
     }
 
     const name = interaction.options.getString('name', true) as keyof typeof FILTER_PRESETS;
     await player.setFilter(name, FILTER_PRESETS[name]);
-    await interaction.reply({
+    await interaction.editReply({
       content: `🎚️ **${FILTER_LABELS[name]}** applied. Remove with \`/filter off\`.`,
-      flags: MessageFlags.Ephemeral,
     });
   },
 });

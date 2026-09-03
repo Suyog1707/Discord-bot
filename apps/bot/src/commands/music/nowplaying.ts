@@ -1,5 +1,4 @@
 /** `/nowplaying` — details, progress and transport buttons for the current track. */
-import { MessageFlags } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -20,11 +19,11 @@ export default defineCommand({
     const player = interaction.guildId === null ? undefined : music.getPlayer(interaction.guildId);
 
     if (player?.queue.current == null) {
-      await interaction.reply({ content: 'Nothing is playing.', flags: MessageFlags.Ephemeral });
+      await interaction.editReply({ content: 'Nothing is playing.' });
       return;
     }
 
     const view = renderNowPlaying(player);
-    await interaction.reply({ ...view, flags: MessageFlags.Ephemeral });
+    await interaction.editReply({ ...view });
   },
 });

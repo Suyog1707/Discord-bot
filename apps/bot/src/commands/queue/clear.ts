@@ -1,6 +1,5 @@
 /** `/clear` — drop every upcoming track, keep the current one playing. */
 import { ValidationError } from '@discord-music/shared';
-import { MessageFlags } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -29,9 +28,8 @@ export default defineCommand({
       throw new ValidationError('There are no upcoming tracks to clear.');
     }
 
-    await interaction.reply({
+    await interaction.editReply({
       content: `🧹 Cleared **${String(removed)}** upcoming track(s).`,
-      flags: MessageFlags.Ephemeral,
     });
   },
 });

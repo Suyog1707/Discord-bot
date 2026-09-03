@@ -1,5 +1,4 @@
 /** `/stop` — stop playback and clear the queue (stays in the channel). */
-import { MessageFlags } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -24,9 +23,8 @@ export default defineCommand({
     const player = requireActivePlayer(music, requireVoiceContext(interaction));
 
     await player.stop();
-    await interaction.reply({
+    await interaction.editReply({
       content: '⏹️ Stopped and cleared the queue.',
-      flags: MessageFlags.Ephemeral,
     });
   },
 });

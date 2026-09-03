@@ -1,5 +1,4 @@
 /** `/skip` — skip the current track. */
-import { MessageFlags } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -24,9 +23,8 @@ export default defineCommand({
     const skipped = player.queue.current;
     await player.skip();
 
-    await interaction.reply({
+    await interaction.editReply({
       content: skipped === null ? 'Skipped.' : `⏭️ Skipped **${skipped.title}**.`,
-      flags: MessageFlags.Ephemeral,
     });
   },
 });

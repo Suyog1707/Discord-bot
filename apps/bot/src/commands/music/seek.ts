@@ -1,6 +1,5 @@
 /** `/seek` — jump to a position in the current track. */
 import { ValidationError } from '@discord-music/shared';
-import { MessageFlags } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -63,9 +62,8 @@ export default defineCommand({
     }
 
     await player.seekTo(positionMs);
-    await interaction.reply({
+    await interaction.editReply({
       content: `⏩ Jumped to **${formatTrackDuration({ durationMs: positionMs, isStream: false })}**.`,
-      flags: MessageFlags.Ephemeral,
     });
   },
 });

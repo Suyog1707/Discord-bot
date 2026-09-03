@@ -1,5 +1,5 @@
 /** `/queue` — paginated view of the queue. */
-import { EmbedBuilder, MessageFlags } from 'discord.js';
+import { EmbedBuilder } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -28,9 +28,8 @@ export default defineCommand({
       player === undefined ||
       (player.queue.current === null && player.queue.upcoming.length === 0)
     ) {
-      await interaction.reply({
+      await interaction.editReply({
         content: 'The queue is empty. Add something with `/play`.',
-        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -67,6 +66,6 @@ export default defineCommand({
           (queue.loopMode === 'off' ? '' : ` · loop: ${queue.loopMode}`),
       });
 
-    await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+    await interaction.editReply({ embeds: [embed] });
   },
 });

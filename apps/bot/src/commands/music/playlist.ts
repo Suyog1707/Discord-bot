@@ -11,12 +11,7 @@ import {
   ValidationError,
 } from '@discord-music/shared';
 import type { Playlist } from '@discord-music/database';
-import {
-  AttachmentBuilder,
-  EmbedBuilder,
-  MessageFlags,
-  type SlashCommandStringOption,
-} from 'discord.js';
+import { AttachmentBuilder, EmbedBuilder, type SlashCommandStringOption } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -65,6 +60,9 @@ const nameOption = (description: string) => (option: SlashCommandStringOption) =
     .setMaxLength(LIMITS.PLAYLIST_NAME_MAX_LENGTH)
     .setRequired(true)
     .setAutocomplete(true);
+
+/** Subcommands whose result is for the whole channel, not just the caller. */
+const PUBLIC_SUBCOMMANDS = new Set(['play', 'shuffle']);
 
 export default defineCommand({
   data: new SlashCommandBuilder()
@@ -197,6 +195,10 @@ export default defineCommand({
   category: 'music',
   guildOnly: true,
   cooldownSeconds: 3,
+  // `play` and `shuffle` fill the channel's queue and belong in the channel;
+  // every other subcommand manages the caller's own library.
+  deferral: (interaction) =>
+    PUBLIC_SUBCOMMANDS.has(interaction.options.getSubcommand()) ? 'public' : 'ephemeral',
 
   async autocomplete({ interaction }) {
     const client = interaction.client as BotClient;
@@ -210,23 +212,21 @@ export default defineCommand({
     const playlists = client.services.playlists;
     const subcommand = interaction.options.getSubcommand(true);
     const ref = refFrom(interaction);
-    const ephemeral = { flags: MessageFlags.Ephemeral } as const;
 
     switch (subcommand) {
       case 'create': {
         const name = interaction.options.getString('name', true).trim();
         const folder = interaction.options.getString('folder')?.trim() ?? null;
         const playlist = await playlists.create(ref, name, folder === '' ? null : folder);
-        await interaction.reply({
+        await interaction.editReply({
           content: `🎶 Created **${playlist.name}** — add tracks with \`/playlist add\`.`,
-          ...ephemeral,
         });
         return;
       }
 
       case 'delete': {
         const name = await playlists.delete(ref, interaction.options.getString('name', true));
-        await interaction.reply({ content: `🗑️ Deleted **${name}**.`, ...ephemeral });
+        await interaction.editReply({ content: `🗑️ Deleted **${name}**.` });
         return;
       }
 
@@ -236,7 +236,7 @@ export default defineCommand({
           interaction.options.getString('name', true),
           interaction.options.getString('new_name', true).trim(),
         );
-        await interaction.reply({ content: `✏️ Renamed to **${updated.name}**.`, ...ephemeral });
+        await interaction.editReply({ content: `✏️ Renamed to **${updated.name}**.` });
         return;
       }
 
@@ -264,7 +264,7 @@ export default defineCommand({
               .join('\n'),
           });
         }
-        await interaction.reply({ embeds: [embed], ...ephemeral });
+        await interaction.editReply({ embeds: [embed] });
         return;
       }
 
@@ -296,7 +296,7 @@ export default defineCommand({
           });
         if (playlist.description !== null)
           embed.addFields({ name: 'About', value: playlist.description });
-        await interaction.reply({ embeds: [embed], ...ephemeral });
+        await interaction.editReply({ embeds: [embed] });
         return;
       }
 
@@ -314,7 +314,6 @@ export default defineCommand({
           }
           track = current;
         } else {
-          await interaction.deferReply(ephemeral);
           const music = requireMusic(client);
           const result = await music.resolve(query, {
             id: interaction.user.id,
@@ -326,10 +325,9 @@ export default defineCommand({
         }
 
         const playlist = await playlists.addTrack(ref, name, track);
-        const message = `➕ Added **${track.title}** to **${playlist.name}** (${String(playlist.trackCount)} tracks).`;
-        await (interaction.deferred
-          ? interaction.editReply(message)
-          : interaction.reply({ content: message, ...ephemeral }));
+        await interaction.editReply(
+          `➕ Added **${track.title}** to **${playlist.name}** (${String(playlist.trackCount)} tracks).`,
+        );
         return;
       }
 
@@ -339,9 +337,8 @@ export default defineCommand({
           interaction.options.getString('name', true),
           interaction.options.getInteger('number', true),
         );
-        await interaction.reply({
+        await interaction.editReply({
           content: `➖ Removed **${removed.title}** from **${playlist.name}**.`,
-          ...ephemeral,
         });
         return;
       }
@@ -356,7 +353,6 @@ export default defineCommand({
           throw new NotFoundError(`**${playlist.name}** is empty.`);
         }
 
-        await interaction.deferReply();
         const player = await music.getOrCreatePlayer({
           guildId: context.guildId,
           voiceChannelId: context.voiceChannelId,
@@ -414,9 +410,8 @@ export default defineCommand({
 
       case 'duplicate': {
         const copy = await playlists.duplicate(ref, interaction.options.getString('name', true));
-        await interaction.reply({
+        await interaction.editReply({
           content: `📄 Copied to **${copy.name}** (${String(copy.trackCount)} tracks).`,
-          ...ephemeral,
         });
         return;
       }
@@ -426,10 +421,9 @@ export default defineCommand({
         const file = new AttachmentBuilder(Buffer.from(JSON.stringify(doc, null, 2), 'utf8'), {
           name: `${doc.name.replaceAll(/[^\w\- ]/gu, '_')}.json`,
         });
-        await interaction.reply({
+        await interaction.editReply({
           content: `📦 **${doc.name}** — ${String(doc.tracks.length)} track(s). Import it anywhere with \`/playlist import\`.`,
           files: [file],
-          ...ephemeral,
         });
         return;
       }
@@ -439,7 +433,6 @@ export default defineCommand({
         if (attachment.size > IMPORT_MAX_BYTES) {
           throw new ValidationError('That file is too large (5 MB max).');
         }
-        await interaction.deferReply(ephemeral);
 
         const response = await fetch(attachment.url, { signal: AbortSignal.timeout(10_000) });
         if (!response.ok) throw new ValidationError('Could not download that attachment.');
@@ -469,11 +462,10 @@ export default defineCommand({
           interaction.options.getString('name', true),
           interaction.guild?.name ?? 'this server',
         );
-        await interaction.reply({
+        await interaction.editReply({
           content: shared
             ? '🌐 Shared with this server — anyone here can `/playlist play` it now.'
             : '🔒 No longer shared with this server.',
-          ...ephemeral,
         });
         return;
       }
@@ -483,9 +475,8 @@ export default defineCommand({
           ref,
           interaction.options.getString('name', true),
         );
-        await interaction.reply({
+        await interaction.editReply({
           content: starred ? '⭐ Starred — it now sorts first.' : 'Removed the star.',
-          ...ephemeral,
         });
         return;
       }
@@ -503,7 +494,7 @@ export default defineCommand({
           .setDescription(
             results.map((playlist) => `**${playlist.name}** — ${describe(playlist)}`).join('\n'),
           );
-        await interaction.reply({ embeds: [embed], ...ephemeral });
+        await interaction.editReply({ embeds: [embed] });
       }
     }
   },

@@ -1,5 +1,5 @@
 /** `/help` — command list grouped by category, built from the live registry. */
-import { EmbedBuilder, MessageFlags } from 'discord.js';
+import { EmbedBuilder } from 'discord.js';
 
 import { COMMAND_CATEGORIES, defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import type { BotClient } from '../../core/bot-client.js';
@@ -44,6 +44,6 @@ export default defineCommand({
       });
     }
 
-    await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+    await interaction.editReply({ embeds: [embed] });
   },
 });

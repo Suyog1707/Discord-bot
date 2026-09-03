@@ -1,6 +1,5 @@
 /** `/remove` — remove one upcoming track by its queue position. */
 import { ValidationError } from '@discord-music/shared';
-import { MessageFlags } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -40,9 +39,8 @@ export default defineCommand({
       );
     }
 
-    await interaction.reply({
+    await interaction.editReply({
       content: `🗑️ Removed **${removed.title}**.`,
-      flags: MessageFlags.Ephemeral,
     });
   },
 });

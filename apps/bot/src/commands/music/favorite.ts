@@ -1,6 +1,6 @@
 /** `/favorite` — save, list, play and remove personal favorite tracks. */
 import { NotFoundError, ValidationError } from '@discord-music/shared';
-import { EmbedBuilder, MessageFlags } from 'discord.js';
+import { EmbedBuilder } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -41,6 +41,10 @@ export default defineCommand({
   category: 'music',
   guildOnly: true,
   cooldownSeconds: 3,
+  // `play` queues tracks for the whole channel and announces it there; the
+  // rest of the subcommands are personal bookkeeping nobody else needs to see.
+  deferral: (interaction) =>
+    interaction.options.getSubcommand() === 'play' ? 'public' : 'ephemeral',
 
   async execute({ interaction }) {
     const client = interaction.client as BotClient;
@@ -54,11 +58,10 @@ export default defineCommand({
       if (track === null) throw new NotFoundError('Nothing is playing to save.');
 
       const added = await client.services.favorites.add(user.id, user.username, track);
-      await interaction.reply({
+      await interaction.editReply({
         content: added
           ? `⭐ Saved **${track.title}** to your favorites.`
           : `**${track.title}** is already in your favorites.`,
-        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -76,7 +79,7 @@ export default defineCommand({
         .setColor(0x5865f2)
         .setAuthor({ name: `${user.username}'s favorites` })
         .setDescription(lines.join('\n'));
-      await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+      await interaction.editReply({ embeds: [embed] });
       return;
     }
 
@@ -91,9 +94,8 @@ export default defineCommand({
       }
 
       await client.services.favorites.remove(user.id, target.identifier);
-      await interaction.reply({
+      await interaction.editReply({
         content: `🗑️ Removed **${target.title}** from your favorites.`,
-        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -105,8 +107,6 @@ export default defineCommand({
     if (favorites.length === 0) {
       throw new NotFoundError('You have no favorites yet — save one with `/favorite add`.');
     }
-
-    await interaction.deferReply();
 
     const player = await music.getOrCreatePlayer({
       guildId: context.guildId,

@@ -1,6 +1,5 @@
 /** `/restart` — restart the current track from the beginning. */
 import { NotFoundError } from '@discord-music/shared';
-import { MessageFlags } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -29,9 +28,8 @@ export default defineCommand({
       throw new NotFoundError('Nothing is playing right now.');
     }
 
-    await interaction.reply({
+    await interaction.editReply({
       content: `🔄 Restarted **${track.title}**.`,
-      flags: MessageFlags.Ephemeral,
     });
   },
 });

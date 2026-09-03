@@ -1,6 +1,5 @@
 /** `/loop` — set the loop mode. */
 import { LOOP_MODES, type LoopMode } from '@discord-music/shared';
-import { MessageFlags } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -40,6 +39,6 @@ export default defineCommand({
     const mode = interaction.options.getString('mode', true) as LoopMode;
     player.setLoopMode(mode);
 
-    await interaction.reply({ content: DESCRIPTIONS[mode], flags: MessageFlags.Ephemeral });
+    await interaction.editReply({ content: DESCRIPTIONS[mode] });
   },
 });

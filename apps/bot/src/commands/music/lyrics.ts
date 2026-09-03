@@ -1,6 +1,6 @@
 /** `/lyrics` — lyrics for the current track (LRCLIB). */
 import { NotFoundError } from '@discord-music/shared';
-import { EmbedBuilder, MessageFlags } from 'discord.js';
+import { EmbedBuilder } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -21,8 +21,6 @@ export default defineCommand({
     const player = interaction.guildId === null ? undefined : music.getPlayer(interaction.guildId);
     const current = player?.queue.current ?? null;
     if (current === null) throw new NotFoundError('Nothing is playing.');
-
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     const result = await fetchLyrics(current.title, current.author);
     if (result === null) {

@@ -1,6 +1,5 @@
 /** `/move` — move an upcoming track to another position. */
 import { ValidationError } from '@discord-music/shared';
-import { MessageFlags } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -48,9 +47,8 @@ export default defineCommand({
       );
     }
 
-    await interaction.reply({
+    await interaction.editReply({
       content: `↕️ Moved **${moved.title}** to position ${String(to)}.`,
-      flags: MessageFlags.Ephemeral,
     });
   },
 });

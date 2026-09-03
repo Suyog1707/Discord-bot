@@ -1,5 +1,5 @@
 /** `/247` — keep the bot in the voice channel around the clock. */
-import { MessageFlags, PermissionFlagsBits } from 'discord.js';
+import { PermissionFlagsBits } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -28,11 +28,10 @@ export default defineCommand({
     // Apply to a live player immediately; otherwise it takes effect on join.
     client.music?.getPlayer(guildId)?.setStayConnected(enabled);
 
-    await interaction.reply({
+    await interaction.editReply({
       content: enabled
         ? '🔁 **24/7 mode on** — I will stay in the voice channel and rejoin after restarts.'
         : `🔁 **24/7 mode off** — I will leave after ${String(settings.leaveOnEmptyAfter)}s of inactivity.`,
-      flags: MessageFlags.Ephemeral,
     });
   },
 });

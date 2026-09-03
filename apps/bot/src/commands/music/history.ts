@@ -1,6 +1,6 @@
 /** `/history` — recently played tracks in this server. */
 import { NotFoundError } from '@discord-music/shared';
-import { EmbedBuilder, MessageFlags } from 'discord.js';
+import { EmbedBuilder } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
@@ -41,6 +41,6 @@ export default defineCommand({
       .setDescription(lines.join('\n'))
       .setFooter({ text: `Last ${String(rows.length)} tracks` });
 
-    await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+    await interaction.editReply({ embeds: [embed] });
   },
 });
