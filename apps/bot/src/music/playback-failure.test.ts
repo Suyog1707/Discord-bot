@@ -69,6 +69,8 @@ describe('isTruncatedPlayback', () => {
   });
 
   it('ignores a track of unknown length', () => {
-    expect(isTruncatedPlayback({ reason: 'finished', expectedMs: 0, reachedMs: 4_000 })).toBe(false);
+    expect(isTruncatedPlayback({ reason: 'finished', expectedMs: 0, reachedMs: 4_000 })).toBe(
+      false,
+    );
   });
 });

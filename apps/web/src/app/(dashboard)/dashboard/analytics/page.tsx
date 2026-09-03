@@ -56,7 +56,9 @@ export default async function AnalyticsPage({
                 variant={server.discordId === selected?.discordId ? 'default' : 'outline'}
                 asChild
               >
-                <AppLink href={`/dashboard/analytics?guild=${server.discordId}`}>{server.name}</AppLink>
+                <AppLink href={`/dashboard/analytics?guild=${server.discordId}`}>
+                  {server.name}
+                </AppLink>
               </Button>
             ))}
           </div>

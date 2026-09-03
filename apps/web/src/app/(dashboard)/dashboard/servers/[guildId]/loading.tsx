@@ -1,4 +1,8 @@
-import { CardGridSkeleton, ListSkeleton, PageHeaderSkeleton } from '@/components/dashboard/skeletons';
+import {
+  CardGridSkeleton,
+  ListSkeleton,
+  PageHeaderSkeleton,
+} from '@/components/dashboard/skeletons';
 
 /** Server detail: guild header + live player + settings + queue. */
 export default function ServerDetailLoading() {

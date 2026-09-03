@@ -88,7 +88,9 @@ describe('playbackSourceOf', () => {
   it('reports where the audio actually came from, not what the track displays as', () => {
     // A Spotify-identified track streamed from SoundCloud. The re-source path
     // must flip to YouTube, not away from "spotify" — which names no provider.
-    expect(playbackSourceOf({ source: 'spotify', playbackSource: 'soundcloud' })).toBe('soundcloud');
+    expect(playbackSourceOf({ source: 'spotify', playbackSource: 'soundcloud' })).toBe(
+      'soundcloud',
+    );
     expect(playbackSourceOf({ source: 'spotify', playbackSource: 'youtube' })).toBe('youtube');
   });
 

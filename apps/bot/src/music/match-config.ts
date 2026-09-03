@@ -356,9 +356,11 @@ export interface MatchOverrides {
 }
 
 /** Apply the operator's overrides to a profile pair. */
-export function applyOverrides(
-  overrides: MatchOverrides,
-): { readonly soundcloud: MatchWeights; readonly youtube: MatchWeights; readonly duration: DurationRules } {
+export function applyOverrides(overrides: MatchOverrides): {
+  readonly soundcloud: MatchWeights;
+  readonly youtube: MatchWeights;
+  readonly duration: DurationRules;
+} {
   const duration: DurationRules =
     overrides.durationToleranceMs === undefined
       ? DEFAULT_DURATION_RULES

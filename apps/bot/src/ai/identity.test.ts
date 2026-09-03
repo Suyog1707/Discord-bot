@@ -9,7 +9,10 @@ describe('identityOf', () => {
   // the song under whichever spelling it hasn't seen yet.
   it('collapses the same song across source vocabularies', () => {
     const plain = identityOf('The Weeknd', 'Blinding Lights');
-    const youtubeTopic = identityOf('The Weeknd - Topic', 'The Weeknd - Blinding Lights (Official Video)');
+    const youtubeTopic = identityOf(
+      'The Weeknd - Topic',
+      'The Weeknd - Blinding Lights (Official Video)',
+    );
     const lowerCasedLyrics = identityOf('the weeknd', 'Blinding Lights [Lyrics]');
 
     expect(youtubeTopic.key).toBe(plain.key);
@@ -90,7 +93,7 @@ describe('identityOf', () => {
     // silently misclassify real, unrelated songs.
     it('does not fire on a variant word that is a substring of a different word', () => {
       // "edit" must not fire inside "edition" or "meditation".
-      const edition = identityOf('Edith Piaf', "La Vie en Rose (Special Edition)");
+      const edition = identityOf('Edith Piaf', 'La Vie en Rose (Special Edition)');
       const meditation = identityOf('Some Artist', 'Meditation Music for Sleep');
       // "live" must not fire inside "alive".
       const alive = identityOf('Some Artist', 'Stay Alive');
@@ -164,7 +167,9 @@ describe('identityOf', () => {
 
 describe('trackKeyOf', () => {
   it('returns the same value as identityOf(...).key', () => {
-    expect(trackKeyOf('The Weeknd', 'Blinding Lights')).toBe(identityOf('The Weeknd', 'Blinding Lights').key);
+    expect(trackKeyOf('The Weeknd', 'Blinding Lights')).toBe(
+      identityOf('The Weeknd', 'Blinding Lights').key,
+    );
   });
 });
 
@@ -177,7 +182,9 @@ describe('identifierKeyOf', () => {
   // ("YouTube", "Spotify", "lastfm"); the key has to be stable regardless.
   it('is stable and lowercased on the source, regardless of input casing', () => {
     expect(identifierKeyOf('YouTube', 'dQw4w9WgXcQ')).toBe('youtube:dQw4w9WgXcQ');
-    expect(identifierKeyOf('YOUTUBE', 'dQw4w9WgXcQ')).toBe(identifierKeyOf('youtube', 'dQw4w9WgXcQ'));
+    expect(identifierKeyOf('YOUTUBE', 'dQw4w9WgXcQ')).toBe(
+      identifierKeyOf('youtube', 'dQw4w9WgXcQ'),
+    );
   });
 
   // Identifiers are opaque provider IDs and are often case-sensitive

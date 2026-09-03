@@ -1,4 +1,8 @@
-import { CardGridSkeleton, ListSkeleton, PageHeaderSkeleton } from '@/components/dashboard/skeletons';
+import {
+  CardGridSkeleton,
+  ListSkeleton,
+  PageHeaderSkeleton,
+} from '@/components/dashboard/skeletons';
 
 /** Analytics: header + guild picker + stat cards + top-tracks list. */
 export default function AnalyticsLoading() {

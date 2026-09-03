@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { canonicalTrack, type CanonicalTrack } from './canonical-track.js';
-import { requestedVariantsOf, type MatchCandidate, type PlaybackProvider } from './candidate-matcher.js';
+import {
+  requestedVariantsOf,
+  type MatchCandidate,
+  type PlaybackProvider,
+} from './candidate-matcher.js';
 import {
   formatResolutionTrace,
   resolvePlayback,
@@ -249,7 +253,9 @@ describe('caching', () => {
   it('reuses an accepted resolution without searching again', async () => {
     const cache = new ResolutionCache<MatchCandidate>();
     const spy = vi.fn<ProviderSearch<MatchCandidate>>((_query, provider) =>
-      Promise.resolve(provider === 'soundcloud' ? [upload('Blinding Lights', 'The Weeknd', 200_000)] : []),
+      Promise.resolve(
+        provider === 'soundcloud' ? [upload('Blinding Lights', 'The Weeknd', 200_000)] : [],
+      ),
     );
 
     const first = await resolvePlayback(wanted, spy, { cache });

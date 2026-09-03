@@ -91,9 +91,7 @@ async function tokenRequest(body: URLSearchParams): Promise<{
       response: spotifyError,
     });
 
-    throw new UpstreamError(
-      `Spotify token request failed (${String(response.status)}).`,
-    );
+    throw new UpstreamError(`Spotify token request failed (${String(response.status)}).`);
   }
 
   return JSON.parse(responseText) as {
@@ -156,9 +154,7 @@ async function apiGet<T>(accessToken: string, path: string): Promise<T> {
       path,
     });
 
-    throw new UpstreamError(
-      `Spotify API request failed (${String(response.status)}).`,
-    );
+    throw new UpstreamError(`Spotify API request failed (${String(response.status)}).`);
   }
 
   return JSON.parse(responseText) as T;

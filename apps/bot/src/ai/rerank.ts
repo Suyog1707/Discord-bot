@@ -96,7 +96,10 @@ function formatContext(context: RerankContext): string {
 
 function buildUserMessage(candidates: readonly RerankCandidate[], context: RerankContext): string {
   const lines = candidates.map((candidate, index) => {
-    const tags = candidate.tags !== undefined && candidate.tags.length > 0 ? candidate.tags.join(', ') : 'none';
+    const tags =
+      candidate.tags !== undefined && candidate.tags.length > 0
+        ? candidate.tags.join(', ')
+        : 'none';
     return `${String(index)}. ${candidate.artist} — ${candidate.title} (score ${candidate.score.toFixed(2)}; tags: ${tags})`;
   });
 

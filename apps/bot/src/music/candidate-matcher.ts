@@ -523,7 +523,8 @@ export function scoreCandidate<T extends MatchCandidate>(
   // whichever direction it points — which is why a conflict is a veto and not
   // merely a penalty: the rights-holder has stated these are different masters.
   const candidateIsrc = normaliseIsrc(candidate.isrc);
-  const isrcMatched = wanted.isrc !== null && candidateIsrc !== null && wanted.isrc === candidateIsrc;
+  const isrcMatched =
+    wanted.isrc !== null && candidateIsrc !== null && wanted.isrc === candidateIsrc;
   if (wanted.isrc !== null && candidateIsrc !== null && !isrcMatched) {
     return reject('isrc-conflict', `${wanted.isrc} != ${candidateIsrc}`);
   }
@@ -599,7 +600,8 @@ export function scoreCandidate<T extends MatchCandidate>(
     const present = wantedTitleWords.filter((word) => titleHaystack.includes(word)).length;
     titleOverlap = present / wantedTitleWords.length;
     if (titleOverlap >= 0.99) add(weights.titleAllWords, 'title-all-words');
-    else if (titleOverlap >= 0.6) add(Math.round(titleOverlap * weights.titlePartial), 'title-partial');
+    else if (titleOverlap >= 0.6)
+      add(Math.round(titleOverlap * weights.titlePartial), 'title-partial');
     else add(weights.titleMismatch, 'title-mismatch');
   }
 

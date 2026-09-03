@@ -1,4 +1,8 @@
-import { CardGridSkeleton, ListSkeleton, PageHeaderSkeleton } from '@/components/dashboard/skeletons';
+import {
+  CardGridSkeleton,
+  ListSkeleton,
+  PageHeaderSkeleton,
+} from '@/components/dashboard/skeletons';
 
 /** Settings: header + profile card + Spotify card + active sessions. */
 export default function SettingsLoading() {

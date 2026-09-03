@@ -47,7 +47,9 @@ interface CacheEntry {
 
 const cache = new Map<string, CacheEntry>();
 
-function cacheGet(key: string): { readonly hit: true; readonly value: CanonicalTrack | null } | null {
+function cacheGet(
+  key: string,
+): { readonly hit: true; readonly value: CanonicalTrack | null } | null {
   const entry = cache.get(key);
   if (entry === undefined) return null;
   if (entry.expiresAt <= Date.now()) {

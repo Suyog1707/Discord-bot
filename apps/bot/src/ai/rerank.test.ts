@@ -49,9 +49,7 @@ describe('ShortlistReranker', () => {
   });
 
   it('accepts a markdown-fenced response', async () => {
-    const reranker = new ShortlistReranker(
-      providerReturning('```json\n{"order":[2,0,1]}\n```'),
-    );
+    const reranker = new ShortlistReranker(providerReturning('```json\n{"order":[2,0,1]}\n```'));
     const result = await reranker.rerank(candidates(3), CONTEXT);
 
     expect(result).toEqual([2, 0, 1]);

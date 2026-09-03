@@ -11,11 +11,7 @@ import {
   type MatchCandidate,
   type MatchOptions,
 } from './candidate-matcher.js';
-import {
-  DEFAULT_DURATION_RULES,
-  SOUNDCLOUD_WEIGHTS,
-  YOUTUBE_WEIGHTS,
-} from './match-config.js';
+import { DEFAULT_DURATION_RULES, SOUNDCLOUD_WEIGHTS, YOUTUBE_WEIGHTS } from './match-config.js';
 
 let seq = 0;
 function candidate(
@@ -294,7 +290,9 @@ describe('rankCandidates — choosing between plausible uploads', () => {
       candidate('Save Your Tears (Lyrics)', 'LyricVault', 200_000),
       candidate('Blinding Lights Lyrics | Movie Scene', 'Film Clips HD', 200_000),
     ];
-    expect(isAcceptable(scoreCandidate(wanted, wrongDuration, youtube), YOUTUBE_WEIGHTS)).toBe(false);
+    expect(isAcceptable(scoreCandidate(wanted, wrongDuration, youtube), YOUTUBE_WEIGHTS)).toBe(
+      false,
+    );
     expect(isAcceptable(scoreCandidate(wanted, wrongSong, youtube), YOUTUBE_WEIGHTS)).toBe(false);
     expect(scoreCandidate(wanted, scene, youtube).rejected?.kind).toBe('non-music');
   });

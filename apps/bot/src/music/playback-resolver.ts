@@ -22,11 +22,7 @@
  * much harder failure for a listener to diagnose.
  */
 import { getLogger } from '../lib/logger.js';
-import {
-  canonicalKey,
-  describeCanonical,
-  type CanonicalTrack,
-} from './canonical-track.js';
+import { canonicalKey, describeCanonical, type CanonicalTrack } from './canonical-track.js';
 import {
   isAcceptable,
   isConfident,
@@ -136,7 +132,10 @@ const DEFAULT_WEIGHTS: Record<PlaybackProvider, MatchWeights> = {
  * "playable track" quietly becomes something else.
  */
 export class ResolutionCache<T extends MatchCandidate> {
-  readonly #entries = new Map<string, { readonly value: ResolvedPlayback<T>; readonly expiresAt: number }>();
+  readonly #entries = new Map<
+    string,
+    { readonly value: ResolvedPlayback<T>; readonly expiresAt: number }
+  >();
   readonly #ttlMs: number;
   readonly #maxEntries: number;
 
@@ -191,7 +190,11 @@ async function searchProvider<T extends MatchCandidate>(
   provider: PlaybackProvider,
   search: ProviderSearch<T>,
   matchOptions: MatchOptions,
-): Promise<{ readonly ranked: readonly ScoredCandidate<T>[]; readonly queriesRun: number; readonly pooled: number }> {
+): Promise<{
+  readonly ranked: readonly ScoredCandidate<T>[];
+  readonly queriesRun: number;
+  readonly pooled: number;
+}> {
   const seen = new Set<string>();
   const pool: T[] = [];
   let ranked: readonly ScoredCandidate<T>[] = [];
@@ -313,7 +316,10 @@ export async function resolvePlayback<T extends MatchCandidate>(
         decision: 'provider-error',
         error: error instanceof Error ? error.message : String(error),
       });
-      logger.warn({ err: error, provider, track: describeCanonical(wanted) }, 'Playback provider failed');
+      logger.warn(
+        { err: error, provider, track: describeCanonical(wanted) },
+        'Playback provider failed',
+      );
       continue;
     }
 
@@ -395,7 +401,10 @@ export function formatResolutionTrace(trace: ResolutionTrace): string {
 
   for (const attempt of trace.attempts) {
     const name = attempt.provider === 'soundcloud' ? 'SoundCloud' : 'YouTube';
-    lines.push('', `${name} candidates: ${String(attempt.considered)} (${String(attempt.queriesRun)} queries)`);
+    lines.push(
+      '',
+      `${name} candidates: ${String(attempt.considered)} (${String(attempt.queriesRun)} queries)`,
+    );
     if (attempt.decision === 'provider-error') {
       lines.push(`  provider error: ${attempt.error ?? 'unknown'}`);
       continue;
@@ -434,7 +443,8 @@ export function formatResolutionTrace(trace: ResolutionTrace): string {
  * come looking for after a bad match.
  */
 function logResolution(trace: ResolutionTrace): void {
-  const fellThrough = trace.playedFrom !== null && trace.playedFrom !== (trace.attempts[0]?.provider ?? null);
+  const fellThrough =
+    trace.playedFrom !== null && trace.playedFrom !== (trace.attempts[0]?.provider ?? null);
   if (trace.decision === 'no-match' || fellThrough) {
     logger.info({ resolution: trace }, formatResolutionTrace(trace));
     return;
