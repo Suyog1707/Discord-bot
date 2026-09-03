@@ -347,6 +347,28 @@ listener, re-syncs the session ledger from the restored tracks, and — if the
 saved queue had already finished — resumes personalised autoplay without
 waiting for a new request. `/autoplay listener` shows who it follows.
 
+Only listeners **currently in the voice channel** personalise a session. The
+ledger remembers requesters and the persisted owner long after they leave, and
+a guild sitting in 24/7 mode would otherwise keep tuning itself to somebody who
+had gone home — including to whatever they are playing in a different server
+right now. `MusicManager` narrows the ledger's listeners to the channel's live
+occupancy before the planner reads them, failing open when the channel cannot
+be resolved.
+
+### Guilds are separate radios
+
+Everything a server's radio is built from is that server's own activity. Play
+history, co-occurrence pairs and the taste profiles blended into a generation
+pass are all scoped to one guild — a listener's profile is `{ guildId, userId }`,
+their listening *here*, never their listening everywhere. That scope has no row
+in `taste_profile` (which keys rows by guild or by user, never by the pair), so
+it is computed on demand and cached for a refresh cooldown.
+
+What legitimately travels with a person is their **library**: favourites, their
+own playlists, and their dislikes. Those apply wherever they are listening —
+and, because of the presence rule above, only while they are actually in the
+room.
+
 ### `/ask` — questions are answered, requests are played
 
 `/ask` first decides what a sentence is. A question ("who sings this", "what

@@ -309,12 +309,21 @@ describe('CooccurrenceService', () => {
     await service.signals('guild-1', []);
 
     expect(stub.favoriteTrack.findMany).not.toHaveBeenCalled();
-    const args = stub.songHistory.findMany.mock.calls[0]?.[0] as
-      { where: { OR: readonly Record<string, unknown>[] } } | undefined;
-    expect(args).toBeDefined();
-    expect(args?.where.OR).toEqual([{ guild: { discordId: 'guild-1' } }]);
+    expect(stub.songHistory.findMany).toHaveBeenCalledTimes(1);
     // The guild's own public playlists exist with or without a listener.
     expect(stub.playlist.findMany).toHaveBeenCalledTimes(1);
+  });
+
+  it("pairs songs from this guild only, never a listener's plays elsewhere", async () => {
+    const { stub, service } = serviceWith({ history: [history()] });
+
+    await service.signals('guild-1', ['u1', 'u2']);
+
+    const args = stub.songHistory.findMany.mock.calls[0]?.[0] as
+      { where: Record<string, unknown> } | undefined;
+    expect(args).toBeDefined();
+    expect(args?.where.OR).toBeUndefined();
+    expect(args?.where.guild).toEqual({ discordId: 'guild-1' });
   });
 });
 

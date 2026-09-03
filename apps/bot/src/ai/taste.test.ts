@@ -1,6 +1,17 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-import { blendProfiles, EMPTY_TASTE_PROFILE, originWeightOf, type TasteProfile } from './taste.js';
+import type { PrismaClient } from '@discord-music/database';
+
+import { CacheService } from './cache.js';
+import type { LastFmService } from './lastfm.js';
+import type { MusicBrainzService } from './musicbrainz.js';
+import {
+  blendProfiles,
+  EMPTY_TASTE_PROFILE,
+  originWeightOf,
+  UserTasteService,
+  type TasteProfile,
+} from './taste.js';
 
 describe('originWeightOf', () => {
   const play = (origin: string, playedMs: number, skipped = false) => ({
@@ -127,5 +138,60 @@ describe('blendProfiles', () => {
     const total = Object.values(blended.languageAffinity).reduce((sum, share) => sum + share, 0);
     expect(total).toBeCloseTo(1);
     expect(blended.languageAffinity.hindi).toBeCloseTo(0.5);
+  });
+});
+
+describe('UserTasteService scopes', () => {
+  /** Just enough Prisma for a profile read whose history comes back empty. */
+  function serviceWith() {
+    const stub = {
+      songHistory: { findMany: vi.fn((_args: unknown) => Promise.resolve([])) },
+      guild: { findUnique: vi.fn(() => Promise.resolve({ id: 'guild-row' })) },
+      user: { findUnique: vi.fn(() => Promise.resolve({ id: 'user-row' })) },
+      tasteProfile: {
+        findFirst: vi.fn(() => Promise.resolve(null)),
+        upsert: vi.fn(() => Promise.resolve(null)),
+      },
+    };
+    const service = new UserTasteService(
+      stub as unknown as PrismaClient,
+      new CacheService(),
+      {} as unknown as LastFmService,
+      {} as unknown as MusicBrainzService,
+    );
+    return { stub, service };
+  }
+
+  it('scopes a listener profile to one guild, and keeps it out of the table', async () => {
+    const { stub, service } = serviceWith();
+
+    expect(await service.profile({ guildId: 'g1', userId: 'u1' })).toEqual(EMPTY_TASTE_PROFILE);
+
+    // Both clauses AND together: this person, in this room. An OR here is
+    // exactly how one server's plays used to shape another server's radio.
+    const args = stub.songHistory.findMany.mock.calls[0]?.[0] as
+      { where: Record<string, unknown> } | undefined;
+    expect(args?.where.guild).toEqual({ discordId: 'g1' });
+    expect(args?.where.user).toEqual({ discordId: 'u1' });
+    expect(args?.where.OR).toBeUndefined();
+
+    // The table keys rows by guild or by user, never by the pair, so this
+    // profile lives in the cache alone.
+    expect(stub.tasteProfile.findFirst).not.toHaveBeenCalled();
+    expect(stub.tasteProfile.upsert).not.toHaveBeenCalled();
+  });
+
+  it('still hangs a guild-wide profile off its row', async () => {
+    const { stub, service } = serviceWith();
+
+    await service.profile({ guildId: 'g1' });
+
+    const args = stub.songHistory.findMany.mock.calls[0]?.[0] as
+      { where: Record<string, unknown> } | undefined;
+    expect(args?.where.guild).toEqual({ discordId: 'g1' });
+    expect(args?.where.user).toBeUndefined();
+    expect(stub.tasteProfile.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { guildId: 'guild-row' } }),
+    );
   });
 });

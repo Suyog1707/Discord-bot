@@ -97,6 +97,16 @@ export interface PlannerResolvers {
     readonly title: string;
     readonly artist: string;
   }) => Promise<QueuedTrack | null>;
+  /**
+   * Narrow the session's remembered listeners to the ones actually in the
+   * voice channel right now. Only the music layer can answer this — the
+   * planner sees a ledger, not a room. Absent, every remembered listener
+   * counts, which is the old behaviour.
+   */
+  readonly presentListeners?: (
+    guildId: string,
+    listenerIds: readonly string[],
+  ) => readonly string[];
 }
 
 export interface PlannerConfig {
@@ -267,7 +277,15 @@ export class AutoplayPlanner implements AutoplayGenerator {
     const startedAt = Date.now();
 
     const snapshot = await this.#services.session.snapshot(guildId);
-    const listenerIds = snapshot.listenerIds.slice(0, this.#config.maxListeners);
+    // Who this radio is for is a question about the room, and the session
+    // ledger cannot answer it: it remembers every requester and the persisted
+    // owner long after they have left, so a guild sitting in 24/7 mode with an
+    // empty channel kept personalising around someone who had gone home — and
+    // whose library and dislikes follow them into whatever server they are
+    // listening in now. Only people currently in the voice channel count.
+    const present =
+      resolvers.presentListeners?.(guildId, snapshot.listenerIds) ?? snapshot.listenerIds;
+    const listenerIds = present.slice(0, this.#config.maxListeners);
 
     // Taste, recency, the known pool and the dislike ledger are independent reads.
     const [profile, recent, pool, dislikes, behaviour] = await Promise.all([
@@ -681,8 +699,13 @@ export class AutoplayPlanner implements AutoplayGenerator {
     // personal profile beats a fresh one that arrives after the gap.
     const [guild, ...listeners] = await Promise.all([
       this.#services.taste.profile({ guildId }),
+      // Scoped to THIS guild, not to the person everywhere. A listener's
+      // profile is meant to answer "what does this room's music sound like
+      // with them in it", and their listening in another server answers a
+      // different question — one whose answer used to leak in here and pull
+      // the radio toward whatever they were playing somewhere else.
       ...listenerIds.map((userId) =>
-        this.#services.taste.profile({ userId }, { allowRefresh: options.background }),
+        this.#services.taste.profile({ guildId, userId }, { allowRefresh: options.background }),
       ),
     ]);
     return blendProfiles([

@@ -22,6 +22,7 @@ import {
   EMPTY_TASTE_PROFILE,
   type RecentContext,
   type TasteProfile,
+  type TasteScope,
   type UserTasteService,
 } from './taste.js';
 
@@ -121,9 +122,9 @@ interface Harness {
   readonly rank: ReturnType<typeof vi.fn>;
   readonly resolveKnown: ReturnType<typeof vi.fn>;
   readonly resolveDiscovery: ReturnType<typeof vi.fn>;
-  readonly profileCalls: (string | { readonly userId: string } | { readonly guildId: string })[];
+  readonly profileCalls: (string | TasteScope)[];
   readonly profileOptions: {
-    readonly scope: { readonly userId: string } | { readonly guildId: string };
+    readonly scope: TasteScope;
     readonly options: unknown;
   }[];
 }
@@ -152,13 +153,11 @@ function harness(options: {
   const profileOptions: Harness['profileOptions'] = [];
 
   const taste = {
-    profile: vi.fn(
-      (scope: { readonly userId: string } | { readonly guildId: string }, opts?: unknown) => {
-        profileCalls.push(scope);
-        profileOptions.push({ scope, options: opts });
-        return Promise.resolve(options.profile ?? EMPTY_TASTE_PROFILE);
-      },
-    ),
+    profile: vi.fn((scope: TasteScope, opts?: unknown) => {
+      profileCalls.push(scope);
+      profileOptions.push({ scope, options: opts });
+      return Promise.resolve(options.profile ?? EMPTY_TASTE_PROFILE);
+    }),
     recentContext: vi.fn(() => Promise.resolve(options.recent ?? EMPTY_RECENT_CONTEXT)),
   } as unknown as UserTasteService;
 
@@ -211,6 +210,11 @@ function harness(options: {
   planner.setResolvers({
     resolveKnown: options.resolvers?.resolveKnown ?? resolveKnown,
     resolveDiscovery: options.resolvers?.resolveDiscovery ?? resolveDiscovery,
+    // Absent by default: without a room to ask about, every remembered
+    // listener counts, which is what most of these tests are asserting.
+    ...(options.resolvers?.presentListeners === undefined
+      ? {}
+      : { presentListeners: options.resolvers.presentListeners }),
   });
 
   return { planner, session, rank, resolveKnown, resolveDiscovery, profileCalls, profileOptions };
@@ -480,12 +484,38 @@ describe('AutoplayPlanner — behavioural signals', () => {
     ]);
     const h = harness({ pool: bigLibrary(2), session });
     await h.planner.generate('guild', seeds, 1, { background: false });
+    // Each listener's profile is scoped to THIS guild: their listening in
+    // another server is that server's music, not this room's.
     expect(h.profileCalls).toEqual(
       expect.arrayContaining([
         { guildId: 'guild' },
-        { userId: '111111111111111111' },
-        { userId: '222222222222222222' },
+        { guildId: 'guild', userId: '111111111111111111' },
+        { guildId: 'guild', userId: '222222222222222222' },
       ]),
+    );
+  });
+
+  it('personalises only around listeners who are still in the voice channel', async () => {
+    const session = new AutoplaySessionStore();
+    await session.syncQueue('guild', [
+      entryOf(playable('U', 'One'), { origin: 'user', requestedById: '111111111111111111' }),
+      entryOf(playable('U', 'Two'), { origin: 'user', requestedById: '222222222222222222' }),
+    ]);
+    const h = harness({
+      pool: bigLibrary(2),
+      session,
+      // Only the first is still in the room; the second went home — and may
+      // well be listening in a different server right now.
+      resolvers: { presentListeners: () => ['111111111111111111'] },
+    });
+
+    await h.planner.generate('guild', seeds, 1, { background: false });
+
+    expect(h.profileCalls).toEqual(
+      expect.arrayContaining([{ guildId: 'guild', userId: '111111111111111111' }]),
+    );
+    expect(h.profileCalls).not.toEqual(
+      expect.arrayContaining([{ guildId: 'guild', userId: '222222222222222222' }]),
     );
   });
 });

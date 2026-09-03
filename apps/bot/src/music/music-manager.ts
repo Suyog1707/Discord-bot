@@ -673,7 +673,48 @@ export class MusicManager {
     planner?.setResolvers({
       resolveKnown: async (candidate) => this.resolveKnown(candidate),
       resolveDiscovery: async (candidate) => this.resolveCandidate(candidate),
+      // The planner is handed a ledger of remembered listeners; only this
+      // layer can say which of them are still in the room.
+      presentListeners: (guildId, listenerIds) => this.#listenersInVoice(guildId, listenerIds),
     });
+  }
+
+  /**
+   * The remembered listeners who are actually in the bot's voice channel.
+   *
+   * Personalisation has to follow people, not rows. The session ledger keeps
+   * every requester and the persisted session owner, and in a guild running
+   * 24/7 that memory outlives everyone leaving the channel — so autoplay went
+   * on building a radio for someone who was no longer there. That is not just
+   * stale: a person's library, dislikes and profile travel with them, so an
+   * empty channel here was being tuned to what its absent owner was listening
+   * to in a completely different server.
+   *
+   * Fails open. A channel the cache cannot resolve returns the ids unchanged,
+   * because silently de-personalising a live session is worse than trusting a
+   * ledger for one generation pass.
+   */
+  #listenersInVoice(guildId: string, listenerIds: readonly string[]): readonly string[] {
+    if (listenerIds.length === 0) return listenerIds;
+
+    const player = this.#players.get(guildId);
+    if (player === undefined) return listenerIds;
+
+    const channel = this.#client.channels.cache.get(player.voiceChannelId);
+    if (channel?.isVoiceBased() !== true) return listenerIds;
+
+    // `members` is derived from voice states, which the GuildVoiceStates
+    // intent keeps current — this is the live occupancy of the channel, not a
+    // message-cache artefact.
+    const present = channel.members;
+    const inRoom = listenerIds.filter((id) => present.has(id));
+    if (inRoom.length !== listenerIds.length) {
+      logger.debug(
+        { guildId, remembered: listenerIds.length, present: inRoom.length },
+        'Autoplay listeners narrowed to the voice channel',
+      );
+    }
+    return inRoom;
   }
 
   /** A queue/history track as the session store sees it. */

@@ -196,7 +196,7 @@ export class FamiliarPoolService {
       const [favorites, playlists, history] = await Promise.all([
         this.#loadFavorites(listenerIds),
         this.#loadPlaylists(guildId, listenerIds),
-        this.#loadHistory(guildId, listenerIds),
+        this.#loadHistory(guildId),
       ]);
 
       const drafts = new Map<string, Draft>();
@@ -279,22 +279,23 @@ export class FamiliarPoolService {
   }
 
   /**
-   * What has actually been played — in this guild, or by these listeners
-   * anywhere. The second half matters because a listener's history in another
-   * server is still their taste.
+   * What has actually been played IN THIS GUILD.
+   *
+   * Strictly one server's plays. This used to widen to "or by these listeners
+   * anywhere", on the reasoning that a person's history in another server is
+   * still their taste — but a play is also an event that happened in a room,
+   * and pulling one server's plays into another's pool is what made a song
+   * queued in one guild turn up unprompted in the next. Taste that genuinely
+   * travels with a person still reaches the pool through their favourites and
+   * playlists below, which are library, not room activity.
    */
-  async #loadHistory(
-    guildId: string,
-    listenerIds: readonly string[],
-  ): Promise<readonly HistoryRow[]> {
+  async #loadHistory(guildId: string): Promise<readonly HistoryRow[]> {
     const since = new Date(Date.now() - HISTORY_WINDOW_DAYS * 86_400_000);
-    const byListener =
-      listenerIds.length === 0 ? [] : [{ user: { discordId: { in: [...listenerIds] } } }];
 
     return this.#prisma.songHistory.findMany({
       where: {
         playedAt: { gte: since },
-        OR: [{ guild: { discordId: guildId } }, ...byListener],
+        guild: { discordId: guildId },
       },
       orderBy: { playedAt: 'desc' },
       take: HISTORY_MAX_ROWS,

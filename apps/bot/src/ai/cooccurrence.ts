@@ -193,7 +193,7 @@ export class CooccurrenceService {
 
     try {
       const [history, playlists, favorites] = await Promise.all([
-        this.#loadHistory(guildId, listenerIds),
+        this.#loadHistory(guildId),
         this.#loadPlaylists(guildId, listenerIds),
         this.#loadFavorites(listenerIds),
       ]);
@@ -220,24 +220,22 @@ export class CooccurrenceService {
   }
 
   /**
-   * What has been played - in this guild, or by these listeners anywhere.
+   * What has been played IN THIS GUILD.
    *
-   * `guildId` is selected because adjacency is only meaningful inside one
-   * guild: a listener's play in another server sat next to that server's music,
-   * not this one's.
+   * Co-occurrence is a claim about a room: these two songs were heard
+   * together, here. A listener's play in another server sat next to that
+   * server's music, so it says nothing about what fits next in this one —
+   * and folding it in was how one guild's pairs seeded another's radio.
+   * `guildId` stays selected: `foldAdjacency` groups by it, and one query
+   * answering for one guild should still be provably so.
    */
-  async #loadHistory(
-    guildId: string,
-    listenerIds: readonly string[],
-  ): Promise<readonly HistoryRow[]> {
+  async #loadHistory(guildId: string): Promise<readonly HistoryRow[]> {
     const since = new Date(Date.now() - HISTORY_WINDOW_DAYS * 86_400_000);
-    const byListener =
-      listenerIds.length === 0 ? [] : [{ user: { discordId: { in: [...listenerIds] } } }];
 
     return this.#prisma.songHistory.findMany({
       where: {
         playedAt: { gte: since },
-        OR: [{ guild: { discordId: guildId } }, ...byListener],
+        guild: { discordId: guildId },
       },
       orderBy: { playedAt: 'desc' },
       take: HISTORY_MAX_ROWS,

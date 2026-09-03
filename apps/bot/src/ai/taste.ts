@@ -128,7 +128,41 @@ export const EMPTY_RECENT_CONTEXT: RecentContext = {
   skippedArtists: [],
 };
 
-export type TasteScope = { readonly guildId: string } | { readonly userId: string };
+/**
+ * Whose listening a profile aggregates.
+ *
+ * `{ guildId }` is the room's own taste. `{ userId }` is one person's, across
+ * every server they listen in — `/ask`, where somebody is asking for
+ * themselves, is the only caller that wants that. `{ guildId, userId }` is a
+ * person's taste *inside one server*, and it is what autoplay blends: a
+ * listener's plays elsewhere are another room's music, and letting them weigh
+ * on this room is how one server's songs start turning up in another.
+ *
+ * The pair has no row of its own — `taste_profile` keys rows by guild or by
+ * user, never by both — so it is computed on demand and lives in the cache.
+ * See {@link UserTasteService.profile}.
+ */
+export type TasteScope =
+  | { readonly guildId: string }
+  | { readonly userId: string }
+  | { readonly guildId: string; readonly userId: string };
+
+/** The two axes of a scope, each present or not. */
+function scopeAxes(scope: TasteScope): {
+  readonly guildId: string | undefined;
+  readonly userId: string | undefined;
+} {
+  return {
+    guildId: 'guildId' in scope ? scope.guildId : undefined,
+    userId: 'userId' in scope ? scope.userId : undefined,
+  };
+}
+
+/** A listener-within-one-guild profile: cache-only, no persisted row. */
+function isListenerInGuild(scope: TasteScope): boolean {
+  const { guildId, userId } = scopeAxes(scope);
+  return guildId !== undefined && userId !== undefined;
+}
 
 interface HistoryRow {
   readonly identifier: string;
@@ -164,7 +198,9 @@ export function originWeightOf(row: {
 }
 
 function scopeKey(scope: TasteScope): string {
-  return 'guildId' in scope ? `guild:${scope.guildId}` : `user:${scope.userId}`;
+  const { guildId, userId } = scopeAxes(scope);
+  if (guildId !== undefined && userId !== undefined) return `guild:${guildId}:user:${userId}`;
+  return guildId === undefined ? `user:${userId ?? ''}` : `guild:${guildId}`;
 }
 
 /** Map a stored affinity object back to a plain record, tolerating any shape. */
@@ -253,7 +289,14 @@ export class UserTasteService {
             confidence: confidenceFor(row.sampleSize),
           };
 
-      await this.#cache.set(key, profile, PROFILE_CACHE_TTL_MS);
+      // A pair scope has nowhere to persist, so its cache entry IS the
+      // profile: it gets the recompute cooldown rather than the short TTL,
+      // which keeps the cadence identical to a stored profile's.
+      await this.#cache.set(
+        key,
+        profile,
+        isListenerInGuild(scope) ? REFRESH_COOLDOWN_MS : PROFILE_CACHE_TTL_MS,
+      );
       return profile;
     } catch (error) {
       logger.warn({ err: error, scope: scopeKey(scope) }, 'Taste profile read failed');
@@ -558,10 +601,14 @@ export class UserTasteService {
 
   async #loadHistory(scope: TasteScope): Promise<readonly HistoryRow[]> {
     const since = new Date(Date.now() - HISTORY_WINDOW_DAYS * 86_400_000);
-    const where =
-      'guildId' in scope
-        ? { guild: { discordId: scope.guildId }, playedAt: { gte: since } }
-        : { user: { discordId: scope.userId }, playedAt: { gte: since } };
+    const { guildId, userId } = scopeAxes(scope);
+    // Both axes AND together, which is the whole point of the pair scope:
+    // this person, in this room, and nowhere else.
+    const where = {
+      playedAt: { gte: since },
+      ...(guildId === undefined ? {} : { guild: { discordId: guildId } }),
+      ...(userId === undefined ? {} : { user: { discordId: userId } }),
+    };
 
     return this.#prisma.songHistory.findMany({
       where,
@@ -632,20 +679,34 @@ export class UserTasteService {
     }
   }
 
-  /** Translate a Discord snowflake to the internal row this profile hangs off. */
+  /**
+   * Translate a Discord snowflake to the internal row this profile hangs off,
+   * or null when there is no such row.
+   *
+   * A listener-in-one-guild profile is the null case by construction: the
+   * table's uniques are `userId` and `guildId` separately, so a row keyed by
+   * the pair cannot exist. Nothing is lost — `profile()` caches that scope
+   * for a full refresh cooldown instead of persisting it.
+   */
   async #resolveOwner(scope: TasteScope): Promise<{ guildId: string } | { userId: string } | null> {
-    if ('guildId' in scope) {
+    const { guildId, userId } = scopeAxes(scope);
+    if (guildId !== undefined && userId !== undefined) return null;
+
+    if (guildId !== undefined) {
       const guild = await this.#prisma.guild.findUnique({
-        where: { discordId: scope.guildId },
+        where: { discordId: guildId },
         select: { id: true },
       });
       return guild === null ? null : { guildId: guild.id };
     }
 
-    const user = await this.#prisma.user.findUnique({
-      where: { discordId: scope.userId },
-      select: { id: true },
-    });
+    const user =
+      userId === undefined
+        ? null
+        : await this.#prisma.user.findUnique({
+            where: { discordId: userId },
+            select: { id: true },
+          });
     return user === null ? null : { userId: user.id };
   }
 }
