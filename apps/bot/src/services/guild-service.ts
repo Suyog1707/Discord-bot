@@ -1,10 +1,10 @@
 /**
  * Guild persistence.
  *
- * Single owner of the Guild + GuildSettings + Queue rows from the bot's side:
- * events and commands go through here rather than touching Prisma ad hoc, so
- * the "row exists with settings and queue" invariant is maintained in exactly
- * one place.
+ * Single owner of the Guild + GuildSettings rows from the bot's side: events
+ * and commands go through here rather than touching Prisma ad hoc, so the
+ * "row exists with settings" invariant is maintained in exactly one place.
+ * Queue rows belong to `QueueStore`, which keys them by voice channel.
  */
 import type { Guild as DiscordGuild } from 'discord.js';
 
@@ -36,8 +36,12 @@ export class GuildService {
   }
 
   /**
-   * Ensure a Guild row exists and is marked joined, with default settings and
-   * an empty queue. Idempotent: safe on every `guildCreate` including rejoins.
+   * Ensure a Guild row exists and is marked joined, with default settings.
+   * Idempotent: safe on every `guildCreate` including rejoins.
+   *
+   * No queue row is created here any more. A queue belongs to a voice channel
+   * now, and on join there is no channel to belong to — `QueueStore` creates
+   * one the first time the bot actually plays somewhere.
    */
   async ensureGuild(guild: DiscordGuild): Promise<void> {
     await this.#prisma.guild.upsert({
@@ -58,20 +62,16 @@ export class GuildService {
         botJoinedAt: new Date(),
         isActive: true,
         settings: { create: {} },
-        queue: { create: {} },
       },
     });
 
-    // Rejoins of guilds created before settings/queue existed: fill the gaps.
+    // Rejoins of guilds created before settings existed: fill the gap.
     const row = await this.#prisma.guild.findUniqueOrThrow({
       where: { discordId: guild.id },
-      include: { settings: { select: { id: true } }, queue: { select: { id: true } } },
+      include: { settings: { select: { id: true } } },
     });
     if (row.settings === null) {
       await this.#prisma.guildSettings.create({ data: { guildId: row.id } });
-    }
-    if (row.queue === null) {
-      await this.#prisma.queue.create({ data: { guildId: row.id } });
     }
 
     this.invalidateSettings(guild.id);
@@ -190,7 +190,6 @@ export class GuildService {
           name: 'Unknown',
           botJoinedAt: new Date(),
           settings: { create: {} },
-          queue: { create: {} },
         },
         include: { settings: true },
       });

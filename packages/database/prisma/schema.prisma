@@ -146,7 +146,10 @@ model Guild {
   updatedAt   DateTime  @updatedAt @db.Timestamptz(3)
 
   settings     GuildSettings?
-  queue        Queue?
+  /// One per voice channel the bot has played in: a channel keeps its own
+  /// queue, so moving the bot to another channel no longer discards the one
+  /// it was serving.
+  queues       Queue[]
   members      GuildMember[]
   playlists    Playlist[]
   songHistory  SongHistory[]
@@ -232,10 +235,19 @@ enum PlaylistVisibility {
 }
 
 /// Live playback queue. Exactly one per guild.
+/// A saved queue for ONE voice channel.
+///
+/// The bot can only occupy one voice channel per guild at a time -- Discord
+/// keeps a single voice state per (guild, user) -- but each channel keeps its
+/// own list, so returning to a channel resumes what was playing there instead
+/// of starting from nothing.
 model Queue {
   id             String   @id @default(cuid())
-  guildId        String   @unique
-  voiceChannelId String?
+  guildId        String
+  /// Required: a queue with no channel belongs to no room and can never be
+  /// restored. Rows predating this constraint were empty by definition and
+  /// were removed by the migration that added it.
+  voiceChannelId String
   textChannelId  String?
   /// Index of the currently playing track within `tracks`.
   currentIndex   Int      @default(0)
@@ -255,7 +267,10 @@ model Queue {
   listener User?        @relation("QueueListener", fields: [listenerId], references: [id], onDelete: SetNull)
   tracks   QueueTrack[]
 
+  @@unique([guildId, voiceChannelId])
   @@index([listenerId])
+  /// The 24/7 restore picks a guild's most recently used channel.
+  @@index([guildId, updatedAt])
   @@map("queues")
 }
 

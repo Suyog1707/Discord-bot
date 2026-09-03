@@ -87,6 +87,8 @@ export interface ServerDetail {
     readonly volume: number;
     readonly loopMode: string;
     readonly currentIndex: number;
+    /** The voice channel this queue belongs to; each keeps its own. */
+    readonly voiceChannelId: string;
     readonly tracks: readonly QueueTrackView[];
   } | null;
 }
@@ -105,8 +107,12 @@ export async function getServerDetail(
       update: {},
       create: { guildId: guild.id },
     }),
-    db.queue.findUnique({
+    // A guild has one saved queue per voice channel now. The page shows the
+    // room the bot was most recently in, which is the one a live player would
+    // be serving; the others are waiting for somebody to start the bot there.
+    db.queue.findFirst({
       where: { guildId: guild.id },
+      orderBy: { updatedAt: 'desc' },
       include: { tracks: { orderBy: { position: 'asc' } } },
     }),
   ]);
@@ -132,6 +138,7 @@ export async function getServerDetail(
             volume: queue.volume,
             loopMode: queue.loopMode.toLowerCase(),
             currentIndex: queue.currentIndex,
+            voiceChannelId: queue.voiceChannelId,
             tracks: queue.tracks.map((track) => ({
               position: track.position,
               title: track.title,

@@ -355,6 +355,35 @@ right now. `MusicManager` narrows the ledger's listeners to the channel's live
 occupancy before the planner reads them, failing open when the channel cannot
 be resolved.
 
+### One queue per voice channel
+
+Discord keeps a single voice state per (guild, user), so the bot occupies at
+most **one voice channel per server at a time** — being called to a second
+channel is always a handover, never a second connection. No amount of code
+changes that; a bot account in two channels at once is not expressible in the
+API, which is why multi-channel music bots ship as several bot accounts.
+
+What the bot *can* do is stop losing the room it leaves. Queues are stored per
+`(guild, voiceChannel)` (`queues.guildId_voiceChannelId`), so:
+
+- Each channel keeps its own track list, cursor, loop mode and primary
+  listener. Moving the bot parks a room's queue instead of overwriting it.
+- Returning to a channel resumes it, if it was saved within
+  `QUEUE_RESUME_WINDOW_MS` (12h). Older than that, the channel starts clean —
+  the feature is "we stepped away and came back", not "last week ambushes you".
+  `/play` says so in its reply; `/stop` clears a channel's saved queue.
+- The autoplay session ledger is dropped on a handover. It describes a room —
+  what played there, who was listening — and none of it carries to the next.
+
+**The handover rule** (`channel-handover.ts`): the bot moves only when the
+channel it currently occupies has no non-bot members left. While anyone is
+still listening there, a `/play` from another channel is refused with the
+channel named. Otherwise anybody in the server could take the music away from a
+room full of people by typing four words.
+
+The 24/7 restore rejoins each guild's **most recently used** channel; that
+guild's other saved queues wait for somebody to start the bot in them.
+
 ### Guilds are separate radios
 
 Everything a server's radio is built from is that server's own activity. Play

@@ -37,7 +37,6 @@ async function main(): Promise<void> {
       ownerId: DEV_USER_DISCORD_ID,
       botJoinedAt: new Date(),
       settings: { create: {} },
-      queue: { create: {} },
     },
   });
 

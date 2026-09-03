@@ -41,6 +41,7 @@ import { getEnv } from '../config/env.js';
 import { getLogger } from '../lib/logger.js';
 import type { GuildService } from '../services/guild-service.js';
 import type { SpotifyService } from '../services/spotify-service.js';
+import { decideHandover } from './channel-handover.js';
 import { ControllerMessage } from './controller.js';
 import { GuildPlayer } from './guild-player.js';
 import {
@@ -65,7 +66,7 @@ import { identifyCanonicalTrack } from './metadata-providers.js';
 import { resolvePlayback, ResolutionCache, type ResolvedPlayback } from './playback-resolver.js';
 import { getResolutionSettings } from './resolution-settings.js';
 import type { SpotifyTrackMeta } from './spotify-resolver.js';
-import type { QueueStore } from './queue-store.js';
+import type { PersistedQueue, QueueStore, StayConnectedSession } from './queue-store.js';
 import { resolvePlatformLinks, type PlatformLinks } from './platform-links.js';
 import {
   buildSearchQuery,
@@ -136,6 +137,17 @@ const SEARCH_CACHE_MAX_ENTRIES = 2_000;
 const SEARCH_CANDIDATE_LIMIT = 10;
 
 /**
+ * How stale a channel's saved queue may be and still come back when the bot
+ * returns to it.
+ *
+ * The point of per-channel queues is that stepping away and coming back
+ * resumes the room, not that a list from last week ambushes whoever plays
+ * next. Twelve hours comfortably covers "we moved rooms" and "the bot idled
+ * out an hour ago"; beyond that the channel starts clean.
+ */
+const QUEUE_RESUME_WINDOW_MS = 12 * 60 * 60_000;
+
+/**
  * Accept threshold when no catalogue could identify the query.
  *
  * Three of the strongest signals — a canonical runtime, a known artist and an
@@ -203,6 +215,18 @@ export interface JoinOptions {
   readonly shardId: number;
   /** Primary listener to start with — the restore path passes the persisted one. */
   readonly listenerId?: string | null;
+  /**
+   * Whether entering a channel brings back the queue it was left with.
+   * Default true. The 24/7 startup path sets it false because it loads and
+   * restores the queue itself, with its own cursor handling.
+   */
+  readonly resumeSavedQueue?: boolean;
+}
+
+/** What a fresh join brought back with it, for the command to mention. */
+export interface ResumeNotice {
+  readonly voiceChannelId: string;
+  readonly trackCount: number;
 }
 
 export class MusicManager {
@@ -246,6 +270,12 @@ export class MusicManager {
    * `ResolutionCache`.
    */
   readonly #resolutionCache = new ResolutionCache<LavalinkCandidate>();
+
+  /**
+   * Queues brought back by the most recent join, waiting to be reported.
+   * Consumed by whichever command caused the join; dropped if nobody asks.
+   */
+  readonly #resumeNotices = new Map<string, ResumeNotice>();
 
   constructor(options: {
     readonly client: Client;
@@ -424,10 +454,45 @@ export class MusicManager {
     return this.#players.get(guildId);
   }
 
-  /** Get the existing player or join the voice channel and create one. */
+  /**
+   * Get the existing player, or join the voice channel and create one.
+   *
+   * A request from a DIFFERENT channel than the bot occupies is a handover,
+   * not a second connection — Discord allows exactly one voice state per
+   * (guild, user). {@link decideHandover} decides whether it is allowed; a
+   * room with listeners still in it keeps the bot, and the caller gets a
+   * `ValidationError` naming the channel.
+   */
   async getOrCreatePlayer(options: JoinOptions): Promise<GuildPlayer> {
     const existing = this.#players.get(options.guildId);
-    if (existing !== undefined) return existing;
+    if (existing !== undefined) {
+      const decision = decideHandover({
+        currentChannelId: existing.voiceChannelId,
+        targetChannelId: options.voiceChannelId,
+        listenersInCurrent: this.#listenerCountIn(existing.voiceChannelId),
+      });
+
+      if (decision.kind === 'stay') return existing;
+      if (decision.kind === 'busy') {
+        throw new ValidationError(
+          `I'm already playing in <#${existing.voiceChannelId}> for ` +
+            `${String(decision.listeners)} listener${decision.listeners === 1 ? '' : 's'}. ` +
+            'Join that channel, or wait until it empties out.',
+        );
+      }
+
+      // The room is empty: park its queue where it can be found again and
+      // leave. `destroyPlayer` flushes the queue under the OLD channel's key,
+      // which is the whole reason the bot can come back to it later.
+      logger.info(
+        { guildId: options.guildId, from: existing.voiceChannelId, to: options.voiceChannelId },
+        'Handing the bot over to another voice channel',
+      );
+      await this.destroyPlayer(options.guildId);
+      // The session ledger describes a room — what played there, who was
+      // listening. None of it applies to the channel being entered.
+      await this.#autoplaySession?.clear(options.guildId).catch(() => undefined);
+    }
 
     if (!this.isAvailable) {
       throw new UpstreamError('The music server is not available right now. Try again shortly.');
@@ -459,6 +524,14 @@ export class MusicManager {
     }
     const controllerActive = this.#controllers.has(options.guildId);
 
+    // What this room was left with, if anything. Read before the player is
+    // built so the listener it was following is known at construction rather
+    // than assigned a beat later.
+    const saved =
+      options.resumeSavedQueue === false
+        ? null
+        : await this.#savedQueueFor(options.guildId, options.voiceChannelId);
+
     const player = await this.shoukaku.joinVoiceChannel({
       guildId: options.guildId,
       channelId: options.voiceChannelId,
@@ -479,7 +552,7 @@ export class MusicManager {
       stayConnected: settings.stayConnected,
       autoplayEnabled: settings.autoplayEnabled,
       autoplayLowWaterMark: getEnv().AUTOPLAY_LOW_WATER_MARK,
-      listenerId: options.listenerId ?? null,
+      listenerId: options.listenerId ?? saved?.listenerId ?? null,
       autoplayTargetQueueSize: getEnv().AUTOPLAY_TARGET_QUEUE_SIZE,
       onSelfDestruct: async (guildId, reason) => {
         logger.info({ guildId, reason }, 'Player self-destructing');
@@ -563,11 +636,84 @@ export class MusicManager {
       },
     });
 
+    this.#players.set(options.guildId, guildPlayer);
+
+    // The room picks up where it left off. Deliberately before the first
+    // event goes out, so the dashboard's opening snapshot already has the
+    // restored list rather than an empty player it has to correct.
+    if (saved !== null) {
+      guildPlayer.queue.restore(saved.tracks, saved.currentIndex, saved.loopMode);
+      this.#syncSessionQueue(options.guildId);
+      if (saved.listenerId !== null) {
+        void this.#autoplaySession
+          ?.setListener(options.guildId, saved.listenerId)
+          .catch(() => undefined);
+      }
+      this.#resumeNotices.set(options.guildId, {
+        voiceChannelId: options.voiceChannelId,
+        trackCount: saved.tracks.length,
+      });
+      logger.info(
+        {
+          guildId: options.guildId,
+          channelId: options.voiceChannelId,
+          tracks: saved.tracks.length,
+        },
+        'Resumed the queue this channel was left with',
+      );
+    }
+
     this.#emitEvent(options.guildId, 'PLAYER_CONNECT', guildPlayer.snapshot());
 
-    this.#players.set(options.guildId, guildPlayer);
     logger.info({ guildId: options.guildId, channelId: options.voiceChannelId }, 'Player created');
     return guildPlayer;
+  }
+
+  /**
+   * The queue a voice channel was left with, if it is worth bringing back.
+   *
+   * Never throws: a database that cannot answer means the room starts empty,
+   * which is exactly what happened before channels had memories at all.
+   */
+  async #savedQueueFor(guildId: string, voiceChannelId: string): Promise<PersistedQueue | null> {
+    try {
+      const saved = await this.#store.loadPersisted(guildId, voiceChannelId);
+      if (saved === null) return null;
+
+      const age = Date.now() - saved.savedAt.getTime();
+      if (age > QUEUE_RESUME_WINDOW_MS) {
+        logger.debug(
+          { guildId, voiceChannelId, ageMinutes: Math.round(age / 60_000) },
+          'Saved queue is too old to resume; starting this channel clean',
+        );
+        return null;
+      }
+      return saved;
+    } catch (error) {
+      logger.warn({ err: error, guildId, voiceChannelId }, 'Reading a saved queue failed');
+      return null;
+    }
+  }
+
+  /**
+   * What the last join brought back, consumed once.
+   *
+   * A command that joins asks for this so it can tell the room "your queue is
+   * back" instead of leaving twelve unexplained songs sitting above the one
+   * that was actually requested.
+   */
+  takeResumeNotice(guildId: string): ResumeNotice | null {
+    const notice = this.#resumeNotices.get(guildId);
+    if (notice === undefined) return null;
+    this.#resumeNotices.delete(guildId);
+    return notice;
+  }
+
+  /** Non-bot members currently in a voice channel; 0 when it cannot be read. */
+  #listenerCountIn(voiceChannelId: string): number {
+    const channel = this.#client.channels.cache.get(voiceChannelId);
+    if (channel?.isVoiceBased() !== true) return 0;
+    return channel.members.filter((member) => !member.user.bot).size;
   }
 
   /**
@@ -1602,17 +1748,20 @@ export class MusicManager {
    * non-fatal — a missing channel simply skips that guild.
    */
   async restoreStayConnectedPlayers(): Promise<void> {
-    let guildIds: readonly string[];
+    let sessions: readonly StayConnectedSession[];
     try {
-      guildIds = await this.#store.stayConnectedGuildIds();
+      // One room per guild: the channel each was most recently playing in.
+      // Its other channels keep their queues for whenever somebody starts the
+      // bot in them again.
+      sessions = await this.#store.stayConnectedSessions();
     } catch (error) {
       logger.warn({ err: error }, '24/7 restore query failed');
       return;
     }
 
-    for (const guildId of guildIds) {
+    for (const { guildId, voiceChannelId } of sessions) {
       try {
-        const persisted = await this.#store.loadPersisted(guildId);
+        const persisted = await this.#store.loadPersisted(guildId, voiceChannelId);
         if (persisted === null) continue;
 
         const guild = this.#client.guilds.cache.get(guildId);
@@ -1636,6 +1785,10 @@ export class MusicManager {
           textChannelId: persisted.textChannelId,
           shardId: guild.shardId,
           listenerId: listener,
+          // This path restores the queue itself, with its own cursor handling
+          // (see the skip below); letting the join do it as well would apply
+          // two different resume policies to one queue.
+          resumeSavedQueue: false,
         });
         player.queue.restore(persisted.tracks, persisted.currentIndex, persisted.loopMode);
         await player.setVolume(persisted.volume);
@@ -1691,6 +1844,8 @@ export class MusicManager {
     if (player === undefined) return;
 
     this.#players.delete(guildId);
+    // A resume nobody asked about does not survive the session it belongs to.
+    this.#resumeNotices.delete(guildId);
     // The queue is gone with the player; the session's queued-mirror must not
     // keep excluding tracks from a queue that no longer exists. Recent-play
     // history intentionally survives: reconnecting must not reset anti-repeat.

@@ -305,6 +305,19 @@ export default defineCommand({
       if (first.artworkUrl !== null) embed.setThumbnail(first.artworkUrl);
     }
 
+    // Entering a channel brings back the queue it was left with. Said out
+    // loud, because a request that lands behind eleven songs nobody just
+    // asked for reads as a bug otherwise.
+    const resumed = music.takeResumeNotice(context.guildId);
+    if (resumed !== null) {
+      embed.addFields({
+        name: 'Picked up where this channel left off',
+        value:
+          `Restored ${String(resumed.trackCount)} track${resumed.trackCount === 1 ? '' : 's'} ` +
+          `saved in <#${resumed.voiceChannelId}>. Use \`/stop\` to clear it.`,
+      });
+    }
+
     await interaction.editReply({ embeds: [embed] });
   },
 });

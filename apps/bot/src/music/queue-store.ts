@@ -5,6 +5,12 @@
  * mutations (queueing a playlist) collapse into one write. The DB copy powers
  * the dashboard's queue view and survives restarts; the in-memory TrackQueue
  * remains the source of truth while the bot is live.
+ *
+ * A queue belongs to a VOICE CHANNEL, not to a guild. Discord only lets the
+ * bot occupy one channel per guild at a time, but that is a limit on playback,
+ * not on memory: each channel keeps its own list, so moving the bot to another
+ * channel parks the first room's queue rather than destroying it, and coming
+ * back resumes it. Everything below is therefore keyed by the pair.
  */
 import {
   MusicSource as DbMusicSource,
@@ -20,6 +26,16 @@ import type { TrackQueue } from './track-queue.js';
 const logger = getLogger('queue-store');
 
 const SAVE_DEBOUNCE_MS = 1_500;
+
+/**
+ * Debounce key. Two channels in one guild can both have a save in flight —
+ * the bot leaving one and joining the other is exactly that — so the pending
+ * timer has to be per room, or the departing channel's write gets cancelled
+ * by the arriving one and its queue is lost.
+ */
+function saveKey(discordGuildId: string, voiceChannelId: string): string {
+  return `${discordGuildId}:${voiceChannelId}`;
+}
 
 const TO_DB_SOURCE: Record<MusicSource, DbMusicSource> = {
   youtube: DbMusicSource.YOUTUBE,
@@ -56,16 +72,25 @@ export interface PersistedQueue {
   readonly textChannelId: string;
   /** Discord id of the primary listener, when one was recorded. */
   readonly listenerId: string | null;
+  /** When this queue was last written — how stale a resume would be. */
+  readonly savedAt: Date;
 }
 
 /** Everything about a queue that is not the track list. */
 export interface QueueSaveState {
   readonly volume: number;
   readonly paused: boolean;
-  readonly voiceChannelId: string | null;
+  /** Half of the queue's identity, so never optional. */
+  readonly voiceChannelId: string;
   readonly textChannelId: string | null;
   /** Discord id of the primary listener; null when nobody has requested yet. */
   readonly listenerId?: string | null;
+}
+
+/** A guild in 24/7 mode and the room it was last heard in. */
+export interface StayConnectedSession {
+  readonly guildId: string;
+  readonly voiceChannelId: string;
 }
 
 export interface HistorySeed {
@@ -96,9 +121,10 @@ export class QueueStore {
     this.#prisma = prisma;
   }
 
-  /** Schedule a debounced snapshot of the queue for this guild. */
+  /** Schedule a debounced snapshot of one channel's queue. */
   scheduleSave(discordGuildId: string, queue: TrackQueue, state: QueueSaveState): void {
-    const existing = this.#pendingSaves.get(discordGuildId);
+    const key = saveKey(discordGuildId, state.voiceChannelId);
+    const existing = this.#pendingSaves.get(key);
     if (existing !== undefined) clearTimeout(existing);
 
     // Snapshot now: the queue may mutate again before the timer fires, and a
@@ -111,31 +137,32 @@ export class QueueStore {
     };
 
     const timer = setTimeout(() => {
-      this.#pendingSaves.delete(discordGuildId);
+      this.#pendingSaves.delete(key);
       this.#save(discordGuildId, snapshot).catch((error: unknown) => {
-        logger.warn({ err: error, guildId: discordGuildId }, 'Queue persistence failed');
+        logger.warn(
+          { err: error, guildId: discordGuildId, voiceChannelId: state.voiceChannelId },
+          'Queue persistence failed',
+        );
       });
     }, SAVE_DEBOUNCE_MS);
     timer.unref();
 
-    this.#pendingSaves.set(discordGuildId, timer);
+    this.#pendingSaves.set(key, timer);
   }
 
-  /** Flush a pending save immediately (shutdown path). */
+  /** Flush a pending save immediately (shutdown and channel-change paths). */
   async flush(
     discordGuildId: string,
     queue: TrackQueue,
     paused: boolean,
-    listenerId: string | null = null,
-    channels: { readonly voiceChannelId: string | null; readonly textChannelId: string | null } = {
-      voiceChannelId: null,
-      textChannelId: null,
-    },
+    listenerId: string | null,
+    channels: { readonly voiceChannelId: string; readonly textChannelId: string | null },
   ): Promise<void> {
-    const existing = this.#pendingSaves.get(discordGuildId);
+    const key = saveKey(discordGuildId, channels.voiceChannelId);
+    const existing = this.#pendingSaves.get(key);
     if (existing !== undefined) {
       clearTimeout(existing);
-      this.#pendingSaves.delete(discordGuildId);
+      this.#pendingSaves.delete(key);
     }
     await this.#save(discordGuildId, {
       tracks: [...queue.tracks],
@@ -143,14 +170,18 @@ export class QueueStore {
       loopMode: queue.loopMode,
       volume: 100,
       paused,
-      // The channels are what `stayConnectedGuildIds` restores by. A graceful
-      // shutdown that erased them made every 24/7 queue unrestorable — the
-      // restore path only ever ran after a crash.
+      // The channel is what the queue is FILED under, as well as what the
+      // 24/7 restore rejoins by. A graceful shutdown that erased it made
+      // every 24/7 queue unrestorable — the restore path only ever ran after
+      // a crash.
       voiceChannelId: channels.voiceChannelId,
       textChannelId: channels.textChannelId,
       listenerId,
     }).catch((error: unknown) => {
-      logger.warn({ err: error, guildId: discordGuildId }, 'Queue flush failed');
+      logger.warn(
+        { err: error, guildId: discordGuildId, voiceChannelId: channels.voiceChannelId },
+        'Queue flush failed',
+      );
     });
   }
 
@@ -180,20 +211,28 @@ export class QueueStore {
       readonly loopMode: LoopMode;
       readonly volume: number;
       readonly paused: boolean;
-      readonly voiceChannelId: string | null;
+      readonly voiceChannelId: string;
       readonly textChannelId: string | null;
       readonly listenerId?: string | null;
     },
   ): Promise<void> {
     const guild = await this.#prisma.guild.findUnique({
       where: { discordId: discordGuildId },
-      select: { id: true, queue: { select: { id: true } } },
+      select: { id: true },
     });
     if (guild === null) return;
 
-    const queueId =
-      guild.queue?.id ??
-      (await this.#prisma.queue.create({ data: { guildId: guild.id }, select: { id: true } })).id;
+    // Find-or-create this room's row. The upsert writes nothing but the
+    // identity: the transaction below owns every mutable field, and doing it
+    // here as well would make the two disagree for the width of one query.
+    const { id: queueId } = await this.#prisma.queue.upsert({
+      where: {
+        guildId_voiceChannelId: { guildId: guild.id, voiceChannelId: snapshot.voiceChannelId },
+      },
+      update: {},
+      create: { guildId: guild.id, voiceChannelId: snapshot.voiceChannelId },
+      select: { id: true },
+    });
 
     const people = new Set<string>();
     for (const track of snapshot.tracks) {
@@ -285,12 +324,17 @@ export class QueueStore {
   }
 
   /**
-   * Load the persisted queue for one guild, for restoring after a restart.
-   * Null when there is nothing worth restoring (no tracks or no channel).
+   * Load one voice channel's saved queue.
+   *
+   * Null when there is nothing worth restoring — no row for that room, or a
+   * row with no tracks left in it.
    */
-  async loadPersisted(discordGuildId: string): Promise<PersistedQueue | null> {
+  async loadPersisted(
+    discordGuildId: string,
+    voiceChannelId: string,
+  ): Promise<PersistedQueue | null> {
     const queue = await this.#prisma.queue.findFirst({
-      where: { guild: { discordId: discordGuildId } },
+      where: { guild: { discordId: discordGuildId }, voiceChannelId },
       include: {
         listener: { select: { discordId: true } },
         tracks: {
@@ -301,7 +345,7 @@ export class QueueStore {
         },
       },
     });
-    if (queue?.voiceChannelId == null || queue.tracks.length === 0) return null;
+    if (queue === null || queue.tracks.length === 0) return null;
 
     return {
       tracks: queue.tracks.map((track): QueuedTrack => {
@@ -343,20 +387,41 @@ export class QueueStore {
       voiceChannelId: queue.voiceChannelId,
       textChannelId: queue.textChannelId ?? '',
       listenerId: queue.listener?.discordId ?? null,
+      savedAt: queue.updatedAt,
     };
   }
 
-  /** Discord guild ids configured for 24/7 that have a restorable queue. */
-  async stayConnectedGuildIds(): Promise<readonly string[]> {
+  /**
+   * Rooms to rejoin on startup: for each 24/7 guild, the voice channel it was
+   * most recently playing in.
+   *
+   * One channel per guild, because the bot can only be in one. A guild whose
+   * other channels have saved queues keeps them — they resume the next time
+   * somebody starts the bot in that channel.
+   */
+  async stayConnectedSessions(): Promise<readonly StayConnectedSession[]> {
     const guilds = await this.#prisma.guild.findMany({
       where: {
         botLeftAt: null,
         settings: { stayConnected: true },
-        queue: { voiceChannelId: { not: null } },
+        queues: { some: {} },
       },
-      select: { discordId: true },
+      select: {
+        discordId: true,
+        queues: {
+          orderBy: { updatedAt: 'desc' },
+          take: 1,
+          select: { voiceChannelId: true },
+        },
+      },
     });
-    return guilds.map((guild) => guild.discordId);
+
+    return guilds.flatMap((guild) => {
+      const [latest] = guild.queues;
+      return latest === undefined
+        ? []
+        : [{ guildId: guild.discordId, voiceChannelId: latest.voiceChannelId }];
+    });
   }
 
   /** Append one play to the analytics history. Best-effort. */
