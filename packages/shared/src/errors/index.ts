@@ -49,7 +49,21 @@ export interface AppErrorOptions {
  * `expected: true` marks errors that are part of normal operation (a 404, a
  * failed validation) so logging can use `warn` instead of `error`.
  */
+/**
+ * Cross-bundle brand for {@link AppError}.
+ *
+ * `instanceof` compares class identity, which holds only while there is one
+ * copy of this module. A bundler that emits an entry point per command — tsup
+ * without `splitting` — gives each chunk its own `AppError`, so a
+ * `ValidationError` thrown in `commands/music/resume` fails `instanceof
+ * AppError` in `events/interaction-create` and is reported as an unexpected
+ * 500 instead of the message the user should have seen. `Symbol.for` resolves
+ * to the same key in every copy, so identity survives the duplication.
+ */
+const APP_ERROR: unique symbol = Symbol.for('@discord-music/shared/AppError');
+
 export class AppError extends Error {
+  readonly [APP_ERROR] = true;
   readonly code: ErrorCode;
   readonly statusCode: number;
   readonly details: Readonly<Record<string, unknown>> | undefined;
@@ -152,7 +166,7 @@ export class InternalError extends AppError {
 }
 
 export function isAppError(value: unknown): value is AppError {
-  return value instanceof AppError;
+  return value instanceof Error && APP_ERROR in value;
 }
 
 /**

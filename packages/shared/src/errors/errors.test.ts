@@ -82,4 +82,21 @@ describe('toAppError', () => {
     expect(wrapped).toBeInstanceOf(InternalError);
     expect((wrapped.cause as Error).message).toBe('just a string');
   });
+
+  /**
+   * The bot bundles one chunk per command, so an error can cross a boundary
+   * between two copies of this module. `instanceof` says no to a foreign copy;
+   * the registered symbol says yes. Without this, every expected failure
+   * reached the user as "Something went wrong on our end."
+   */
+  it('recognises an AppError from a duplicate copy of this module', () => {
+    const foreign = Object.assign(new Error('Nothing is playing.'), {
+      [Symbol.for('@discord-music/shared/AppError')]: true,
+      expected: true,
+    });
+
+    expect(foreign).not.toBeInstanceOf(AppError);
+    expect(isAppError(foreign)).toBe(true);
+    expect(toAppError(foreign)).toBe(foreign);
+  });
 });

@@ -6,7 +6,7 @@
  * enforcement (guild-only, permissions, cooldowns, DJ role), unknown-command
  * handling and safe error replies.
  */
-import { AppError, LIMITS, toAppError } from '@discord-music/shared';
+import { isAppError, LIMITS, toAppError } from '@discord-music/shared';
 import { EmbedBuilder, Events, GuildMember, MessageFlags } from 'discord.js';
 
 import { defineEvent } from '../core/event.js';
@@ -358,7 +358,7 @@ export default defineEvent({
       // rather than retried into a second Unknown interaction.
       await replyWithError(
         interaction,
-        appError instanceof AppError && appError.expected
+        isAppError(appError) && appError.expected
           ? appError.message
           : 'Something went wrong while running that command. Please try again.',
         commandLogger,
