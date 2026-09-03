@@ -234,6 +234,28 @@ export class GuildPlayer {
   #trackStartedAt = 0;
   /** Whether a track is actually playing right now. See `isPlaying`. */
   #playing = false;
+
+  /**
+   * Whether anybody who is not a bot is in the voice channel.
+   *
+   * Music is for people in a room. 24/7 mode keeps the CONNECTION alive, not
+   * the playback: a bot left alone used to keep pulling autoplay picks and
+   * playing them to nobody — inaudible to everyone, and still spending
+   * Lavalink time, recommendation budget and (worst of all) writing plays into
+   * the guild's listening history that nobody actually heard.
+   *
+   * Defaults to true so a player whose occupancy has never been reported
+   * behaves exactly as it always did; the music layer sets it at creation and
+   * the voice-state event keeps it current.
+   */
+  #listenersPresent = true;
+
+  /**
+   * Set only when THIS class paused because the room emptied, so an arriving
+   * listener resumes what the bot paused without ever overriding a pause a
+   * person asked for.
+   */
+  #pausedForEmptyRoom = false;
   /**
    * Why the next track-end should advance with `skip()` instead of `advance()`.
    * The DISTINCTION matters for learning: `/skip` is a rejection of the song
@@ -401,6 +423,11 @@ export class GuildPlayer {
     return this.#playing;
   }
 
+  /** Whether a non-bot member is currently in the bot's voice channel. */
+  get hasListeners(): boolean {
+    return this.#listenersPresent;
+  }
+
   get stayConnected(): boolean {
     return this.#stayConnected;
   }
@@ -440,6 +467,8 @@ export class GuildPlayer {
    */
   async resumeAutoplay(): Promise<boolean> {
     if (this.isPlaying) return true;
+    // An empty room gets no radio. Whoever walks in starts it.
+    if (!this.#listenersPresent) return false;
     const outcome = await this.#tryAutoplay();
     if (outcome === 'continued') this.#clearIdleTimer();
     return outcome === 'continued';
@@ -589,12 +618,16 @@ export class GuildPlayer {
   }
 
   async pause(): Promise<void> {
+    // An explicit pause takes ownership of the paused state: the empty-room
+    // resume must not later "undo" a pause somebody asked for.
+    this.#pausedForEmptyRoom = false;
     await this.#player.setPaused(true);
     this.#persist();
     this.#emit('TRACK_PAUSE');
   }
 
   async resume(): Promise<void> {
+    this.#pausedForEmptyRoom = false;
     await this.#player.setPaused(false);
     this.#persist();
     this.#emit('TRACK_RESUME');
@@ -702,13 +735,78 @@ export class GuildPlayer {
     });
   }
 
-  /** Voice-state hook: the bot is alone (or not) in its channel. */
+  /**
+   * Voice-state hook: the bot is alone (or not) in its channel.
+   *
+   * Two separate consequences. The idle timer (unchanged) decides whether to
+   * LEAVE, and 24/7 mode switches it off. Playback is the new one and 24/7
+   * does not exempt it: an empty room hears nothing either way.
+   *
+   * Called on every voice-state change in the guild, so the transition is
+   * what matters — repeating "still empty" must not re-pause or re-announce.
+   */
   onOccupancyChange(listenersPresent: boolean): void {
     if (listenersPresent) {
       this.#clearIdleTimer();
     } else {
       this.#startIdleTimer();
     }
+
+    if (this.#listenersPresent === listenersPresent) return;
+    this.#listenersPresent = listenersPresent;
+
+    void this.#applyOccupancy(listenersPresent).catch((error: unknown) => {
+      this.#logger.warn({ err: error, listenersPresent }, 'Occupancy change handling failed');
+    });
+  }
+
+  /**
+   * Start or stop the music to match who is in the room.
+   *
+   * Emptied: pause what is playing and stop any autoplay work — the guards in
+   * `#maintainAutoplay` / `#tryAutoplay` cover generation, this covers the
+   * track already in the speakers.
+   *
+   * Filled: undo exactly what this class did, and nothing else. A pause a
+   * person asked for stays paused; a queue that was parked while the room was
+   * empty (a 24/7 restore, or a drain nobody was there for) starts now.
+   */
+  async #applyOccupancy(listenersPresent: boolean): Promise<void> {
+    if (this.#destroyed) return;
+
+    if (!listenersPresent) {
+      if (this.#autoplayRetryTimer !== undefined) {
+        clearTimeout(this.#autoplayRetryTimer);
+        this.#autoplayRetryTimer = undefined;
+      }
+      if (!this.isPlaying || this.paused) return;
+      await this.pause();
+      // Set AFTER pause(), which clears it: this is the one pause that is
+      // the bot's own and may be undone automatically.
+      this.#pausedForEmptyRoom = true;
+      this.#logger.info(
+        { event: 'EMPTY_ROOM_PAUSE', guildId: this.guildId },
+        'Channel is empty; playback paused until somebody joins',
+      );
+      await this.#notify('⏸️ Paused — nobody is in the channel. I pick up when someone joins.');
+      return;
+    }
+
+    if (this.#pausedForEmptyRoom) {
+      this.#pausedForEmptyRoom = false;
+      await this.resume();
+      return;
+    }
+    // Playing already, or paused by a person: not this method's business.
+    if (this.isPlaying || this.paused) return;
+
+    if (await this.#startParked()) {
+      this.#clearIdleTimer();
+      return;
+    }
+    if (!this.#autoplayEnabled) return;
+    const outcome = await this.#tryAutoplay();
+    if (outcome === 'continued') this.#clearIdleTimer();
   }
 
   /* ----------------------------------------------------------------- events */
@@ -1054,6 +1152,15 @@ export class GuildPlayer {
         return;
       }
 
+      // Nobody is in the channel. The queue has not "finished" — there is
+      // simply no one to play the next song to, and generating one would put
+      // a track nobody heard into this guild's listening history. Whoever
+      // walks in next starts it again.
+      if (!this.#listenersPresent) {
+        this.#startIdleTimer();
+        return;
+      }
+
       // The just-finished track should be visible to autoplay's history
       // reads — but not at any price: a slow write must not become silence.
       await Promise.race([historyWrite, delay(HISTORY_WAIT_MS)]);
@@ -1095,7 +1202,7 @@ export class GuildPlayer {
    */
   #maintainAutoplay(): void {
     if (!this.#autoplayEnabled || this.#autoplayInFlight !== null || this.#destroyed) return;
-    if (!this.isPlaying) return;
+    if (!this.isPlaying || !this.#listenersPresent) return;
     const need = this.#autoplayShortfall();
     if (need === 0) return;
 
@@ -1163,6 +1270,10 @@ export class GuildPlayer {
    */
   async #tryAutoplay(): Promise<'continued' | 'exhausted' | 'failed'> {
     if (!this.#autoplayEnabled) return 'exhausted';
+    // Generating a radio for nobody costs a full candidate sweep and writes
+    // plays into history that no one heard. The drain path checks occupancy
+    // before it gets here; this covers every other caller.
+    if (!this.#listenersPresent) return 'exhausted';
 
     // A refill already on its way is not an empty pool. Wait for it; if it
     // got the music going there is nothing left to do here.
@@ -1253,6 +1364,7 @@ export class GuildPlayer {
       this.#autoplayRetryTimer = undefined;
       // Only if nothing else got the music going in the meantime.
       if (this.#destroyed || this.isPlaying || !this.#autoplayEnabled) return;
+      if (!this.#listenersPresent) return;
       void this.#tryAutoplay().then(async (outcome) => {
         if (outcome === 'continued') {
           this.#clearIdleTimer();

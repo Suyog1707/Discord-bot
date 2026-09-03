@@ -638,6 +638,12 @@ export class MusicManager {
 
     this.#players.set(options.guildId, guildPlayer);
 
+    // Who is in the room, before anything can start playing. Without this a
+    // player begins life assuming an audience, and a 24/7 restore into an
+    // empty channel would start the music before the first voice-state event
+    // arrived to say nobody is there.
+    guildPlayer.onOccupancyChange(this.#listenerCountIn(options.voiceChannelId) > 0);
+
     // The room picks up where it left off. Deliberately before the first
     // event goes out, so the dashboard's opening snapshot already has the
     // restored list rather than an empty player it has to correct.
@@ -1804,6 +1810,16 @@ export class MusicManager {
         // listener's taste continues it.
         const next = player.queue.skip();
         this.#syncSessionQueue(guildId);
+        if (!player.hasListeners) {
+          // 24/7 means the bot waits in the channel, not that it performs to
+          // an empty one. The queue is restored and parked; the first person
+          // to walk in starts it (`GuildPlayer.onOccupancyChange`).
+          logger.info(
+            { guildId, tracks: persisted.tracks.length, listener },
+            '24/7: rejoined an empty channel; queue parked until somebody joins',
+          );
+          continue;
+        }
         if (next !== null) {
           await player.jumpTo(player.queue.currentIndex);
         } else if (player.autoplayEnabled) {

@@ -355,6 +355,24 @@ right now. `MusicManager` narrows the ledger's listeners to the channel's live
 occupancy before the planner reads them, failing open when the channel cannot
 be resolved.
 
+### Nothing plays to an empty room
+
+Music is for people who are in the channel. When the last non-bot member
+leaves, playback **pauses** and every autoplay path stops: the low-water
+refill, the drain-time top-up, the retry timer and `resumeAutoplay` all check
+occupancy first. When somebody joins, the bot undoes exactly what it did —
+resuming its own pause, or starting a queue that was parked while the room was
+empty — and never overrides a pause a person asked for.
+
+24/7 mode is unaffected by this and does not exempt anything from it: it keeps
+the bot *connected* to the channel, not performing to it. A 24/7 restore into
+an empty channel now rejoins and parks its queue instead of starting the music.
+
+This is not only about wasted audio. Autoplay generation is a full candidate
+sweep per song, and every track it plays is written into the guild's listening
+history — so a bot playing to nobody was teaching that guild's taste profile
+from songs no one heard, and paying Lavalink and Last.fm for the privilege.
+
 ### One queue per voice channel
 
 Discord keeps a single voice state per (guild, user), so the bot occupies at

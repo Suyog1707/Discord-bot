@@ -1176,3 +1176,86 @@ describe('GuildPlayer listener identity', () => {
     expect(h.gp.snapshot().current?.trackKey).toBe('weeknd::blinding lights');
   });
 });
+
+describe('GuildPlayer empty-room playback', () => {
+  it('pauses when the last listener leaves and resumes when somebody joins', async () => {
+    const h = harness();
+    await h.gp.enqueue([track('t1', 'One')]);
+    expect(h.gp.isPlaying).toBe(true);
+
+    h.gp.onOccupancyChange(false);
+    await settle();
+    expect(h.player.paused).toBe(true);
+
+    h.gp.onOccupancyChange(true);
+    await settle();
+    expect(h.player.paused).toBe(false);
+  });
+
+  it('repeating "still empty" neither re-pauses nor re-announces', async () => {
+    const h = harness();
+    await h.gp.enqueue([track('t1', 'One')]);
+
+    h.gp.onOccupancyChange(false);
+    await settle();
+    h.player.setPaused.mockClear();
+    h.gp.onOccupancyChange(false);
+    h.gp.onOccupancyChange(false);
+    await settle();
+
+    expect(h.player.setPaused).not.toHaveBeenCalled();
+  });
+
+  it('leaves a pause a person asked for alone when the room fills again', async () => {
+    const h = harness();
+    await h.gp.enqueue([track('t1', 'One')]);
+    await h.gp.pause();
+
+    h.gp.onOccupancyChange(false);
+    await settle();
+    h.gp.onOccupancyChange(true);
+    await settle();
+
+    expect(h.player.paused).toBe(true);
+  });
+
+  it('never asks for autoplay when the queue drains with nobody in the channel', async () => {
+    const h = harness({ autoplayEnabled: true, autoplay: () => Promise.resolve(picks(2)) });
+    await h.gp.enqueue([track('t1', 'One')]);
+    h.gp.onOccupancyChange(false);
+    await settle();
+    h.autoplay.mockClear();
+
+    endNaturally(h.player);
+    await settle();
+
+    expect(h.autoplay).not.toHaveBeenCalled();
+  });
+
+  it('starts a queue that was parked while the room was empty', async () => {
+    const h = harness();
+    // The shape a 24/7 restore leaves behind: tracks loaded, nothing playing.
+    h.gp.onOccupancyChange(false);
+    await settle();
+    h.gp.queue.restore([track('saved', 'Saved')], 0, 'off');
+    expect(h.gp.isPlaying).toBe(false);
+
+    h.gp.onOccupancyChange(true);
+    await settle();
+
+    expect(played(h.player)).toEqual(['encoded-saved']);
+  });
+
+  it('starts the radio for an arriving listener when the parked queue is empty', async () => {
+    const h = harness({ autoplayEnabled: true, autoplay: () => Promise.resolve(picks(2)) });
+    h.gp.onOccupancyChange(false);
+    await settle();
+    expect(await h.gp.resumeAutoplay()).toBe(false);
+
+    h.gp.onOccupancyChange(true);
+    await settle();
+
+    expect(h.autoplay).toHaveBeenCalled();
+    expect(played(h.player).length).toBeGreaterThan(0);
+  });
+});
