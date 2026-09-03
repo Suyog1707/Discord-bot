@@ -1,5 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "regions": ["sin1"],
-  "framework": "nextjs"
+  "framework": "nextjs",
+  "buildCommand": "cd ../.. && pnpm turbo run build --filter=@discord-music/web..."
 }

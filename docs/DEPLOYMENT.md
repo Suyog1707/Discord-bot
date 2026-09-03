@@ -14,7 +14,16 @@ Targets: Web → Vercel · Bot + Lavalink → VPS · PostgreSQL → managed · R
    since the direct host is IPv6-only unless the IPv4 add-on is enabled.
    `DATABASE_URL` stays on the transaction pooler (`:6543?pgbouncer=true`) and
    serves every runtime query.
-3. **Web (Vercel)** — root directory `apps/web`; build runs `next build`.
+3. **Web (Vercel)** — root directory `apps/web`. The build command lives in
+   `apps/web/vercel.json` and must stay a workspace build, not a bare
+   `next build`: the app imports `@discord-music/shared` and
+   `@discord-music/database` through their `exports`, which point at `dist/`,
+   and Vercel never builds a workspace dependency on its own. A plain
+   `next build` therefore fails at webpack resolution — "Module not found" for
+   both packages. Routing it through Turborepo builds them first
+   (`--filter=@discord-music/web...`, where the trailing `...` means "and its
+   dependencies"), which is also what runs `prisma generate`, so the client
+   cannot go stale behind Vercel's dependency cache.
    Set every `NEXT*`, `DISCORD_*`, `DATABASE_URL`, `REDIS_URL` variable.
    `DIRECT_URL` is only needed where migrations run; the build itself only
    generates the client and falls back to `DATABASE_URL` without it.
