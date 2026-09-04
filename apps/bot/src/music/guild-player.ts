@@ -15,6 +15,7 @@ import {
 import { EmbedBuilder, type Client } from 'discord.js';
 import type { FilterOptions, Player } from 'shoukaku';
 
+import { delay } from '../lib/delay.js';
 import { getLogger, type Logger } from '../lib/logger.js';
 import type { FilterPresetName } from './filters.js';
 import type { QueueStore } from './queue-store.js';
@@ -102,13 +103,6 @@ export function isTruncatedPlayback(input: {
     input.reachedMs < input.expectedMs * TRUNCATION_RATIO &&
     input.expectedMs - input.reachedMs > TRUNCATION_ABSOLUTE_MS
   );
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    timer.unref();
-  });
 }
 
 function truncate(value: string | undefined, limit: number): string | undefined {

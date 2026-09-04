@@ -25,9 +25,11 @@ import {
   Shoukaku,
   type LavalinkResponse,
   type Node,
+  type Player as LavalinkPlayer,
   type Track as LavalinkTrack,
 } from 'shoukaku';
 
+import { delay } from '../lib/delay.js';
 import { selectAutoplaySeeds, type AnchorHistoryEntry } from '../ai/anchors.js';
 import type { AutoplayPlanner } from '../ai/autoplay-planner.js';
 import type { AutoplayEngine } from '../ai/autoplay.js';
@@ -42,6 +44,7 @@ import { getLogger } from '../lib/logger.js';
 import type { GuildService } from '../services/guild-service.js';
 import type { SpotifyService } from '../services/spotify-service.js';
 import { decideHandover } from './channel-handover.js';
+import { decideVoiceCleanup } from './voice-cleanup.js';
 import { ControllerMessage } from './controller.js';
 import { GuildPlayer } from './guild-player.js';
 import {
@@ -80,6 +83,16 @@ const logger = getLogger('music');
 
 /** How often to re-probe an audio server that Shoukaku gave up on. */
 const RECONNECT_PROBE_INTERVAL_MS = 30_000;
+/**
+ * Attempts at the Discord voice handshake before a join is reported as failed.
+ *
+ * Two, not more: the first failure is what clears a stale voice state, so the
+ * second attempt is the one that runs under the conditions we actually want.
+ * Anything beyond that is waiting on Discord and costs another full timeout.
+ */
+const VOICE_JOIN_ATTEMPTS = 2;
+/** Time for Discord to register a forced disconnect before rejoining. */
+const VOICE_RESET_SETTLE_MS = 500;
 /** A reachability probe should answer immediately or not at all. */
 const PROBE_TIMEOUT_MS = 2_000;
 /**
@@ -427,6 +440,102 @@ export class MusicManager {
     this.#ensureGiveUpWatched();
   }
 
+  /**
+   * Drop any voice state left over from a previous attempt or a previous run.
+   *
+   * Callers reach this only when the guild has no `GuildPlayer`, so anything
+   * still holding voice is a leftover, in one of two shapes:
+   *
+   *   - Shoukaku kept a connection whose player never made it into
+   *     `#players`. Its own teardown is the one that also tells Discord.
+   *   - Discord has the bot in a channel with nothing behind it — a previous
+   *     process that died without a graceful shutdown, or a handshake that
+   *     timed out (`joinVoiceChannel` drops its connection on failure but
+   *     never sends the matching disconnect).
+   *
+   * @returns Whether anything was cleared, so the caller can let it settle.
+   */
+  async #clearLeftoverVoiceState(guildId: string, shardId: number): Promise<boolean> {
+    const channelId = this.#client.guilds.cache.get(guildId)?.members.me?.voice.channelId ?? null;
+    const cleanup = decideVoiceCleanup({
+      shoukakuHoldsGuild:
+        this.shoukaku.connections.has(guildId) || this.shoukaku.players.has(guildId),
+      discordVoiceChannelId: channelId,
+    });
+
+    switch (cleanup) {
+      case 'connection':
+        logger.info({ guildId }, 'Releasing a Shoukaku connection with no player behind it');
+        await this.shoukaku.leaveVoiceChannel(guildId);
+        return true;
+      case 'voice-state':
+        logger.info(
+          { guildId, channelId },
+          'Clearing a voice state with no connection behind it before joining',
+        );
+        this.#resetVoiceState(guildId, shardId);
+        return true;
+      case 'none':
+        return false;
+    }
+  }
+
+  /** Force this bot out of whatever voice channel Discord thinks it occupies. */
+  #resetVoiceState(guildId: string, shardId: number): void {
+    this.shoukaku.connector.sendPacket(
+      shardId,
+      {
+        op: 4,
+        d: { guild_id: guildId, channel_id: null, self_deaf: false, self_mute: false },
+      },
+      false,
+    );
+  }
+
+  /**
+   * Join a voice channel, surviving a stale voice state.
+   *
+   * Joining a channel Discord already believes the bot occupies is a no-op to
+   * Discord: it sends no `VOICE_SERVER_UPDATE`, so Shoukaku waits out its full
+   * timeout and throws "The voice connection is not established in 15
+   * seconds". That is what left a 24/7 guild silent after a restart — the
+   * restore ran once, hit the leftover state from the previous process, and
+   * gave up. Clearing the state first makes the join a real transition, and
+   * the retry covers a handshake that fails for Discord's own reasons.
+   */
+  async #joinVoiceChannel(
+    guildId: string,
+    voiceChannelId: string,
+    shardId: number,
+  ): Promise<LavalinkPlayer> {
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= VOICE_JOIN_ATTEMPTS; attempt += 1) {
+      if (await this.#clearLeftoverVoiceState(guildId, shardId)) {
+        await delay(VOICE_RESET_SETTLE_MS);
+      }
+
+      try {
+        return await this.shoukaku.joinVoiceChannel({
+          guildId,
+          channelId: voiceChannelId,
+          shardId,
+          deaf: true,
+        });
+      } catch (error) {
+        lastError = error;
+        logger.warn(
+          { err: error, guildId, channelId: voiceChannelId, attempt },
+          attempt < VOICE_JOIN_ATTEMPTS
+            ? 'Voice join failed; clearing the voice state and retrying'
+            : 'Voice join failed',
+        );
+      }
+    }
+
+    throw lastError;
+  }
+
   /** Cheap liveness check against the Lavalink REST API. */
   async #isNodeReachable(): Promise<boolean> {
     const scheme = this.#node.secure ? 'https' : 'http';
@@ -532,12 +641,11 @@ export class MusicManager {
         ? null
         : await this.#savedQueueFor(options.guildId, options.voiceChannelId);
 
-    const player = await this.shoukaku.joinVoiceChannel({
-      guildId: options.guildId,
-      channelId: options.voiceChannelId,
-      shardId: options.shardId,
-      deaf: true,
-    });
+    const player = await this.#joinVoiceChannel(
+      options.guildId,
+      options.voiceChannelId,
+      options.shardId,
+    );
 
     const guildPlayer = new GuildPlayer({
       guildId: options.guildId,
@@ -1767,13 +1875,28 @@ export class MusicManager {
 
     for (const { guildId, voiceChannelId } of sessions) {
       try {
+        // Every skip below is silent by design — none of them is a fault — but
+        // silence is also how "24/7 did not come back" becomes unanswerable
+        // without a database query, so each says which gate it fell at.
         const persisted = await this.#store.loadPersisted(guildId, voiceChannelId);
-        if (persisted === null) continue;
+        if (persisted === null) {
+          logger.debug({ guildId, voiceChannelId }, '24/7 skipped: no queue left to restore');
+          continue;
+        }
 
         const guild = this.#client.guilds.cache.get(guildId);
-        if (guild === undefined) continue;
+        if (guild === undefined) {
+          logger.debug({ guildId }, '24/7 skipped: guild not in cache');
+          continue;
+        }
         const channel = guild.channels.cache.get(persisted.voiceChannelId);
-        if (channel?.isVoiceBased() !== true) continue;
+        if (channel?.isVoiceBased() !== true) {
+          logger.debug(
+            { guildId, channelId: persisted.voiceChannelId },
+            '24/7 skipped: the saved channel is gone or is not a voice channel',
+          );
+          continue;
+        }
 
         // Who this radio is for comes back with the queue: the persisted
         // owner, or failing that the most recent person who requested one of
