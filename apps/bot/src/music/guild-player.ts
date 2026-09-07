@@ -205,6 +205,12 @@ export interface GuildPlayerOptions {
   ) => Promise<QueuedTrack | null>;
   /** Cross-platform "listen on" links for the track that just started. */
   readonly onResolveLinks?: (track: QueuedTrack) => Promise<PlatformLinks>;
+  /**
+   * Called when Discord closes the voice websocket, with the code it sent.
+   * The player does not judge the code — reconnecting means rebuilding this
+   * object, which only the manager can do. Must return immediately.
+   */
+  readonly onVoiceClosed?: (guildId: string, code: number, reason: string) => void;
   /** Fire-and-forget realtime event sink (Redis → dashboard SSE). */
   readonly onEvent?: (type: PlayerEventType, state: PlayerSnapshot | null) => void;
 }
@@ -348,6 +354,7 @@ export class GuildPlayer {
    * to the radio and the music never actually stopped.
    */
   #stopRequested = false;
+  readonly #onVoiceClosed: ((guildId: string, code: number, reason: string) => void) | undefined;
   readonly #onEvent: ((type: PlayerEventType, state: PlayerSnapshot | null) => void) | undefined;
 
   constructor(options: GuildPlayerOptions) {
@@ -375,6 +382,7 @@ export class GuildPlayer {
     this.#onSelfDestruct = options.onSelfDestruct;
     this.#onAutoplayRequest = options.onAutoplayRequest;
     this.#onTrackStarted = options.onTrackStarted;
+    this.#onVoiceClosed = options.onVoiceClosed;
     this.#onTrackFinished = options.onTrackFinished;
     this.#onFindAlternative = options.onFindAlternative;
     this.#onResolveLinks = options.onResolveLinks;
@@ -394,6 +402,11 @@ export class GuildPlayer {
     const moved = this.#voiceChannelId !== channelId;
     this.#voiceChannelId = channelId;
     if (moved) this.#emit('VOICE_MOVE');
+  }
+
+  /** Where this player announces. Needed to rebuild it on a voice reconnect. */
+  get textChannelId(): string {
+    return this.#textChannelId;
   }
 
   get volume(): number {
@@ -917,7 +930,11 @@ export class GuildPlayer {
     });
 
     this.#player.on('closed', (event) => {
-      this.#logger.warn({ code: event.code, reason: event.reason }, 'Voice websocket closed');
+      this.#logger.warn(
+        { code: event.code, reason: event.reason, byRemote: event.byRemote },
+        'Voice websocket closed',
+      );
+      this.#onVoiceClosed?.(this.guildId, event.code, event.reason);
     });
   }
 

@@ -45,6 +45,12 @@ import type { GuildService } from '../services/guild-service.js';
 import type { SpotifyService } from '../services/spotify-service.js';
 import { decideHandover } from './channel-handover.js';
 import { decideVoiceCleanup } from './voice-cleanup.js';
+import {
+  claimReconnect,
+  decideVoiceClose,
+  type ReconnectBudget,
+  type ReconnectClaim,
+} from './voice-close.js';
 import { ControllerMessage } from './controller.js';
 import { GuildPlayer } from './guild-player.js';
 import {
@@ -93,6 +99,19 @@ const RECONNECT_PROBE_INTERVAL_MS = 30_000;
 const VOICE_JOIN_ATTEMPTS = 2;
 /** Time for Discord to register a forced disconnect before rejoining. */
 const VOICE_RESET_SETTLE_MS = 500;
+/** Pause between tearing a dead voice session down and rebuilding it. */
+const VOICE_RECONNECT_DELAY_MS = 1_000;
+/** Reconnects allowed per guild inside {@link VOICE_RECONNECT_WINDOW_MS}. */
+const VOICE_RECONNECT_MAX_ATTEMPTS = 3;
+/**
+ * Window the attempt budget is counted over.
+ *
+ * A voice server that closes the socket the moment it opens would otherwise
+ * have the bot rejoining forever. Past the budget the player is torn down: a
+ * guild with no player is recoverable with `/play`, where one wedged in a
+ * reconnect loop is not.
+ */
+const VOICE_RECONNECT_WINDOW_MS = 60_000;
 /** A reachability probe should answer immediately or not at all. */
 const PROBE_TIMEOUT_MS = 2_000;
 /**
@@ -289,6 +308,9 @@ export class MusicManager {
    * Consumed by whichever command caused the join; dropped if nobody asks.
    */
   readonly #resumeNotices = new Map<string, ResumeNotice>();
+
+  /** Guilds currently rebuilding a voice connection, and their recent attempts. */
+  readonly #voiceReconnects = new Map<string, ReconnectBudget>();
 
   constructor(options: {
     readonly client: Client;
@@ -665,6 +687,10 @@ export class MusicManager {
       onSelfDestruct: async (guildId, reason) => {
         logger.info({ guildId, reason }, 'Player self-destructing');
         await this.destroyPlayer(guildId);
+      },
+      onVoiceClosed: (guildId, code, reason) => {
+        if (decideVoiceClose(code) === 'ignore') return;
+        void this.#reconnectVoice(guildId, code, reason);
       },
       onAutoplayRequest: (guildId, count) => this.pickAutoplayTracks(guildId, count),
       // The session ledger follows the queue's owner: whose library and
@@ -1972,6 +1998,112 @@ export class MusicManager {
     // with it rather than leave the dashboard greeting new tabs with a ghost.
     this.#retainEvent?.(guildId, state === null ? null : payload);
     this.#controllers.get(guildId)?.onEvent(type, state);
+  }
+
+  /**
+   * Whether this guild may rebuild its voice connection right now.
+   *
+   * One reconnect at a time, and a bounded number inside a rolling window —
+   * a voice server that closes the socket as fast as it opens would otherwise
+   * keep the bot rejoining forever.
+   */
+  #claimVoiceReconnect(guildId: string): ReconnectClaim['decision'] {
+    const claim = claimReconnect(this.#voiceReconnects.get(guildId), Date.now(), {
+      maxAttempts: VOICE_RECONNECT_MAX_ATTEMPTS,
+      windowMs: VOICE_RECONNECT_WINDOW_MS,
+    });
+    if (claim.decision === 'claimed') this.#voiceReconnects.set(guildId, claim.next);
+    return claim.decision;
+  }
+
+  /**
+   * Rebuild a voice connection Discord closed under us.
+   *
+   * Codes like 4006 end the voice session but leave the bot's voice state
+   * standing: audio stops, nothing reconnects, and `getPlayer` goes on
+   * handing out a player whose connection is dead — so `/play` finds an
+   * existing player and returns it rather than rejoining. Nothing short of a
+   * restart recovered from that.
+   *
+   * The queue is rebuilt from memory rather than from the store: it is
+   * authoritative while playing, and the persisted copy is a debounced
+   * snapshot that can lag. Playback resumes where it stopped, so a reconnect
+   * costs a gap rather than the song.
+   */
+  async #reconnectVoice(guildId: string, code: number, reason: string): Promise<void> {
+    const player = this.#players.get(guildId);
+    if (player === undefined) return;
+
+    const claim = this.#claimVoiceReconnect(guildId);
+    if (claim === 'busy') {
+      logger.debug({ guildId, code }, 'Voice close during a rebuild; already handled');
+      return;
+    }
+    if (claim === 'exhausted') {
+      logger.error(
+        { guildId, code, attempts: VOICE_RECONNECT_MAX_ATTEMPTS },
+        'Voice reconnect budget spent; tearing the player down instead of looping',
+      );
+      await this.destroyPlayer(guildId).catch((error: unknown) => {
+        logger.warn({ err: error, guildId }, 'Teardown after a failed reconnect failed');
+      });
+      return;
+    }
+
+    const snapshot = {
+      tracks: [...player.queue.tracks],
+      currentIndex: player.queue.currentIndex,
+      loopMode: player.queue.loopMode,
+      volume: player.volume,
+      positionMs: player.positionMs,
+      voiceChannelId: player.voiceChannelId,
+      textChannelId: player.textChannelId,
+      listenerId: player.listenerId,
+      // A player that was paused stays paused; only audio that was actually
+      // running is worth restarting.
+      wasPlaying: player.isPlaying && !player.paused,
+    };
+
+    logger.warn(
+      { guildId, code, reason, tracks: snapshot.tracks.length, positionMs: snapshot.positionMs },
+      'Voice session died; rebuilding the connection',
+    );
+
+    try {
+      // Teardown first: it is what clears the connection and the voice state
+      // that would otherwise make the rejoin a no-op to Discord.
+      await this.destroyPlayer(guildId);
+      await delay(VOICE_RECONNECT_DELAY_MS);
+
+      const fresh = await this.getOrCreatePlayer({
+        guildId,
+        voiceChannelId: snapshot.voiceChannelId,
+        textChannelId: snapshot.textChannelId,
+        shardId: this.#client.guilds.cache.get(guildId)?.shardId ?? 0,
+        listenerId: snapshot.listenerId,
+        // The queue comes from the snapshot above, which is fresher than
+        // anything the store has.
+        resumeSavedQueue: false,
+      });
+
+      fresh.queue.restore(snapshot.tracks, snapshot.currentIndex, snapshot.loopMode);
+      await fresh.setVolume(snapshot.volume);
+
+      if (snapshot.wasPlaying && fresh.queue.current !== null) {
+        await fresh.jumpTo(snapshot.currentIndex);
+        if (snapshot.positionMs > 0) await fresh.seekTo(snapshot.positionMs);
+      }
+
+      logger.info(
+        { guildId, code, tracks: snapshot.tracks.length, resumed: snapshot.wasPlaying },
+        'Voice session rebuilt',
+      );
+    } catch (error) {
+      logger.error({ err: error, guildId, code }, 'Voice reconnect failed');
+    } finally {
+      const entry = this.#voiceReconnects.get(guildId);
+      if (entry !== undefined) this.#voiceReconnects.set(guildId, { ...entry, inFlight: false });
+    }
   }
 
   /** Tear down a guild's player and leave its voice channel. */
