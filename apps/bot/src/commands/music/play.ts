@@ -78,7 +78,6 @@ export default defineCommand({
   category: 'music',
   guildOnly: true,
   cooldownSeconds: 2,
-  djOnly: true,
   botPermissions: [PermissionFlagsBits.Connect, PermissionFlagsBits.Speak],
   // Acknowledged by the dispatcher before guards run: the cooldown (Redis) and
   // DJ (Postgres) checks are remote, and deferring after them is what let the

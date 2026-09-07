@@ -54,8 +54,18 @@ export interface CommandDefinition {
   readonly userPermissions?: readonly PermissionResolvable[];
   /** Discord permissions the bot must hold in the channel. */
   readonly botPermissions?: readonly PermissionResolvable[];
-  /** Restrict to the configured DJ role. Enforced in Phase 4. */
+  /** Restrict to the session's DJs (see `music/session-dj.ts`). */
   readonly djOnly?: boolean;
+  /**
+   * `djOnly`, except over a track the caller queued themselves.
+   *
+   * `runGuards` cannot enforce this: it has the interaction but not the track
+   * the command is about, and "is this mine?" is only answerable once that has
+   * been resolved. So the guard stands aside and the command calls
+   * `checkDjAuthority` itself, after it knows which track is meant. Anything
+   * carrying this flag MUST perform that check.
+   */
+  readonly ownTrackExempt?: boolean;
   /** Hide from `/help` and from production command deployment. */
   readonly devOnly?: boolean;
   /**

@@ -13,6 +13,7 @@ import {
   type PermissionResolvable,
 } from 'discord.js';
 
+import { decideDjAuthority } from '../music/session-dj.js';
 import { getLogger } from '../lib/logger.js';
 import type { CommandDefinition } from './command.js';
 import type { BotClient } from './bot-client.js';
@@ -100,8 +101,10 @@ export async function runGuards(
     }
   }
 
-  if (command.djOnly === true && interaction.inGuild()) {
-    const verdict = await checkDjRole(client, interaction);
+  // `ownTrackExempt` commands run their own check once they know which track
+  // is meant — see the field's docs on `CommandDefinition`.
+  if (command.djOnly === true && command.ownTrackExempt !== true && interaction.inGuild()) {
+    const verdict = await checkDjAuthority(client, interaction);
     if (!verdict.allowed) return verdict;
   }
 
@@ -109,39 +112,67 @@ export async function runGuards(
 }
 
 /**
- * DJ gate: when a DJ role is configured, restrict the command to members who
- * hold it (or can Manage Server, so admins are never locked out). With no DJ
- * role configured, everyone passes.
+ * DJ gate.
+ *
+ * Control of a session belongs to whoever summoned the bot, to the people
+ * they hand it to, and to anyone holding the standing DJ configuration — but
+ * all three only inside the voice channel the bot is actually playing in. A DJ
+ * role is not a guild-wide grant: holding it while sitting in another channel
+ * says nothing about this room's music. Manage Server is the one exception,
+ * left unscoped so an admin can always stop a bot that is misbehaving.
  *
  * The settings read is bounded (see {@link DJ_SETTINGS_BUDGET_MS}). If Postgres
  * cannot answer within the budget for a guild we have never read, the command
- * is allowed through: the DJ role is a convenience restriction, and blocking
+ * is allowed through: the DJ gate is a convenience restriction, and blocking
  * every music command whenever the database is slow is the worse failure.
  */
-async function checkDjRole(
+export async function checkDjAuthority(
   client: BotClient,
   interaction: ChatInputCommandInteraction,
 ): Promise<GuardResult> {
-  if (interaction.guildId === null) return ALLOWED;
+  const guildId = interaction.guildId;
+  if (guildId === null) return ALLOWED;
 
-  const settings = await client.services.guilds.getSettingsWithin(
-    interaction.guildId,
-    DJ_SETTINGS_BUDGET_MS,
-  );
+  const settings = await client.services.guilds.getSettingsWithin(guildId, DJ_SETTINGS_BUDGET_MS);
   if (settings === null) {
     logger.warn(
-      { guildId: interaction.guildId, budgetMs: DJ_SETTINGS_BUDGET_MS },
-      'DJ role check timed out reading settings; allowing the command through',
+      { guildId, budgetMs: DJ_SETTINGS_BUDGET_MS },
+      'DJ check timed out reading settings; allowing the command through',
     );
     return ALLOWED;
   }
-  if (settings.djRoleId === null) return ALLOWED;
 
   const member = interaction.member as GuildMember | null;
-  if (member === null) return denied('Could not verify your roles. Try again.');
+  if (member === null) return denied('Could not verify your permissions. Try again.');
 
-  if (member.permissions.has(PermissionsBitField.Flags.ManageGuild)) return ALLOWED;
-  if (member.roles.cache.has(settings.djRoleId)) return ALLOWED;
+  const player = client.music?.getPlayer(guildId);
+  const botVoiceChannelId = player?.voiceChannelId ?? null;
+  const registry = client.music?.sessionDj;
 
-  return denied(`This command is restricted to the <@&${settings.djRoleId}> role.`);
+  const verdict = decideDjAuthority({
+    memberId: member.id,
+    memberVoiceChannelId: member.voice.channelId,
+    botVoiceChannelId,
+    hasManageGuild: member.permissions.has(PermissionsBitField.Flags.ManageGuild),
+    hostId: registry?.host(guildId) ?? null,
+    sessionDjIds: registry?.djIds(guildId) ?? [],
+    memberRoleIds: [...member.roles.cache.keys()],
+    djRoleId: settings.djRoleId,
+    djUserIds: settings.djUserIds,
+  });
+
+  if (verdict === 'allowed') return ALLOWED;
+  if (verdict === 'not-in-channel') {
+    return denied('Join the voice channel the bot is playing in to control playback.');
+  }
+
+  const host = registry?.host(guildId) ?? null;
+  if (host !== null) {
+    return denied(
+      `Only <@${host}> and the DJs they picked can do that. Ask them for DJ with \`/dj add\`, or queue a song with \`/play\`.`,
+    );
+  }
+  return settings.djRoleId === null
+    ? denied("That command is restricted to this server's DJs.")
+    : denied(`That command is restricted to the <@&${settings.djRoleId}> role.`);
 }

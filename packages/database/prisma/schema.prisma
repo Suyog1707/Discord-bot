@@ -170,6 +170,10 @@ model GuildSettings {
   /// Leave the voice channel after this many seconds of inactivity.
   leaveOnEmptyAfter  Int      @default(300)
   djRoleId           String?
+  /// Discord user snowflakes granted DJ from the dashboard. Standing config,
+  /// but like djRoleId it only counts inside the voice channel the bot is
+  /// playing in — never a guild-wide grant.
+  djUserIds          String[] @default([])
   musicChannelId     String?
   announceNowPlaying Boolean  @default(true)
   /// 24/7 mode: stay in the voice channel through inactivity and restarts.
@@ -381,20 +385,24 @@ model PlaylistTrack {
 /// A linked Spotify account. Tokens are AES-256-GCM encrypted by the web app
 /// before storage — the database never sees plaintext credentials.
 model SpotifyAccount {
-  id           String   @id @default(cuid())
-  userId       String   @unique
-  spotifyId    String
-  displayName  String?
-  country      String?
+  id            String   @id @default(cuid())
+  userId        String   @unique
+  spotifyId     String
+  displayName   String?
+  country       String?
   /// Encrypted (AES-256-GCM, `iv:ciphertext:tag` base64) — never plaintext.
-  accessToken  String   @db.Text
+  accessToken   String   @db.Text
   /// Encrypted like `accessToken`.
-  refreshToken String   @db.Text
-  expiresAt    DateTime @db.Timestamptz(3)
+  refreshToken  String   @db.Text
+  expiresAt     DateTime @db.Timestamptz(3)
   /// Space-separated OAuth scopes granted at link time.
-  scopes       String
-  createdAt    DateTime @default(now()) @db.Timestamptz(3)
-  updatedAt    DateTime @updatedAt @db.Timestamptz(3)
+  scopes        String
+  /// Whether this library may steer autoplay in a shared voice channel.
+  /// Linking Spotify is for playback first; this is the separate consent to
+  /// let it shape what a room hears.
+  autoplayOptIn Boolean  @default(true)
+  createdAt     DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime @updatedAt @db.Timestamptz(3)
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 

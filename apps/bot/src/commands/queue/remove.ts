@@ -4,6 +4,7 @@ import { ValidationError } from '@discord-music/shared';
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import {
+  denyUnlessDjOrOwnTrack,
   requireActivePlayer,
   requireMusic,
   requireVoiceContext,
@@ -24,6 +25,8 @@ export default defineCommand({
   guildOnly: true,
   cooldownSeconds: 2,
   djOnly: true,
+  // Taking back a track you queued yourself needs no DJ.
+  ownTrackExempt: true,
 
   async execute({ interaction }) {
     const client = interaction.client as BotClient;
@@ -31,6 +34,16 @@ export default defineCommand({
     const player = requireActivePlayer(music, requireVoiceContext(interaction));
 
     const position = interaction.options.getInteger('position', true);
+
+    // Check before removing: authority depends on whose track it is, so the
+    // target has to be read while it is still in the queue.
+    const target = player.queue.upcoming[position - 1] ?? null;
+    const denial = await denyUnlessDjOrOwnTrack(interaction, target);
+    if (denial !== null) {
+      await interaction.editReply({ content: denial });
+      return;
+    }
+
     const removed = player.removeUpcoming(position - 1);
 
     if (removed === null) {

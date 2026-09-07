@@ -76,6 +76,7 @@ export interface ServerDetail {
     GuildSettings,
     | 'defaultVolume'
     | 'djRoleId'
+    | 'djUserIds'
     | 'announceNowPlaying'
     | 'leaveOnEmptyAfter'
     | 'musicChannelId'
@@ -124,6 +125,7 @@ export async function getServerDetail(
     settings: {
       defaultVolume: settings.defaultVolume,
       djRoleId: settings.djRoleId,
+      djUserIds: settings.djUserIds,
       announceNowPlaying: settings.announceNowPlaying,
       leaveOnEmptyAfter: settings.leaveOnEmptyAfter,
       musicChannelId: settings.musicChannelId,
@@ -160,6 +162,15 @@ export const updateGuildSettingsSchema = z
       .string()
       .regex(/^\d{17,20}$/u, 'Must be a Discord role ID.')
       .nullable()
+      .optional(),
+    /**
+     * Individuals granted DJ without needing a role. Standing configuration,
+     * but the bot only honours it inside the voice channel it is playing in —
+     * it is not a guild-wide grant.
+     */
+    djUserIds: z
+      .array(z.string().regex(/^\d{17,20}$/u, 'Must be a Discord user ID.'))
+      .max(50, 'At most 50 named DJs.')
       .optional(),
     announceNowPlaying: z.boolean().optional(),
     leaveOnEmptyAfter: z.number().int().min(60).max(3600).optional(),
@@ -205,6 +216,7 @@ export async function updateGuildSettings(
   return {
     defaultVolume: settings.defaultVolume,
     djRoleId: settings.djRoleId,
+    djUserIds: settings.djUserIds,
     announceNowPlaying: settings.announceNowPlaying,
     leaveOnEmptyAfter: settings.leaveOnEmptyAfter,
     musicChannelId: settings.musicChannelId,

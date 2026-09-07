@@ -44,6 +44,7 @@ import { getLogger } from '../lib/logger.js';
 import type { CacheService } from './cache.js';
 import type { FamiliarCandidate, FamiliarSource } from './familiar-scoring.js';
 import { identityOf } from './identity.js';
+import type { SpotifyTasteService, SpotifyTasteTrack } from './spotify-taste.js';
 
 const logger = getLogger('familiar-pool');
 
@@ -107,6 +108,10 @@ const FROM_DB_SOURCE: Record<DbMusicSource, MusicSource> = {
 const METADATA_RANK: Readonly<Record<FamiliarSource, number>> = {
   requested: 8,
   library: 6,
+  // Above a local playlist row: Spotify's strings are the catalogue's own, so
+  // when the same song arrives from both, Spotify's spelling of the title and
+  // artist is the one worth keeping.
+  spotify: 5,
   playlist: 4,
   history: 2,
 };
@@ -163,10 +168,12 @@ interface RowMetadata {
 export class FamiliarPoolService {
   readonly #prisma: PrismaClient;
   readonly #cache: CacheService;
+  readonly #spotifyTaste: SpotifyTasteService | undefined;
 
-  constructor(prisma: PrismaClient, cache: CacheService) {
+  constructor(prisma: PrismaClient, cache: CacheService, spotifyTaste?: SpotifyTasteService) {
     this.#prisma = prisma;
     this.#cache = cache;
+    this.#spotifyTaste = spotifyTaste;
   }
 
   /**
@@ -193,16 +200,18 @@ export class FamiliarPoolService {
     }
 
     try {
-      const [favorites, playlists, history] = await Promise.all([
+      const [favorites, playlists, history, spotify] = await Promise.all([
         this.#loadFavorites(listenerIds),
         this.#loadPlaylists(guildId, listenerIds),
         this.#loadHistory(guildId),
+        this.#loadSpotify(listenerIds),
       ]);
 
       const drafts = new Map<string, Draft>();
       this.#foldFavorites(drafts, favorites);
       this.#foldPlaylists(drafts, playlists);
       this.#foldHistory(drafts, history);
+      this.#foldSpotify(drafts, spotify);
 
       const candidates = finalise(drafts);
       await this.#cache.set(
@@ -214,6 +223,27 @@ export class FamiliarPoolService {
     } catch (error) {
       logger.warn({ err: error, guildId, listeners: listenerIds.length }, 'Familiar pool failed');
       return [];
+    }
+  }
+
+  /**
+   * What the room's linked Spotify accounts hold.
+   *
+   * Cache-only and never throws — see `SpotifyTasteService`. Absent service,
+   * disabled feature, cold cache and API failure are all the same thing here:
+   * no rows, and a pool built from the other three sources exactly as before.
+   */
+  async #loadSpotify(listenerIds: readonly string[]): Promise<readonly SpotifyTasteTrack[]> {
+    if (this.#spotifyTaste === undefined) return [];
+    return this.#spotifyTaste.tracksFor(listenerIds).catch(() => []);
+  }
+
+  #foldSpotify(drafts: Map<string, Draft>, rows: readonly SpotifyTasteTrack[]): void {
+    for (const row of rows) {
+      const draft = upsertDraft(drafts, row, 'spotify');
+      if (draft === null) continue;
+      draft.sources.add('spotify');
+      draft.listeners.add(row.ownerId);
     }
   }
 

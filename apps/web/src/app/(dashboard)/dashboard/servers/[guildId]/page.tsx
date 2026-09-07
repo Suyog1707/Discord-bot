@@ -87,6 +87,12 @@ export default async function ServerDetailPage({
     const actor = await requireUserOrRedirect(`/dashboard/servers/${guildId}`);
 
     const djRoleRaw = formString(formData, 'djRoleId').trim();
+    // One textarea, one ID per line — `formString` reads a single value, so
+    // the splitting happens here rather than with repeated form fields.
+    const djUserIds = formString(formData, 'djUserIds')
+      .split(/[\s,]+/u)
+      .map((id) => id.trim())
+      .filter((id) => id !== '');
     await updateGuildSettings(actor.id, guildId, {
       defaultVolume: formNumber(formData, 'defaultVolume'),
       leaveOnEmptyAfter: formNumber(formData, 'leaveOnEmptyAfter'),
@@ -94,6 +100,7 @@ export default async function ServerDetailPage({
       stayConnected: formData.get('stayConnected') === 'on',
       autoplayEnabled: formData.get('autoplayEnabled') === 'on',
       djRoleId: djRoleRaw === '' ? null : djRoleRaw,
+      djUserIds,
     });
 
     revalidatePath(`/dashboard/servers/${guildId}`);
@@ -177,6 +184,24 @@ export default async function ServerDetailPage({
                 />
                 <p className="text-muted-foreground text-xs">
                   Right-click a role in Discord → Copy Role ID (developer mode required).
+                </p>
+              </div>
+
+              <div className="grid gap-2">
+                <Label htmlFor="djUserIds">DJ user IDs</Label>
+                <textarea
+                  id="djUserIds"
+                  name="djUserIds"
+                  rows={3}
+                  placeholder="One Discord user ID per line"
+                  defaultValue={detail.settings.djUserIds.join('\n')}
+                  className="border-input placeholder:text-muted-foreground focus-visible:ring-ring shadow-xs w-full rounded-md border bg-transparent px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-1"
+                />
+                <p className="text-muted-foreground text-xs">
+                  Named DJs, for when you would rather not create a role. Like the DJ role, this
+                  only applies while they are in the voice channel the bot is playing in — it is
+                  never server-wide. Whoever starts the music always controls their own session and
+                  can share it with <code>/dj add</code>.
                 </p>
               </div>
 

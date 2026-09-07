@@ -1,0 +1,20 @@
+-- Named DJs, alongside the DJ role.
+--
+-- Restricting playback used to require an admin to create a Discord role and
+-- hand it out before anyone could be a DJ. That is a lot of ceremony for
+-- "let these two people skip", and it made the common case — the person who
+-- summoned the bot wanting to share control with whoever is in the channel
+-- with them — impossible to express at all.
+--
+--   * guild_settings.djUserIds — Discord user snowflakes granted DJ from the
+--     dashboard. An empty array is the default and means "nobody named here",
+--     which together with a NULL djRoleId keeps today's behaviour: with no DJ
+--     configuration at all, everyone may control playback.
+--
+-- Note this is standing configuration, not a guild-wide grant: the bot only
+-- honours it for a member sitting in the voice channel it is playing in, the
+-- same rule the session host and in-session DJ grants follow. Session grants
+-- themselves are deliberately NOT stored here — they live and die with the
+-- playback session and never touch Postgres.
+-- AlterTable
+ALTER TABLE "guild_settings" ADD COLUMN "djUserIds" TEXT[] DEFAULT ARRAY[]::TEXT[];

@@ -215,6 +215,7 @@ export class GuildService {
         GuildSettings,
         | 'defaultVolume'
         | 'djRoleId'
+        | 'djUserIds'
         | 'musicChannelId'
         | 'announceNowPlaying'
         | 'leaveOnEmptyAfter'

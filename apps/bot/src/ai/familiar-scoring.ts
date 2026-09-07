@@ -24,7 +24,7 @@ import { dominantLanguage } from './scoring.js';
 import type { RecentContext, TasteProfile } from './taste.js';
 
 /** How a familiar candidate earned the label. Ordered by how much it is trusted. */
-export type FamiliarSource = 'requested' | 'playlist' | 'library' | 'history';
+export type FamiliarSource = 'requested' | 'playlist' | 'spotify' | 'library' | 'history';
 
 export interface FamiliarCandidate {
   readonly title: string;
@@ -133,6 +133,16 @@ const SOURCE_TRUST: Readonly<Record<FamiliarSource, number>> = {
   // but never enough of it that a playlist entry falls below a bare history
   // row: a person listed it, nobody merely happened to play it.
   playlist: 0.8,
+  /**
+   * On a playlist of theirs on Spotify.
+   *
+   * The same act of curation as a local playlist, and rated just under it for
+   * one reason: it was not saved *here*. A song in a bot playlist was put
+   * there to be played in a voice channel; a song on Spotify was saved for
+   * private listening and may not be something they would pick for a room.
+   * Still far above a history row — a person chose it either way.
+   */
+  spotify: 0.75,
   // Played here and survived the familiarity test upstream. Real, but weakest:
   // it may have been someone else's pick that nobody objected to.
   history: 0.55,

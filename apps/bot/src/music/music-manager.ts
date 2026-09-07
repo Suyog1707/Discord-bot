@@ -45,6 +45,7 @@ import type { GuildService } from '../services/guild-service.js';
 import type { SpotifyService } from '../services/spotify-service.js';
 import { decideHandover } from './channel-handover.js';
 import { decideVoiceCleanup } from './voice-cleanup.js';
+import { SessionDjRegistry } from './session-dj.js';
 import {
   claimReconnect,
   decideVoiceClose,
@@ -311,6 +312,15 @@ export class MusicManager {
 
   /** Guilds currently rebuilding a voice connection, and their recent attempts. */
   readonly #voiceReconnects = new Map<string, ReconnectBudget>();
+
+  /**
+   * Session hosts and their DJ grants.
+   *
+   * Public because the command guard reads it on every control command. It
+   * lives here rather than on `GuildPlayer` so a voice reconnect — which
+   * destroys and rebuilds the player — cannot strip everyone's DJ mid-session.
+   */
+  readonly sessionDj = new SessionDjRegistry();
 
   constructor(options: {
     readonly client: Client;
@@ -698,6 +708,9 @@ export class MusicManager {
       // happens to be the most recent.
       onListenerChange: (guildId, listenerId) => {
         void this.#autoplaySession?.setListener(guildId, listenerId).catch(() => undefined);
+        // The session's listener is also its host: whoever's request started
+        // the music runs the room until the bot leaves.
+        if (listenerId !== null) this.sessionDj.setHost(guildId, listenerId);
         logger.info({ event: 'AUTOPLAY_LISTENER', guildId, listenerId }, 'Autoplay listener set');
       },
       // A track actually started: this is the moment it becomes "recently
@@ -2059,6 +2072,11 @@ export class MusicManager {
       voiceChannelId: player.voiceChannelId,
       textChannelId: player.textChannelId,
       listenerId: player.listenerId,
+      // Who runs this session. The teardown below clears it, but a reconnect
+      // is not the session ending — stripping everyone's DJ because Discord
+      // dropped a websocket would be its own bug.
+      hostId: this.sessionDj.host(guildId),
+      sessionDjIds: this.sessionDj.djIds(guildId),
       // A player that was paused stays paused; only audio that was actually
       // running is worth restarting.
       wasPlaying: player.isPlaying && !player.paused,
@@ -2089,6 +2107,9 @@ export class MusicManager {
       fresh.queue.restore(snapshot.tracks, snapshot.currentIndex, snapshot.loopMode);
       await fresh.setVolume(snapshot.volume);
 
+      if (snapshot.hostId !== null) this.sessionDj.claimHost(guildId, snapshot.hostId);
+      for (const djId of snapshot.sessionDjIds) this.sessionDj.grant(guildId, djId);
+
       if (snapshot.wasPlaying && fresh.queue.current !== null) {
         await fresh.jumpTo(snapshot.currentIndex);
         if (snapshot.positionMs > 0) await fresh.seekTo(snapshot.positionMs);
@@ -2117,6 +2138,10 @@ export class MusicManager {
     this.#players.delete(guildId);
     // A resume nobody asked about does not survive the session it belongs to.
     this.#resumeNotices.delete(guildId);
+    // Session over: the next person to summon the bot hosts a fresh one.
+    // `#reconnectVoice` restores these afterwards, so a voice rebuild does
+    // not read as the session ending.
+    this.sessionDj.clear(guildId);
     // The queue is gone with the player; the session's queued-mirror must not
     // keep excluding tracks from a queue that no longer exists. Recent-play
     // history intentionally survives: reconnecting must not reset anti-repeat.

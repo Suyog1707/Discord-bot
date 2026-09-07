@@ -78,6 +78,29 @@ describe('scoreFamiliar — provenance', () => {
     expect(playlist).toBeGreaterThan(history);
   });
 
+  /**
+   * A Spotify save is the same act of curation as a local playlist entry, but
+   * it was not saved *here* — it may be private listening rather than
+   * something they would put on for a room. Below a playlist, far above a
+   * history row nobody chose.
+   */
+  it('ranks a Spotify save between a local playlist and bare history', () => {
+    const playlist = scoreOf({ sources: sources('playlist'), playlistRelevance: 1 });
+    const spotify = scoreOf({ sources: sources('spotify') });
+    const history = scoreOf({ sources: sources('history') });
+
+    expect(playlist).toBeGreaterThan(spotify);
+    expect(spotify).toBeGreaterThan(history);
+  });
+
+  /** One song on Spotify and in the local library is one song, scored at its best claim. */
+  it('lets a library claim outrank a Spotify one on the same track', () => {
+    const both = scoreOf({ sources: sources('spotify', 'library') });
+    const libraryOnly = scoreOf({ sources: sources('library') });
+
+    expect(both).toBeCloseTo(libraryOnly, 10);
+  });
+
   it('takes the strongest claim when a track has several sources', () => {
     const both = scoreOf({ sources: sources('history', 'library') });
     const libraryOnly = scoreOf({ sources: sources('library') });

@@ -182,6 +182,10 @@ export class BotClient extends Client {
       env,
       prisma: this.prisma,
       dislikes: this.services.dislikes,
+      // The same reader `/spotify` and `/play` use. Autoplay reads the linked
+      // libraries of whoever is in the voice channel, so the room's own music
+      // counts as familiar rather than being invisible to the recommender.
+      spotify: this.services.spotify,
       ...(this.#redis && { redis: this.#redis }),
     });
     this.music?.attachAutoplay(this.ai.autoplay, this.ai.orchestrator, this.ai.planner);

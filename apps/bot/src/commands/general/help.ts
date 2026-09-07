@@ -25,7 +25,10 @@ export default defineCommand({
     const embed = new EmbedBuilder()
       .setTitle('Commands')
       .setColor(0x5865f2)
-      .setDescription('Everything the bot can do. Commands marked DJ-only need the DJ role.');
+      .setDescription(
+        'Everything the bot can do. Anyone can queue with `/play`; commands marked *(DJ)* ' +
+          'need to be the session host or a DJ they added with `/dj add`.',
+      );
 
     for (const category of COMMAND_CATEGORIES) {
       const commands = client.commands

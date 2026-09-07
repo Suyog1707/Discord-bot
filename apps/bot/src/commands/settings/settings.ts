@@ -5,6 +5,7 @@
  *   view                      Show current settings.
  *   volume <percent>          Default playback volume (0–200).
  *   dj-role <role> | clear    Restrict music control to a role, or open it up.
+ *   dj-user <add|remove> <user>  Name individuals as standing DJs.
  *   announce <enabled>        Toggle now-playing announcements.
  *   auto-leave <seconds>      Leave voice after N seconds idle (60–3600).
  *
@@ -45,6 +46,21 @@ export default defineCommand({
         .setDescription('Restrict music commands to a DJ role, or clear the restriction.')
         .addRoleOption((option) =>
           option.setName('role').setDescription('The DJ role. Omit to clear.').setRequired(false),
+        ),
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName('dj-user')
+        .setDescription('Give or take standing DJ from one person.')
+        .addStringOption((option) =>
+          option
+            .setName('action')
+            .setDescription('Add or remove')
+            .setRequired(true)
+            .addChoices({ name: 'add', value: 'add' }, { name: 'remove', value: 'remove' }),
+        )
+        .addUserOption((option) =>
+          option.setName('user').setDescription('Who to add or remove').setRequired(true),
         ),
     )
     .addSubcommand((sub) =>
@@ -93,7 +109,15 @@ export default defineCommand({
             { name: 'Default volume', value: `${String(settings.defaultVolume)}%`, inline: true },
             {
               name: 'DJ role',
-              value: settings.djRoleId === null ? 'None (everyone)' : `<@&${settings.djRoleId}>`,
+              value: settings.djRoleId === null ? 'None' : `<@&${settings.djRoleId}>`,
+              inline: true,
+            },
+            {
+              name: 'Named DJs',
+              value:
+                settings.djUserIds.length === 0
+                  ? 'None'
+                  : settings.djUserIds.map((id) => `<@${id}>`).join(', '),
               inline: true,
             },
             {
@@ -127,8 +151,35 @@ export default defineCommand({
         await interaction.editReply({
           content:
             role === null
-              ? 'DJ restriction cleared — everyone can control music.'
-              : `Music control restricted to <@&${role.id}>.`,
+              ? 'DJ role cleared. Whoever starts the music still hosts the session and can share control with `/dj add`.'
+              : `<@&${role.id}> can control music — while they are in the voice channel the bot is playing in.`,
+          allowedMentions: { parse: [] },
+        });
+        return;
+      }
+
+      case 'dj-user': {
+        const action = interaction.options.getString('action', true);
+        const user = interaction.options.getUser('user', true);
+        const current = (await guilds.getSettings(guildId)).djUserIds;
+
+        // Standing DJs are a set; adding twice must not grow the column, and
+        // removing someone who was never there is not an error worth raising.
+        const next =
+          action === 'add'
+            ? [...new Set([...current, user.id])]
+            : current.filter((id) => id !== user.id);
+
+        if (next.length === current.length && action === 'add') {
+          await interaction.editReply({ content: `**${user.username}** is already a DJ.` });
+          return;
+        }
+        await guilds.updateSettings(guildId, { djUserIds: next });
+        await interaction.editReply({
+          content:
+            action === 'add'
+              ? `**${user.username}** is now a DJ — in whichever voice channel the bot is playing in.`
+              : `**${user.username}** is no longer a standing DJ.`,
         });
         return;
       }

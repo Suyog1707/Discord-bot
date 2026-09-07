@@ -3,7 +3,11 @@ import { revalidatePath } from 'next/cache';
 import { cookies } from 'next/headers';
 
 import { requireUserOrRedirect } from '@/lib/auth/session';
-import { disconnectSpotify, getSpotifyStatus } from '@/lib/services/spotify';
+import {
+  disconnectSpotify,
+  getSpotifyStatus,
+  setSpotifyAutoplayOptIn,
+} from '@/lib/services/spotify';
 import { isSpotifyConfigured } from '@/lib/spotify/client';
 import { formString } from '@/lib/forms';
 import {
@@ -15,6 +19,7 @@ import {
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Label } from '@/components/ui/label';
 
 export const metadata: Metadata = { title: 'Settings' };
 export const dynamic = 'force-dynamic';
@@ -47,6 +52,13 @@ export default async function AccountSettingsPage({
     'use server';
     const actor = await requireUserOrRedirect('/dashboard/settings');
     await disconnectSpotify(actor.id);
+    revalidatePath('/dashboard/settings');
+  }
+
+  async function toggleAutoplayOptIn(formData: FormData) {
+    'use server';
+    const actor = await requireUserOrRedirect('/dashboard/settings');
+    await setSpotifyAutoplayOptIn(actor.id, formData.get('optIn') === 'on');
     revalidatePath('/dashboard/settings');
   }
 
@@ -131,6 +143,28 @@ export default async function AccountSettingsPage({
               <form action={unlinkSpotify}>
                 <Button type="submit" variant="destructive" size="sm">
                   Disconnect
+                </Button>
+              </form>
+
+              <form action={toggleAutoplayOptIn} className="w-full">
+                <Label className="flex cursor-pointer items-start gap-2">
+                  <input
+                    type="checkbox"
+                    name="optIn"
+                    defaultChecked={spotify.autoplayOptIn}
+                    className="mt-1 size-4"
+                  />
+                  <span className="text-sm">
+                    Use my Spotify for autoplay
+                    <span className="text-muted-foreground block text-xs">
+                      Lets the bot treat your playlists and Liked Songs as music you already like,
+                      and pick new songs in the same taste — but only in voice channels you are
+                      actually sitting in. Turn this off to keep Spotify linked for playback alone.
+                    </span>
+                  </span>
+                </Label>
+                <Button type="submit" size="sm" variant="outline" className="mt-2">
+                  Save preference
                 </Button>
               </form>
             </div>

@@ -48,6 +48,7 @@ import {
   type InterleaveConfig,
 } from './interleave.js';
 import { languageFromText } from './language.js';
+import type { SpotifyTasteService } from './spotify-taste.js';
 import { TrackProfileResolver, type TrackProfile } from './track-profile.js';
 import { MusicOrchestrator } from './orchestrator.js';
 import type { RecommendationExclusions, RecommendationService, TrackSeed } from './recommender.js';
@@ -166,6 +167,17 @@ const DISLIKED_ARTIST_PENALTY_CAP = 2;
 const MAX_SLOT_ITERATIONS = 12;
 
 /** Guild profile weight relative to a listener's own profile in the blend. */
+/**
+ * Ceiling on how much a Spotify artist can be worth as an affinity.
+ *
+ * Deliberately well under 1: saving a song is a weaker statement than playing
+ * it here and letting it run, and the profile's own numbers are earned from
+ * real completions. High enough to get an unheard-here artist onto the
+ * recommender's seed list, low enough that it cannot outrank what the room has
+ * actually demonstrated.
+ */
+const SPOTIFY_ARTIST_WEIGHT = 0.5;
+
 const GUILD_PROFILE_WEIGHT = 0.6;
 const LISTENER_PROFILE_WEIGHT = 1;
 
@@ -198,6 +210,8 @@ interface PlannerServices {
    * planner runs on raw tags when no resolver is wired.
    */
   readonly profiles?: TrackProfileResolver;
+  /** The room's linked Spotify libraries, as an artist-level taste prior. */
+  readonly spotifyTaste?: SpotifyTasteService;
   readonly config?: Partial<PlannerConfig>;
 }
 
@@ -708,10 +722,45 @@ export class AutoplayPlanner implements AutoplayGenerator {
         this.#services.taste.profile({ guildId, userId }, { allowRefresh: options.background }),
       ),
     ]);
-    return blendProfiles([
+    const blended = blendProfiles([
       { profile: guild, weight: GUILD_PROFILE_WEIGHT },
       ...listeners.map((profile) => ({ profile, weight: LISTENER_PROFILE_WEIGHT })),
     ]);
+    return this.#withSpotifyArtists(blended, listenerIds);
+  }
+
+  /**
+   * Fold the room's Spotify artists into the profile's artist affinities.
+   *
+   * This is the half of the Spotify feature that reaches *discovery*. The
+   * recommender already seeds new music from the profile's top artists
+   * (`taste-artists` and `discovery` strategies), so an artist somebody plays
+   * constantly on Spotify but has never played here starts pulling in
+   * neighbours — exactly the music the bot could not otherwise know to suggest.
+   *
+   * Applied only where it beats what is already known: a saved song is weaker
+   * evidence than one this room has sat through, so Spotify may raise an
+   * artist the profile has not seen but never lower one it has. Never throws —
+   * an unavailable library leaves the profile exactly as it was.
+   */
+  async #withSpotifyArtists(
+    profile: TasteProfile,
+    listenerIds: readonly string[],
+  ): Promise<TasteProfile> {
+    const service = this.#services.spotifyTaste;
+    if (service === undefined || listenerIds.length === 0) return profile;
+
+    const affinity = await service
+      .artistAffinity(listenerIds)
+      .catch(() => new Map<string, number>());
+    if (affinity.size === 0) return profile;
+
+    const artistAffinity: Record<string, number> = { ...profile.artistAffinity };
+    for (const [artistKey, weight] of affinity) {
+      const scaled = weight * SPOTIFY_ARTIST_WEIGHT;
+      if (scaled > (artistAffinity[artistKey] ?? 0)) artistAffinity[artistKey] = scaled;
+    }
+    return { ...profile, artistAffinity };
   }
 
   /**

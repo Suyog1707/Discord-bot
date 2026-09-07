@@ -291,15 +291,20 @@ export class SpotifyService {
   /** The user's playlists (Liked Songs first), newest-touched first. */
   async listPlaylists(discordId: string): Promise<UserPlaylist[]> {
     interface Page {
-      items: {
+      /**
+       * Entries are nullable: Spotify pads a page with nulls for playlists the
+       * user can no longer see.
+       */
+      items: ({
         id: string;
         name: string;
         snapshot_id: string;
-        items: { total: number };
-        owner: { display_name: string | null };
+        /** Spotify names this `tracks`, not `items`. */
+        tracks: { total: number } | null;
+        owner: { display_name: string | null } | null;
         images?: { url: string }[] | null;
         public: boolean | null;
-      }[];
+      } | null)[];
       next: string | null;
     }
 
@@ -318,15 +323,17 @@ export class SpotifyService {
     while (url !== null && collected.length < 200) {
       const page: Page = await this.#apiGet(discordId, url);
       collected.push(
-        ...page.items.map((item) => ({
-          spotifyId: item.id,
-          name: item.name,
-          trackCount: item.items.total,
-          owner: item.owner.display_name,
-          artworkUrl: item.images?.[0]?.url ?? null,
-          isPublic: item.public,
-          snapshotId: item.snapshot_id,
-        })),
+        ...page.items
+          .filter((item) => item !== null)
+          .map((item) => ({
+            spotifyId: item.id,
+            name: item.name,
+            trackCount: item.tracks?.total ?? 0,
+            owner: item.owner?.display_name ?? null,
+            artworkUrl: item.images?.[0]?.url ?? null,
+            isPublic: item.public,
+            snapshotId: item.snapshot_id,
+          })),
       );
       url = page.next;
     }
@@ -336,19 +343,26 @@ export class SpotifyService {
   /** Tracks of a playlist (or Liked Songs), local files skipped. */
   async playlistTracks(discordId: string, spotifyId: string, limit: number): Promise<UserTrack[]> {
     const collected: UserTrack[] = [];
+    /**
+     * "Get Playlist Items" is `/tracks`. It was `/items`, which Spotify does
+     * not publish — the same mistake `spotify-resolver.ts` records fixing on
+     * its own path. Neither route had ever run, because no account had been
+     * linked, so nothing caught it.
+     */
     let url: string | null =
       spotifyId === LIKED_SONGS_ID
         ? '/me/tracks?limit=50'
-        : `/playlists/${spotifyId}/items?limit=100`;
+        : `/playlists/${spotifyId}/tracks?limit=100`;
 
     while (url !== null && collected.length < limit) {
-      const page: { items: { item: RawTrack | null }[]; next: string | null } = await this.#apiGet(
-        discordId,
-        url,
-      );
+      // Both routes wrap each entry as `{ track }`; it is null for a removed
+      // or region-unavailable song.
+      const page: { items: ({ track: RawTrack | null } | null)[]; next: string | null } =
+        await this.#apiGet(discordId, url);
       for (const item of page.items) {
-        if (item.item !== null && item.item.is_local !== true) {
-          collected.push(toUserTrack(item.item));
+        const track = item?.track;
+        if (track != null && track.is_local !== true) {
+          collected.push(toUserTrack(track));
         }
       }
       url = page.next;

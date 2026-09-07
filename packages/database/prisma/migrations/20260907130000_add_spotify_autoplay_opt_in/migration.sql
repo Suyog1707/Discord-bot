@@ -1,0 +1,15 @@
+-- Consent to let a linked Spotify library steer autoplay.
+--
+-- Linking Spotify has so far meant one thing: resolve Spotify URLs and import
+-- playlists, both actions the user takes deliberately, one at a time. Autoplay
+-- reading the same library is different in kind — it is passive, continuous,
+-- and it plays what it finds to a room full of other people. A private
+-- playlist steering a shared voice channel is a fact worth being able to
+-- decline without unlinking the account outright.
+--
+--   * spotify_accounts.autoplayOptIn — default true, because reaching this
+--     column at all means the user already connected Spotify on purpose and
+--     the dashboard states what it is used for. The toggle exists so that
+--     choice stays theirs.
+-- AlterTable
+ALTER TABLE "spotify_accounts" ADD COLUMN "autoplayOptIn" BOOLEAN NOT NULL DEFAULT true;

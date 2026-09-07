@@ -70,12 +70,21 @@ export interface SpotifyStatus {
   readonly country: string | null;
   readonly scopes: readonly string[];
   readonly linkedAt: Date | null;
+  /** Whether this library may steer autoplay in a shared voice channel. */
+  readonly autoplayOptIn: boolean;
 }
 
 export async function getSpotifyStatus(userId: string): Promise<SpotifyStatus> {
   const account = await getDb().spotifyAccount.findUnique({
     where: { userId },
-    select: { displayName: true, spotifyId: true, country: true, scopes: true, createdAt: true },
+    select: {
+      displayName: true,
+      spotifyId: true,
+      country: true,
+      scopes: true,
+      createdAt: true,
+      autoplayOptIn: true,
+    },
   });
   if (account === null) {
     return {
@@ -85,6 +94,7 @@ export async function getSpotifyStatus(userId: string): Promise<SpotifyStatus> {
       country: null,
       scopes: [],
       linkedAt: null,
+      autoplayOptIn: false,
     };
   }
   return {
@@ -93,6 +103,7 @@ export async function getSpotifyStatus(userId: string): Promise<SpotifyStatus> {
     spotifyId: account.spotifyId,
     country: account.country,
     scopes: account.scopes.split(' '),
+    autoplayOptIn: account.autoplayOptIn,
     linkedAt: account.createdAt,
   };
 }
@@ -294,4 +305,16 @@ export async function syncSpotifyPlaylist(
   }
   const result = await importSpotifyItem(userId, playlist.spotifyId);
   return { trackCount: result.trackCount, changed: result.changed };
+}
+
+/**
+ * Turn autoplay personalisation on or off for this account.
+ *
+ * Separate from linking on purpose. Connecting Spotify is about playback the
+ * user asks for one action at a time; letting the same library quietly steer
+ * what a whole voice channel hears is a different thing to agree to, and has
+ * to be refusable without unlinking.
+ */
+export async function setSpotifyAutoplayOptIn(userId: string, optIn: boolean): Promise<void> {
+  await getDb().spotifyAccount.updateMany({ where: { userId }, data: { autoplayOptIn: optIn } });
 }

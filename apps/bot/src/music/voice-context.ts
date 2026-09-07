@@ -8,8 +8,10 @@ import { UpstreamError, ValidationError } from '@discord-music/shared';
 import type { ChatInputCommandInteraction, GuildMember } from 'discord.js';
 
 import type { BotClient } from '../core/bot-client.js';
+import { checkDjAuthority } from '../core/guards.js';
 import type { GuildPlayer } from './guild-player.js';
 import type { MusicManager } from './music-manager.js';
+import { trackOrigin, type QueuedTrack } from './track.js';
 
 /** The music engine, or a clear message when Lavalink is not configured. */
 export function requireMusic(client: BotClient): MusicManager {
@@ -57,4 +59,27 @@ export function requireActivePlayer(music: MusicManager, context: VoiceContext):
     throw new ValidationError('You need to be in my voice channel to control playback.');
   }
   return player;
+}
+
+/**
+ * Let a DJ act, or anyone act on a track they queued themselves.
+ *
+ * A misclicked `/play` should not need a DJ to clean up, so the person who put
+ * a track on may always take it back off. Ownership is only meaningful for
+ * user-requested tracks: every autoplay pick is stamped with a placeholder
+ * requester, and nobody owns the robot's choices.
+ *
+ * @returns the rejection message, or null when the caller may proceed.
+ */
+export async function denyUnlessDjOrOwnTrack(
+  interaction: ChatInputCommandInteraction,
+  track: QueuedTrack | null,
+): Promise<string | null> {
+  const owned =
+    track !== null && trackOrigin(track) === 'user' && track.requestedById === interaction.user.id;
+  if (owned) return null;
+
+  const verdict = await checkDjAuthority(interaction.client as BotClient, interaction);
+  if (verdict.allowed) return null;
+  return verdict.message ?? 'You do not have permission to do that.';
 }

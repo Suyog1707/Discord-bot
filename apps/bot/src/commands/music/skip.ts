@@ -3,6 +3,7 @@
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import {
+  denyUnlessDjOrOwnTrack,
   requireActivePlayer,
   requireMusic,
   requireVoiceContext,
@@ -14,6 +15,8 @@ export default defineCommand({
   guildOnly: true,
   cooldownSeconds: 2,
   djOnly: true,
+  // Skipping your own song needs no permission from anybody.
+  ownTrackExempt: true,
 
   async execute({ interaction }) {
     const client = interaction.client as BotClient;
@@ -21,6 +24,13 @@ export default defineCommand({
     const player = requireActivePlayer(music, requireVoiceContext(interaction));
 
     const skipped = player.queue.current;
+
+    const denial = await denyUnlessDjOrOwnTrack(interaction, skipped);
+    if (denial !== null) {
+      await interaction.editReply({ content: denial });
+      return;
+    }
+
     await player.skip();
 
     await interaction.editReply({

@@ -11,6 +11,7 @@ import type { PrismaClient } from '@discord-music/database';
 import type { Redis } from '@discord-music/shared/redis';
 
 import type { BotEnv } from '../config/env.js';
+import type { SpotifyService } from '../services/spotify-service.js';
 import { getLogger } from '../lib/logger.js';
 
 import { AutoplayPlanner, type DislikeSource } from './autoplay-planner.js';
@@ -19,6 +20,7 @@ import { CacheService } from './cache.js';
 import { CooccurrenceService } from './cooccurrence.js';
 import { TrackProfileResolver } from './track-profile.js';
 import { FamiliarPoolService } from './familiar.js';
+import { SpotifyTasteService } from './spotify-taste.js';
 import { IntentService } from './intent.js';
 import { LastFmService } from './lastfm.js';
 import { GroqProvider } from './llm/groq.js';
@@ -48,8 +50,14 @@ export function createAiStack(options: {
   readonly redis?: Redis;
   /** Explicit "not like" store; absent means dislikes are session-only. */
   readonly dislikes?: DislikeSource;
+  /**
+   * Linked-Spotify reader. Absent means autoplay sees only what the bot itself
+   * recorded — the pre-Spotify behaviour, and the behaviour whenever Spotify
+   * is not configured.
+   */
+  readonly spotify?: SpotifyService;
 }): AiStack {
-  const { env, prisma, redis, dislikes } = options;
+  const { env, prisma, redis, dislikes, spotify } = options;
 
   const cache = new CacheService(redis);
 
@@ -127,13 +135,28 @@ export function createAiStack(options: {
   // playlists, history, requests) apart from the similarity engine's output
   // and decides the rhythm between them. The engine only buffers what the
   // planner chooses.
-  const familiar = new FamiliarPoolService(prisma, cache);
+  // The room's own Spotify libraries, when one is reachable. Feeds the
+  // familiar pool with songs they already chose and the planner with the
+  // artists behind them; absent, everything below behaves exactly as before.
+  const spotifyTaste =
+    spotify === undefined
+      ? undefined
+      : new SpotifyTasteService({
+          spotify,
+          cache,
+          prisma,
+          enabled: env.SPOTIFY_TASTE_ENABLED,
+          maxTracksPerListener: env.SPOTIFY_TASTE_MAX_TRACKS,
+        });
+
+  const familiar = new FamiliarPoolService(prisma, cache, spotifyTaste);
   const planner = new AutoplayPlanner({
     session,
     taste,
     familiar,
     recommender,
     ...(dislikes === undefined ? {} : { dislikes }),
+    ...(spotifyTaste === undefined ? {} : { spotifyTaste }),
     // Behavioural similarity stands in for the audio features no provider
     // exposes: what the room plays, saves and lists together.
     cooccurrence: new CooccurrenceService(prisma, cache),

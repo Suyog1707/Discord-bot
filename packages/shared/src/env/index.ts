@@ -331,6 +331,22 @@ export const botEnvSchema = requireInProduction(
        */
       AUTOPLAY_DISCOVERY_ENABLED: booleanish.default(true),
       /**
+       * Let a listener's linked Spotify library steer autoplay.
+       *
+       * On, their playlists and Liked Songs join the familiar pool and their
+       * artists become a discovery prior — for the people actually in the
+       * voice channel, and only where they left the dashboard opt-in on. Off
+       * is the pre-Spotify behaviour: autoplay sees only what the bot itself
+       * recorded. Reads are cached and never block a queue refill.
+       */
+      SPOTIFY_TASTE_ENABLED: booleanish.default(true),
+      /**
+       * Tracks read per listener before their library is truncated. Guards
+       * both the Spotify API budget and the size of the familiar pool a single
+       * heavy listener can occupy.
+       */
+      SPOTIFY_TASTE_MAX_TRACKS: z.coerce.number().int().min(20).max(1000).default(200),
+      /**
        * Queue refill: autoplay tops the queue up BEFORE it drains. When the
        * upcoming count falls to the low-water mark a refill starts, and it
        * fills back up to the target. Small numbers on purpose: every pick
