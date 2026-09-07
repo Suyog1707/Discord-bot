@@ -11,6 +11,7 @@
  *   import { createRedisClient } from '@discord-music/shared/redis';
  */
 export * from './constants/index.js';
+export * from './discord/index.js';
 export * from './errors/index.js';
 export * from './music-identity/index.js';
 export * from './net/index.js';

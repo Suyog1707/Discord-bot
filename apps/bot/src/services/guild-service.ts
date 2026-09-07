@@ -99,6 +99,118 @@ export class GuildService {
   }
 
   /**
+   * Record that this deployment runs as a given Discord application.
+   *
+   * Written by every client at startup, including players that have never
+   * joined a server — the dashboard needs the roster to offer an invite for
+   * one, which is the whole point of having them.
+   */
+  async registerBot(bot: {
+    readonly clientId: string;
+    readonly label: string;
+    readonly role: string;
+  }): Promise<void> {
+    try {
+      await this.#prisma.playerBot.upsert({
+        where: { clientId: bot.clientId },
+        update: { label: bot.label, role: bot.role, lastSeenAt: new Date() },
+        create: { ...bot, lastSeenAt: new Date() },
+      });
+    } catch (error) {
+      // The roster is for the dashboard's benefit; failing to write it must
+      // not stop a player from starting and holding a voice channel.
+      logger.warn({ err: error, bot: bot.label }, 'Player roster write failed');
+    }
+  }
+
+  /**
+   * Record whether one player is in one guild.
+   *
+   * Separate from `Guild.isActive`, which stays a single flag meaning "this
+   * server has the bot people talk to". A server may have added two players
+   * and not the other five, and only a row per player can say so.
+   */
+  async setBotPresence(
+    discordGuildId: string,
+    botClientId: string,
+    present: boolean,
+  ): Promise<void> {
+    try {
+      const guild = await this.#prisma.guild.findUnique({
+        where: { discordId: discordGuildId },
+        select: { id: true },
+      });
+      // A worker can be in a server the primary has never seen; there is no
+      // guild row to hang presence off yet, and the primary's own join will
+      // create one.
+      if (guild === null) return;
+
+      const now = new Date();
+      await this.#prisma.guildBot.upsert({
+        where: { guildId_botClientId: { guildId: guild.id, botClientId } },
+        update: present
+          ? { present: true, joinedAt: now, leftAt: null }
+          : { present: false, leftAt: now },
+        create: {
+          guildId: guild.id,
+          botClientId,
+          present,
+          ...(present ? { joinedAt: now } : { leftAt: now }),
+        },
+      });
+    } catch (error) {
+      logger.warn(
+        { err: error, guildId: discordGuildId, botClientId, present },
+        'Player presence write failed',
+      );
+    }
+  }
+
+  /**
+   * Reconcile one player's presence against the servers it is actually in.
+   *
+   * `guildCreate` fires when a bot *joins*, not for servers it was already in
+   * when the process started — so presence written only from that event would
+   * stay empty for every existing server and the dashboard would offer an
+   * invite for a player that is plainly already there. Run at startup, this
+   * is also what repairs a row deleted by hand or missed while the bot was
+   * offline.
+   */
+  async syncBotPresence(botClientId: string, discordGuildIds: readonly string[]): Promise<void> {
+    try {
+      const guilds = await this.#prisma.guild.findMany({
+        where: { discordId: { in: [...discordGuildIds] } },
+        select: { id: true },
+      });
+      const now = new Date();
+
+      await Promise.all(
+        guilds.map(async (guild) =>
+          this.#prisma.guildBot.upsert({
+            where: { guildId_botClientId: { guildId: guild.id, botClientId } },
+            update: { present: true, joinedAt: now, leftAt: null },
+            create: { guildId: guild.id, botClientId, present: true, joinedAt: now },
+          }),
+        ),
+      );
+
+      // Anything still marked present that this player is no longer in — it
+      // was removed while the process was down, and nothing else will say so.
+      const gone = await this.#prisma.guildBot.updateMany({
+        where: { botClientId, present: true, guildId: { notIn: guilds.map((g) => g.id) } },
+        data: { present: false, leftAt: now },
+      });
+
+      logger.info(
+        { botClientId, present: guilds.length, cleared: gone.count },
+        'Player presence reconciled',
+      );
+    } catch (error) {
+      logger.warn({ err: error, botClientId }, 'Player presence reconcile failed');
+    }
+  }
+
+  /**
    * Settings for a guild, creating the default row if it is missing.
    *
    * Served from a short-lived cache (see {@link SETTINGS_CACHE_TTL_MS}) so the

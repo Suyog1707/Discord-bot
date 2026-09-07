@@ -33,7 +33,28 @@ interface ServerPresence {
   readonly botPresent: boolean;
 }
 
-export function InviteBotButton({ guildId, inviteUrl }: { guildId: string; inviteUrl: string }) {
+/** The subset of `ServerPlayer` this component reads. */
+interface PlayerPresence {
+  readonly clientId: string;
+  readonly present: boolean;
+}
+
+export function InviteBotButton({
+  guildId,
+  inviteUrl,
+  clientId,
+}: {
+  guildId: string;
+  inviteUrl: string;
+  /**
+   * Watch for *this* player rather than for the server having the bot at all.
+   *
+   * Adding a second player to a server that already has the first would
+   * otherwise satisfy the poll instantly — the server does have the bot — and
+   * the card would flip back before the new player had joined anything.
+   */
+  clientId?: string;
+}) {
   const router = useRouter();
   const [waiting, setWaiting] = useState(false);
   /** Bumped on every click so a second attempt restarts the poll from scratch. */
@@ -55,12 +76,11 @@ export function InviteBotButton({ guildId, inviteUrl }: { guildId: string; invit
       checking = true;
 
       try {
-        const response = await fetch('/api/server', { cache: 'no-store', signal });
-        const body = (await response.json()) as ApiResponse<readonly ServerPresence[]>;
-        if (
-          body.success &&
-          body.data.some((server) => server.discordId === guildId && server.botPresent)
-        ) {
+        const arrived =
+          clientId === undefined
+            ? await hasBot(guildId, signal)
+            : await hasPlayer(guildId, clientId, signal);
+        if (arrived) {
           if (!stale()) {
             setWaiting(false);
             router.refresh();
@@ -86,6 +106,23 @@ export function InviteBotButton({ guildId, inviteUrl }: { guildId: string; invit
       }, POLL_INTERVAL_MS);
     }
 
+    async function hasBot(id: string, abort: AbortSignal): Promise<boolean> {
+      const response = await fetch('/api/server', { cache: 'no-store', signal: abort });
+      const body = (await response.json()) as ApiResponse<readonly ServerPresence[]>;
+      return (
+        body.success && body.data.some((server) => server.discordId === id && server.botPresent)
+      );
+    }
+
+    async function hasPlayer(id: string, bot: string, abort: AbortSignal): Promise<boolean> {
+      const response = await fetch(`/api/server/${id}/players`, {
+        cache: 'no-store',
+        signal: abort,
+      });
+      const body = (await response.json()) as ApiResponse<readonly PlayerPresence[]>;
+      return body.success && body.data.some((player) => player.clientId === bot && player.present);
+    }
+
     function checkNow(): void {
       if (document.visibilityState !== 'visible') return;
       if (timer !== undefined) clearTimeout(timer);
@@ -102,7 +139,7 @@ export function InviteBotButton({ guildId, inviteUrl }: { guildId: string; invit
       document.removeEventListener('visibilitychange', checkNow);
       window.removeEventListener('focus', checkNow);
     };
-  }, [waiting, attempt, guildId, router]);
+  }, [waiting, attempt, guildId, clientId, router]);
 
   return (
     <Button asChild variant="outline" className="w-full">

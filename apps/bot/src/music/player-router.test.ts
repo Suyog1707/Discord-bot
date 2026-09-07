@@ -41,6 +41,7 @@ function fakeBot(
 
   return {
     botId,
+    clientId: `app-${botId}`,
     destroyed,
     isInGuild: () => options.inGuild ?? true,
     music: {
@@ -163,7 +164,35 @@ describe('joinRoom', () => {
       fakeBot('b', { inGuild: false }),
     ]);
 
-    await expect(router.joinRoom(join('room-b'))).rejects.toThrow(/Add another player/iu);
+    await expect(router.joinRoom(join('room-b'))).rejects.toThrow(/Add \*\*b\*\*/u);
+  });
+
+  /** A dead end is a worse answer than a one-click fix. */
+  it('hands over an invite link for the player to add', async () => {
+    const router = new PlayerRouter([
+      fakeBot('a', { player: { voiceChannelId: 'room-a' } }),
+      fakeBot('b', { inGuild: false }),
+    ]);
+
+    await expect(router.joinRoom(join('room-b'))).rejects.toThrow(
+      /discord\.com\/oauth2\/authorize.*client_id=app-b/u,
+    );
+  });
+});
+
+describe('nextUninvited', () => {
+  it('names the first player the guild has not added', () => {
+    const router = new PlayerRouter([
+      fakeBot('a'),
+      fakeBot('b', { inGuild: false }),
+      fakeBot('c', { inGuild: false }),
+    ]);
+
+    expect(router.nextUninvited(GUILD)?.botId).toBe('b');
+  });
+
+  it('names nobody when the guild has them all', () => {
+    expect(new PlayerRouter([fakeBot('a')]).nextUninvited(GUILD)).toBeUndefined();
   });
 });
 

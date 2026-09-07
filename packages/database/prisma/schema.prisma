@@ -137,7 +137,12 @@ model Guild {
   name        String
   icon        String?
   ownerId     String?
-  /// Whether the bot is currently installed in this guild.
+  /// Whether the PRIMARY bot is installed in this guild.
+  ///
+  /// Deliberately still one boolean: it is what gates dashboard access, and
+  /// that question is about the bot people talk to, not about how many extra
+  /// players a server happens to have added. Per-player presence lives in
+  /// `GuildBot`.
   isActive    Boolean   @default(false)
   /// Cleared when the bot is removed; the row is retained for settings restore.
   botJoinedAt DateTime? @db.Timestamptz(3)
@@ -154,9 +159,60 @@ model Guild {
   playlists    Playlist[]
   songHistory  SongHistory[]
   tasteProfile TasteProfile?
+  bots         GuildBot[]
 
   @@index([botJoinedAt])
   @@map("guilds")
+}
+
+/// One Discord application this deployment logs in as.
+///
+/// Discord allows one voice connection per guild per token, so playing in
+/// several channels of one server at once means running as several
+/// applications. This is the roster of them — written by each client as it
+/// starts, so the dashboard can offer an invite for a player that has never
+/// joined anything yet.
+model PlayerBot {
+  id         String    @id @default(cuid())
+  /// Discord application id — what an invite URL needs.
+  clientId   String    @unique
+  /// Short name shown to admins, e.g. "main" or "player-2".
+  label      String
+  /// "primary" (has the slash commands) or "worker" (headless player).
+  role       String
+  lastSeenAt DateTime? @db.Timestamptz(3)
+  createdAt  DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt  DateTime  @updatedAt @db.Timestamptz(3)
+
+  @@map("player_bots")
+}
+
+/// Whether one player is in one guild.
+///
+/// `Guild.isActive` cannot express this: it is a single flag and says only
+/// whether the server has the bot at all. A server that has added two players
+/// and not the other five needs a row per player, which is also what tells the
+/// bot which invite to offer when every player it has is busy.
+///
+/// Deliberately no relation to `PlayerBot`: a guild event can arrive before
+/// the roster row is written, and a presence record that fails on ordering
+/// would be worse than one that stands alone.
+model GuildBot {
+  id          String    @id @default(cuid())
+  guildId     String
+  /// Discord application id of the player.
+  botClientId String
+  present     Boolean   @default(false)
+  joinedAt    DateTime? @db.Timestamptz(3)
+  leftAt      DateTime? @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(3)
+
+  guild Guild @relation(fields: [guildId], references: [id], onDelete: Cascade)
+
+  @@unique([guildId, botClientId])
+  @@index([guildId, present])
+  @@map("guild_bots")
 }
 
 /// Per-guild configuration, split from `Guild` so hot settings reads stay narrow.

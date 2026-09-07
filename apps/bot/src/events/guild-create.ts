@@ -22,7 +22,12 @@ export default defineEvent({
      * is absent from would open the dashboard for a bot that cannot take a
      * command.
      */
-    if (client.identity.role !== 'primary') return;
-    await client.services.guilds.ensureGuild(guild);
+    if (client.identity.role === 'primary') {
+      await client.services.guilds.ensureGuild(guild);
+    }
+    // Every player records its own presence, primary included: "which players
+    // does this server have?" is the question the invite prompt answers, and
+    // only a row per player can answer it.
+    await client.services.guilds.setBotPresence(guild.id, client.identity.clientId, true);
   },
 });

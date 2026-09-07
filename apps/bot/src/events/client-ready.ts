@@ -26,6 +26,25 @@ export default defineEvent({
       'Bot is ready',
     );
 
+    // The roster the dashboard offers invites from. Fire-and-forget: a player
+    // that cannot write it still plays.
+    void client.services.guilds
+      .registerBot({
+        clientId: client.identity.clientId,
+        label: client.identity.label,
+        role: client.identity.role,
+      })
+      // Presence for the servers this player was ALREADY in. `guildCreate`
+      // only fires on a fresh join, so without this a long-standing server
+      // would show every player as "not added" and offer invites for bots
+      // sitting in it.
+      .then(async () =>
+        client.services.guilds.syncBotPresence(client.identity.clientId, [
+          ...readyClient.guilds.cache.keys(),
+        ]),
+      )
+      .catch(() => undefined);
+
     readyClient.user.setPresence({
       status: 'online',
       activities: [{ name: '/play', type: ActivityType.Listening }],

@@ -10,7 +10,7 @@
  * Callers ask for a room and get a player. Which application is actually in
  * the channel is this module's business and nobody else's.
  */
-import { ValidationError } from '@discord-music/shared';
+import { botInviteUrl, ValidationError } from '@discord-music/shared';
 
 import { getLogger } from '../lib/logger.js';
 
@@ -30,6 +30,8 @@ const RECLAIM_GRACE_MS = 60_000;
 /** One player bot, as the router sees it. */
 export interface RouterBot {
   readonly botId: string;
+  /** Discord application id — what an invite URL for this player needs. */
+  readonly clientId: string;
   readonly music: MusicManager;
   /** Whether this application is a member of a guild. */
   isInGuild(guildId: string): boolean;
@@ -153,9 +155,20 @@ export class PlayerRouter {
     });
 
     if (allocation.kind === 'invite') {
+      // Name the player and hand over the link. "All busy, sorry" is a dead
+      // end; "all busy, here is the one-click fix" is not, and this is the one
+      // moment the multi-bot design becomes visible to anybody.
+      const next = this.nextUninvited(options.guildId);
       throw new ValidationError(
-        'Every player is busy in another channel right now. Add another player bot to this ' +
-          'server from the dashboard, and it can play here too.',
+        next === undefined
+          ? 'Every player is busy in another channel right now. Try again shortly.'
+          : `Every player is busy in another channel. Add **${next.botId}** to this server and ` +
+              `it can play here too:\n${botInviteUrl({
+                clientId: next.clientId,
+                guildId: options.guildId,
+                // A player registers no slash commands.
+                withCommands: false,
+              })}`,
       );
     }
     if (allocation.kind === 'full') {
@@ -232,6 +245,11 @@ export class PlayerRouter {
 
   /** Whether the guild could add a player it has not invited yet. */
   #hasUninvitedPlayers(guildId: string): boolean {
-    return this.#bots.some((bot) => !bot.isInGuild(guildId));
+    return this.nextUninvited(guildId) !== undefined;
+  }
+
+  /** The next player this guild has not added, in fleet order. */
+  nextUninvited(guildId: string): RouterBot | undefined {
+    return this.#bots.find((bot) => !bot.isInGuild(guildId));
   }
 }

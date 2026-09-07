@@ -1,3 +1,4 @@
+import { botInviteUrl } from '@discord-music/shared';
 import { Server } from 'lucide-react';
 import type { Metadata } from 'next';
 import Image from 'next/image';
@@ -16,15 +17,10 @@ export const metadata: Metadata = { title: 'Servers' };
 export const dynamic = 'force-dynamic';
 
 function inviteUrl(guildId: string): string {
-  const clientId = getEnv().DISCORD_CLIENT_ID;
-  const params = new URLSearchParams({
-    client_id: clientId,
-    scope: 'bot applications.commands',
-    // Connect, Speak, Send Messages, Embed Links, Read History, View Channels
-    permissions: '277083450688',
-    guild_id: guildId,
-  });
-  return `https://discord.com/oauth2/authorize?${params.toString()}`;
+  // Shared with the bot, which offers the same link in a voice channel when
+  // every player is busy — two copies of a permission integer is two chances
+  // to drift.
+  return botInviteUrl({ clientId: getEnv().DISCORD_CLIENT_ID, guildId });
 }
 
 export default async function ServersPage() {

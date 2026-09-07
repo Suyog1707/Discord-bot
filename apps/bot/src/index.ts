@@ -54,6 +54,7 @@ const routerBots: readonly RouterBot[] = fleet.flatMap((client) => {
   return [
     {
       botId: client.identity.label,
+      clientId: client.identity.clientId,
       music,
       isInGuild: (guildId: string) => client.guilds.cache.has(guildId),
     },

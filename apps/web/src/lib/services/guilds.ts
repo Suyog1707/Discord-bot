@@ -95,6 +95,23 @@ export interface ServerDetail {
    * hid the rest.
    */
   readonly rooms: readonly ServerRoom[];
+  /**
+   * Every player this deployment runs, and whether this server has added it.
+   *
+   * A server only needs a second player when somebody tries to play in a
+   * second channel, so most will show one present and the rest absent — the
+   * list exists so an admin who wants more can add them before hitting the
+   * limit rather than after.
+   */
+  readonly players: readonly ServerPlayer[];
+}
+
+/** One player bot, and whether this server has it. */
+export interface ServerPlayer {
+  readonly clientId: string;
+  readonly label: string;
+  readonly role: string;
+  readonly present: boolean;
 }
 
 export interface ServerRoom {
@@ -115,7 +132,7 @@ export async function getServerDetail(
   const { guild, summary } = await requireManagedGuild(userId, discordGuildId);
   const db = getDb();
 
-  const [settings, queues] = await Promise.all([
+  const [settings, queues, fleet, presence] = await Promise.all([
     db.guildSettings.upsert({
       where: { guildId: guild.id },
       update: {},
@@ -130,7 +147,14 @@ export async function getServerDetail(
       take: MAX_ROOMS,
       include: { tracks: { orderBy: { position: 'asc' } } },
     }),
+    db.playerBot.findMany({ orderBy: { createdAt: 'asc' } }),
+    db.guildBot.findMany({
+      where: { guildId: guild.id },
+      select: { botClientId: true, present: true },
+    }),
   ]);
+
+  const presentIds = new Set(presence.filter((row) => row.present).map((row) => row.botClientId));
 
   return {
     discordId: guild.discordId,
@@ -164,7 +188,44 @@ export async function getServerDetail(
         sourceKey: track.sourceKey,
       })),
     })),
+    players: fleet.map((bot) => ({
+      clientId: bot.clientId,
+      label: bot.label,
+      role: bot.role,
+      present: presentIds.has(bot.clientId),
+    })),
   };
+}
+
+/**
+ * Just the player roster and presence for one server.
+ *
+ * `getServerDetail` computes this too, but the invite button polls until a
+ * newly added player shows up and has no business pulling a whole queue back
+ * every three seconds to find out.
+ */
+export async function listServerPlayers(
+  userId: string,
+  discordGuildId: string,
+): Promise<readonly ServerPlayer[]> {
+  const { guild } = await requireManagedGuild(userId, discordGuildId);
+  const db = getDb();
+
+  const [fleet, presence] = await Promise.all([
+    db.playerBot.findMany({ orderBy: { createdAt: 'asc' } }),
+    db.guildBot.findMany({
+      where: { guildId: guild.id },
+      select: { botClientId: true, present: true },
+    }),
+  ]);
+  const presentIds = new Set(presence.filter((row) => row.present).map((row) => row.botClientId));
+
+  return fleet.map((bot) => ({
+    clientId: bot.clientId,
+    label: bot.label,
+    role: bot.role,
+    present: presentIds.has(bot.clientId),
+  }));
 }
 
 export const updateGuildSettingsSchema = z

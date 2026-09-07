@@ -20,6 +20,7 @@ export default defineEvent({
      * admin tidying up the member list — must not 404 the whole dashboard and
      * stop 24/7 restore for a server the primary is still happily playing in.
      */
+    await client.services.guilds.setBotPresence(guild.id, client.identity.clientId, false);
     if (client.identity.role !== 'primary') return;
     await client.services.guilds.markGuildLeft(guild.id);
   },

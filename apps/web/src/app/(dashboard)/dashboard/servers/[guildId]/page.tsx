@@ -1,4 +1,4 @@
-import { identityOf } from '@discord-music/shared';
+import { botInviteUrl, identityOf } from '@discord-music/shared';
 import { isAppError } from '@discord-music/shared';
 import type { Metadata } from 'next';
 import Image from 'next/image';
@@ -10,6 +10,7 @@ import { requireUserOrRedirect, withDiscordLink } from '@/lib/auth/session';
 import { formNumber, formString } from '@/lib/forms';
 import { guildIconUrl } from '@/lib/discord/cdn';
 import { getServerDetail, updateGuildSettings, type ServerRoom } from '@/lib/services/guilds';
+import { InviteBotButton } from '@/components/dashboard/invite-bot-button';
 import { LivePlayer } from '@/components/dashboard/live-player';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -157,6 +158,57 @@ export default async function ServerDetailPage({
               </CardContent>
             </Card>
           ))
+        )}
+
+        {detail.players.length > 1 && (
+          <Card>
+            <CardHeader>
+              <CardTitle>Players</CardTitle>
+              <CardDescription>
+                Discord lets one bot hold one voice channel per server, so playing in several
+                channels at once needs several bots. Add another only if you want a second channel
+                playing at the same time — one is enough for most servers.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="flex flex-col gap-3">
+              {detail.players.map((player) => (
+                <div
+                  key={player.clientId}
+                  className="flex flex-wrap items-center justify-between gap-3 text-sm"
+                >
+                  <div>
+                    <p className="font-medium">
+                      {player.label}
+                      {player.role === 'primary' && (
+                        <Badge variant="secondary" className="ml-2">
+                          Commands
+                        </Badge>
+                      )}
+                    </p>
+                    <p className="text-muted-foreground text-xs">
+                      {player.present ? 'In this server' : 'Not added yet'}
+                    </p>
+                  </div>
+                  {player.present ? (
+                    <Badge variant="success">Added</Badge>
+                  ) : (
+                    <InviteBotButton
+                      guildId={detail.discordId}
+                      clientId={player.clientId}
+                      inviteUrl={botInviteUrl({
+                        clientId: player.clientId,
+                        guildId: detail.discordId,
+                        // Only the primary registers slash commands; asking for
+                        // them on a player puts a permission in the consent
+                        // screen it will never use.
+                        withCommands: player.role === 'primary',
+                      })}
+                    />
+                  )}
+                </div>
+              ))}
+            </CardContent>
+          </Card>
         )}
 
         <Card>
