@@ -24,7 +24,7 @@ import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import type { UserPlaylist } from '../../services/spotify-service.js';
 import { queuedKeys, withoutQueued } from '../../music/queue-dedupe.js';
-import { requireMusic, requireVoiceContext } from '../../music/voice-context.js';
+import { requireMusic, requireRouter, requireVoiceContext } from '../../music/voice-context.js';
 
 const EMBED_COLOR = 0x1db954; // Spotify green
 const PAGE_SIZE = 10;
@@ -224,7 +224,7 @@ async function browsePlaylists(
               selected.spotifyId,
               getEnv().SPOTIFY_PLAYLIST_MAX_TRACKS,
             );
-            const player = await music.getOrCreatePlayer({
+            const player = await requireRouter(client).joinRoom({
               guildId: context.guildId,
               voiceChannelId: context.voiceChannelId,
               textChannelId: interaction.channelId,

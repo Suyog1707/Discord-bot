@@ -4,7 +4,7 @@ import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import {
   requireActivePlayer,
-  requireMusic,
+  requireRouter,
   requireVoiceContext,
 } from '../../music/voice-context.js';
 
@@ -19,11 +19,13 @@ export default defineCommand({
 
   async execute({ interaction }) {
     const client = interaction.client as BotClient;
-    const music = requireMusic(client);
+    const router = requireRouter(client);
     const context = requireVoiceContext(interaction);
-    requireActivePlayer(music, context);
+    requireActivePlayer(router, context);
 
-    await music.destroyPlayer(context.guildId);
+    // Only the caller's room leaves; any other channel this server has
+    // playing carries on untouched.
+    await router.leaveRoom(context.guildId, context.voiceChannelId);
     await interaction.editReply({ content: '👋 Disconnected.' });
   },
 });

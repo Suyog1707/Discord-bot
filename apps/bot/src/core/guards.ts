@@ -145,13 +145,22 @@ export async function checkDjAuthority(
   const member = interaction.member as GuildMember | null;
   if (member === null) return denied('Could not verify your permissions. Try again.');
 
-  const player = client.music?.getPlayer(guildId);
-  const botVoiceChannelId = player?.voiceChannelId ?? null;
-  const registry = client.music?.sessionDj;
+  /**
+   * The room the member is standing in, not "the guild's player" — with
+   * several channels playing at once there is no such thing, and asking the
+   * primary would judge this member against a different room's host and DJs.
+   */
+  const memberVoiceChannelId = member.voice.channelId;
+  const room =
+    memberVoiceChannelId === null
+      ? undefined
+      : client.router?.roomFor(guildId, memberVoiceChannelId);
+  const botVoiceChannelId = room?.player.voiceChannelId ?? null;
+  const registry = room?.music.sessionDj;
 
   const verdict = decideDjAuthority({
     memberId: member.id,
-    memberVoiceChannelId: member.voice.channelId,
+    memberVoiceChannelId,
     botVoiceChannelId,
     hasManageGuild: member.permissions.has(PermissionsBitField.Flags.ManageGuild),
     hostId: registry?.host(guildId) ?? null,

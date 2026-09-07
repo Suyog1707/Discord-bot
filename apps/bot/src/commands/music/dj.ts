@@ -4,8 +4,8 @@ import { PermissionFlagsBits } from 'discord.js';
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import {
-  requireActivePlayer,
-  requireMusic,
+  requireActiveRoom,
+  requireRouter,
   requireVoiceContext,
 } from '../../music/voice-context.js';
 
@@ -43,14 +43,17 @@ export default defineCommand({
 
   async execute({ interaction }) {
     const client = interaction.client as BotClient;
-    const music = requireMusic(client);
+    const router = requireRouter(client);
     const guildId = interaction.guildId ?? '';
+    const context = requireVoiceContext(interaction);
+    // The DJ registry lives on the bot serving this room, so grants in one
+    // channel say nothing about another.
+    const { player, music } = requireActiveRoom(router, context);
     const registry = music.sessionDj;
     const subcommand = interaction.options.getSubcommand(true);
 
     // Every subcommand is about the session in the bot's channel, so the
     // caller has to be in it — the same rule the DJ gate itself applies.
-    const player = requireActivePlayer(music, requireVoiceContext(interaction));
     const host = registry.host(guildId);
     const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild) === true;
 

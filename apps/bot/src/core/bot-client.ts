@@ -29,6 +29,7 @@ import { getEnv, getLavalinkNode, isDevelopment, isProduction } from '../config/
 import { getLogger, logger, type Logger } from '../lib/logger.js';
 import { PlayerCommandSubscriber } from '../music/command-subscriber.js';
 import { MusicManager } from '../music/music-manager.js';
+import type { PlayerRouter } from '../music/player-router.js';
 import { QueueStore } from '../music/queue-store.js';
 import { DislikesService } from '../services/dislikes-service.js';
 import { FavoritesService } from '../services/favorites-service.js';
@@ -119,6 +120,15 @@ export class BotClient extends Client {
    * development). Commands go through `requireMusic()` for a friendly error.
    */
   readonly music: MusicManager | undefined;
+
+  /**
+   * The fleet, seen as one bot.
+   *
+   * Assigned after construction by the entry point, because it spans every
+   * client and none of them can build it alone. Undefined when Lavalink is not
+   * configured, exactly as `music` is.
+   */
+  router: PlayerRouter | undefined;
 
   /**
    * Intent parsing, taste and recommendations. Always present — with nothing
@@ -327,10 +337,10 @@ export class BotClient extends Client {
    */
   async #startCommandSubscriber(): Promise<void> {
     const redisUrl = getEnv().REDIS_URL;
-    if (this.#redis === undefined || redisUrl === undefined || this.music === undefined) return;
+    if (this.#redis === undefined || redisUrl === undefined || this.router === undefined) return;
 
     try {
-      this.#commandSubscriber = new PlayerCommandSubscriber(redisUrl, this.music);
+      this.#commandSubscriber = new PlayerCommandSubscriber(redisUrl, this.router);
       await this.#commandSubscriber.start();
     } catch (error) {
       this.logger.warn({ err: error }, 'Dashboard command subscriber failed to start');

@@ -25,8 +25,11 @@ export default defineCommand({
     const enabled = interaction.options.getBoolean('enabled') ?? !settings.stayConnected;
     await client.services.guilds.updateSettings(guildId, { stayConnected: enabled });
 
-    // Apply to a live player immediately; otherwise it takes effect on join.
-    client.music?.getPlayer(guildId)?.setStayConnected(enabled);
+    // 24/7 is a server setting, so it applies to every room this server
+    // currently has playing; otherwise it takes effect on the next join.
+    for (const room of client.router?.roomsIn(guildId) ?? []) {
+      room.player.setStayConnected(enabled);
+    }
 
     await interaction.editReply({
       content: enabled

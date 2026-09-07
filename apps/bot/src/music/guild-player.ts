@@ -249,6 +249,15 @@ export class GuildPlayer {
    * the voice-state event keeps it current.
    */
   #listenersPresent = true;
+  /**
+   * When the room last emptied, or null while somebody is in it.
+   *
+   * The router reclaims idle players for other channels, and "empty right now"
+   * is too eager a test: a channel is momentarily empty in the middle of a mass
+   * move. This is what lets a reclaim wait for the room to have been empty for
+   * a while rather than for an instant.
+   */
+  #emptySince: number | null = null;
 
   /**
    * Set only when THIS class paused because the room emptied, so an arriving
@@ -433,6 +442,11 @@ export class GuildPlayer {
   /** Whether a non-bot member is currently in the bot's voice channel. */
   get hasListeners(): boolean {
     return this.#listenersPresent;
+  }
+
+  /** Epoch ms since the room emptied, or null while it has listeners. */
+  get emptySince(): number | null {
+    return this.#emptySince;
   }
 
   get stayConnected(): boolean {
@@ -761,6 +775,7 @@ export class GuildPlayer {
 
     if (this.#listenersPresent === listenersPresent) return;
     this.#listenersPresent = listenersPresent;
+    this.#emptySince = listenersPresent ? null : Date.now();
 
     void this.#applyOccupancy(listenersPresent).catch((error: unknown) => {
       this.#logger.warn({ err: error, listenersPresent }, 'Occupancy change handling failed');

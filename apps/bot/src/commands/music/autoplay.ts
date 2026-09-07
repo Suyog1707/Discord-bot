@@ -5,7 +5,7 @@ import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import {
   requireActivePlayer,
-  requireMusic,
+  requireRouter,
   requireVoiceContext,
 } from '../../music/voice-context.js';
 
@@ -43,8 +43,8 @@ export default defineCommand({
     if (subcommand === 'claim') {
       // Changing whose taste a shared radio follows is a voice action: the
       // claimant must be in the channel the music is playing in.
-      const music = requireMusic(client);
-      const player = requireActivePlayer(music, requireVoiceContext(interaction));
+      const router = requireRouter(client);
+      const player = requireActivePlayer(router, requireVoiceContext(interaction));
       player.setListener(interaction.user.id);
       await interaction.editReply({
         content: `🎧 Autoplay now follows **${interaction.user.username}**'s taste.`,

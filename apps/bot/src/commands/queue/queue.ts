@@ -4,7 +4,7 @@ import { EmbedBuilder } from 'discord.js';
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import { formatTrackDuration, trackLink } from '../../music/track.js';
-import { requireMusic } from '../../music/voice-context.js';
+import { requireRouter, resolveRoomPlayer } from '../../music/voice-context.js';
 
 const PAGE_SIZE = 10;
 
@@ -21,8 +21,8 @@ export default defineCommand({
 
   async execute({ interaction }) {
     const client = interaction.client as BotClient;
-    const music = requireMusic(client);
-    const player = interaction.guildId === null ? undefined : music.getPlayer(interaction.guildId);
+    const router = requireRouter(client);
+    const player = resolveRoomPlayer(router, interaction);
 
     if (
       player === undefined ||

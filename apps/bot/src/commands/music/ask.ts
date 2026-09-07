@@ -16,7 +16,12 @@ import { EmbedBuilder, MessageFlags, PermissionFlagsBits } from 'discord.js';
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import { formatTrackDuration, trackLink } from '../../music/track.js';
-import { requireMusic, requireVoiceContext } from '../../music/voice-context.js';
+import {
+  requireMusic,
+  requireRouter,
+  requireVoiceContext,
+  resolveRoomPlayer,
+} from '../../music/voice-context.js';
 
 /** Beyond this a single reply cannot usefully describe what was queued. */
 const PREVIEW_TRACKS = 5;
@@ -59,7 +64,8 @@ export default defineCommand({
 
     // Seed from what the room is already listening to, so "more like this"
     // has a "this" to work from.
-    const existing = music.getPlayer(guildId);
+    const router = requireRouter(client);
+    const existing = resolveRoomPlayer(router, interaction);
     const seeds = [existing?.queue.current, ...(existing?.queue.tracks.slice(-3) ?? [])]
       .filter((track): track is NonNullable<typeof track> => track != null)
       .map((track) => ({
@@ -92,7 +98,7 @@ export default defineCommand({
     }
 
     const context = requireVoiceContext(interaction);
-    const player = await music.getOrCreatePlayer({
+    const player = await router.joinRoom({
       guildId: context.guildId,
       voiceChannelId: context.voiceChannelId,
       textChannelId: interaction.channelId,

@@ -15,17 +15,17 @@ import {
 import { closeRedis, createRedisClient, type Redis } from '@discord-music/shared/redis';
 
 import { getLogger } from '../lib/logger.js';
-import type { MusicManager } from './music-manager.js';
+import type { PlayerRouter } from './player-router.js';
 
 const logger = getLogger('player-commands');
 
 export class PlayerCommandSubscriber {
   readonly #subscriber: Redis;
-  readonly #music: MusicManager;
+  readonly #router: PlayerRouter;
 
-  constructor(redisUrl: string, music: MusicManager) {
+  constructor(redisUrl: string, router: PlayerRouter) {
     this.#subscriber = createRedisClient({ url: redisUrl, logger });
-    this.#music = music;
+    this.#router = router;
   }
 
   async start(): Promise<void> {
@@ -54,11 +54,28 @@ export class PlayerCommandSubscriber {
   }
 
   async #apply(command: PlayerCommand): Promise<void> {
-    const player = this.#music.getPlayer(command.guildId);
-    if (player === undefined) {
+    /**
+     * Which room the dashboard meant.
+     *
+     * Commands do not carry a voice channel yet, so a guild with one room is
+     * unambiguous and a guild with several cannot be served safely — applying
+     * to an arbitrary one would let a dashboard open on room A pause room B.
+     * Refusing is the honest answer until the protocol carries the room.
+     */
+    const rooms = this.#router.roomsIn(command.guildId);
+    if (rooms.length > 1) {
+      logger.warn(
+        { guildId: command.guildId, action: command.action, rooms: rooms.length },
+        'Dashboard command for a guild playing in several channels; ignored until commands name a room',
+      );
+      return;
+    }
+    const room = rooms[0];
+    if (room === undefined) {
       logger.debug({ command }, 'Command for guild without an active player; ignored');
       return;
     }
+    const player = room.player;
 
     logger.info(
       { guildId: command.guildId, action: command.action, issuedBy: command.issuedBy },
@@ -104,7 +121,7 @@ export class PlayerCommandSubscriber {
         // room. Only somebody in this session — its owner or a requester —
         // gets to pull a song out of everyone's queue and skip it. Anyone
         // else's dislike still shapes their own recommendations next time.
-        if (!this.#music.isSessionListener(command.guildId, command.issuedBy)) {
+        if (!room.music.isSessionListener(command.guildId, command.issuedBy)) {
           logger.info(
             { guildId: command.guildId, issuedBy: command.issuedBy },
             'Dislike from someone outside the session; stored only',
@@ -124,13 +141,13 @@ export class PlayerCommandSubscriber {
             identityOf(current.author, current.title).key === command.trackKey)
             ? current
             : null;
-        this.#music.applyDislike(command.guildId, playing ?? { trackKey: command.trackKey });
+        room.music.applyDislike(command.guildId, playing ?? { trackKey: command.trackKey });
         if (command.skipIfPlaying && playing !== null) await player.skip();
         return;
       }
       case 'undislike':
-        if (!this.#music.isSessionListener(command.guildId, command.issuedBy)) return;
-        this.#music.forgetDislike(command.guildId, command.trackKey);
+        if (!room.music.isSessionListener(command.guildId, command.issuedBy)) return;
+        room.music.forgetDislike(command.guildId, command.trackKey);
         return;
       case 'sync-settings':
         if (command.stayConnected !== undefined) player.setStayConnected(command.stayConnected);

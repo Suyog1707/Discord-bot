@@ -7,6 +7,7 @@ import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import {
   requireActivePlayer,
   requireMusic,
+  requireRouter,
   requireVoiceContext,
 } from '../../music/voice-context.js';
 
@@ -52,8 +53,7 @@ export default defineCommand({
     const user = interaction.user;
 
     if (subcommand === 'add') {
-      const music = requireMusic(client);
-      const player = requireActivePlayer(music, requireVoiceContext(interaction));
+      const player = requireActivePlayer(requireRouter(client), requireVoiceContext(interaction));
       const track = player.queue.current;
       if (track === null) throw new NotFoundError('Nothing is playing to save.');
 
@@ -102,13 +102,14 @@ export default defineCommand({
 
     // play
     const music = requireMusic(client);
+    const router = requireRouter(client);
     const context = requireVoiceContext(interaction);
     const favorites = await client.services.favorites.list(user.id, PLAY_BATCH);
     if (favorites.length === 0) {
       throw new NotFoundError('You have no favorites yet — save one with `/favorite add`.');
     }
 
-    const player = await music.getOrCreatePlayer({
+    const player = await router.joinRoom({
       guildId: context.guildId,
       voiceChannelId: context.voiceChannelId,
       textChannelId: interaction.channelId,

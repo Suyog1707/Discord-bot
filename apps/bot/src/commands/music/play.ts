@@ -11,7 +11,7 @@ import {
   type SpotifySearchKind,
 } from '../../music/spotify-resolver.js';
 import { formatTrackDuration, trackLink } from '../../music/track.js';
-import { requireMusic, requireVoiceContext } from '../../music/voice-context.js';
+import { requireMusic, requireRouter, requireVoiceContext } from '../../music/voice-context.js';
 
 /** Discord caps choice names and values at 100 characters. */
 function clip(value: string, max = 100): string {
@@ -189,7 +189,11 @@ export default defineCommand({
 
     // Whether the bot was already in voice decides how a failed lookup is
     // cleaned up below — check before the join can create a player.
-    const alreadyConnected = music.getPlayer(context.guildId) !== undefined;
+    const router = requireRouter(client);
+    // The caller's OWN room — another channel in this server being busy
+    // says nothing about whether this one was already connected.
+    const alreadyConnected =
+      router.playerFor(context.guildId, context.voiceChannelId) !== undefined;
 
     // Track lookup and joining voice are independent — the gateway round-trip
     // for the voice connection is dead time if it waits for the search.
@@ -204,7 +208,7 @@ export default defineCommand({
       },
       source,
     );
-    const joining = music.getOrCreatePlayer({
+    const joining = router.joinRoom({
       guildId: context.guildId,
       voiceChannelId: context.voiceChannelId,
       textChannelId: interaction.channelId,

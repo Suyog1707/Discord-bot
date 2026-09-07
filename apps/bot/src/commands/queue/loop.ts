@@ -5,7 +5,7 @@ import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import {
   requireActivePlayer,
-  requireMusic,
+  requireRouter,
   requireVoiceContext,
 } from '../../music/voice-context.js';
 
@@ -33,8 +33,8 @@ export default defineCommand({
 
   async execute({ interaction }) {
     const client = interaction.client as BotClient;
-    const music = requireMusic(client);
-    const player = requireActivePlayer(music, requireVoiceContext(interaction));
+    const router = requireRouter(client);
+    const player = requireActivePlayer(router, requireVoiceContext(interaction));
 
     const mode = interaction.options.getString('mode', true) as LoopMode;
     player.setLoopMode(mode);

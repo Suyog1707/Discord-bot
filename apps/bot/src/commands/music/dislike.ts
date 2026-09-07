@@ -12,8 +12,8 @@ import { EmbedBuilder } from 'discord.js';
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import {
-  requireActivePlayer,
-  requireMusic,
+  requireActiveRoom,
+  requireRouter,
   requireVoiceContext,
 } from '../../music/voice-context.js';
 
@@ -95,8 +95,10 @@ export default defineCommand({
 
     // add — a database write plus a Lavalink skip, both well past Discord's
     // three-second window. The framework has already acknowledged.
-    const music = requireMusic(client);
-    const player = requireActivePlayer(music, requireVoiceContext(interaction));
+    const { player, music } = requireActiveRoom(
+      requireRouter(client),
+      requireVoiceContext(interaction),
+    );
     const number = interaction.options.getInteger('number');
     const target =
       number === null ? player.queue.current : (player.queue.upcoming[number - 1] ?? null);

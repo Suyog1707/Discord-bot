@@ -3,7 +3,7 @@
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import { renderNowPlaying } from '../../music/now-playing-view.js';
-import { requireMusic } from '../../music/voice-context.js';
+import { requireRouter, resolveRoomPlayer } from '../../music/voice-context.js';
 
 export default defineCommand({
   data: new SlashCommandBuilder()
@@ -15,8 +15,8 @@ export default defineCommand({
 
   async execute({ interaction }) {
     const client = interaction.client as BotClient;
-    const music = requireMusic(client);
-    const player = interaction.guildId === null ? undefined : music.getPlayer(interaction.guildId);
+    const router = requireRouter(client);
+    const player = resolveRoomPlayer(router, interaction);
 
     if (player?.queue.current == null) {
       await interaction.editReply({ content: 'Nothing is playing.' });

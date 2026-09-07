@@ -5,7 +5,7 @@ import { EmbedBuilder } from 'discord.js';
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import { fetchLyrics } from '../../music/lyrics.js';
-import { requireMusic } from '../../music/voice-context.js';
+import { requireRouter, resolveRoomPlayer } from '../../music/voice-context.js';
 
 export default defineCommand({
   data: new SlashCommandBuilder()
@@ -17,8 +17,8 @@ export default defineCommand({
 
   async execute({ interaction }) {
     const client = interaction.client as BotClient;
-    const music = requireMusic(client);
-    const player = interaction.guildId === null ? undefined : music.getPlayer(interaction.guildId);
+    const router = requireRouter(client);
+    const player = resolveRoomPlayer(router, interaction);
     const current = player?.queue.current ?? null;
     if (current === null) throw new NotFoundError('Nothing is playing.');
 

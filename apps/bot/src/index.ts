@@ -12,6 +12,7 @@ import { RestError } from 'shoukaku';
 
 import { getEnv } from './config/env.js';
 import { BotClient } from './core/bot-client.js';
+import { PlayerRouter, type RouterBot } from './music/player-router.js';
 import { logger } from './lib/logger.js';
 
 // Validate configuration before anything else, so a missing variable is
@@ -38,6 +39,28 @@ const workers = env.BOT_FLEET.map(
     }),
 );
 const fleet = [primary, ...workers];
+
+/**
+ * One router over every player, shared by all of them.
+ *
+ * It spans the fleet, so no single client can build it — and every client
+ * needs it, because a command arriving at the primary may be about a room a
+ * worker is serving. Clients whose Lavalink is unconfigured have no manager
+ * and simply do not appear as players.
+ */
+const routerBots: readonly RouterBot[] = fleet.flatMap((client) => {
+  const music = client.music;
+  if (music === undefined) return [];
+  return [
+    {
+      botId: client.identity.label,
+      music,
+      isInGuild: (guildId: string) => client.guilds.cache.has(guildId),
+    },
+  ];
+});
+const router = new PlayerRouter(routerBots);
+for (const client of fleet) client.router = router;
 
 /** Signals that should trigger a graceful shutdown. */
 const SHUTDOWN_SIGNALS = ['SIGINT', 'SIGTERM'] as const;

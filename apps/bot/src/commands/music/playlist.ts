@@ -21,6 +21,7 @@ import { formatTrackDuration } from '../../music/track.js';
 import {
   requireActivePlayer,
   requireMusic,
+  requireRouter,
   requireVoiceContext,
 } from '../../music/voice-context.js';
 
@@ -306,8 +307,10 @@ export default defineCommand({
 
         let track: QueuedTrack;
         if (query === undefined || query === '') {
-          const music = requireMusic(client);
-          const player = requireActivePlayer(music, requireVoiceContext(interaction));
+          const player = requireActivePlayer(
+            requireRouter(client),
+            requireVoiceContext(interaction),
+          );
           const current = player.queue.current;
           if (current === null) {
             throw new NotFoundError('Nothing is playing — pass a `query` to search instead.');
@@ -346,6 +349,7 @@ export default defineCommand({
       case 'play':
       case 'shuffle': {
         const music = requireMusic(client);
+        const router = requireRouter(client);
         const context = requireVoiceContext(interaction);
         const playlist = await playlists.resolve(ref, interaction.options.getString('name', true));
         const stored = await playlists.tracks(playlist.id);
@@ -353,7 +357,7 @@ export default defineCommand({
           throw new NotFoundError(`**${playlist.name}** is empty.`);
         }
 
-        const player = await music.getOrCreatePlayer({
+        const player = await router.joinRoom({
           guildId: context.guildId,
           voiceChannelId: context.voiceChannelId,
           textChannelId: interaction.channelId,
