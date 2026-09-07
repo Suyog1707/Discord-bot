@@ -21,6 +21,8 @@ import {
   createRedisClient,
   type Redis,
 } from '@discord-music/shared/redis';
+import { randomUUID } from 'node:crypto';
+
 import { Client, GatewayIntentBits, Options, Partials } from 'discord.js';
 
 import { getEnv, getLavalinkNode, isDevelopment, isProduction } from '../config/env.js';
@@ -62,7 +64,41 @@ const INTENTS = [
   GatewayIntentBits.GuildMessages,
 ] as const;
 
+/**
+ * A worker announces nothing and reads no messages — it exists to hold a voice
+ * connection — so it asks for the minimum Discord will let it have.
+ */
+const WORKER_INTENTS = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] as const;
+
+/**
+ * Which Discord application this client logs in as.
+ *
+ * Discord allows one voice connection per guild per *token*, so playing in
+ * several channels of one server at once means running as several
+ * applications. The primary is the one users interact with: it owns the slash
+ * commands and the dashboard command channel. A worker is a headless player
+ * the primary hands a channel to.
+ */
+export interface BotIdentity {
+  readonly token: string;
+  /** Application id — slash-command deployment and invite links. */
+  readonly clientId: string;
+  /** Short name for logs, e.g. "main" or "player-2". */
+  readonly label: string;
+  readonly role: 'primary' | 'worker';
+}
+
 export class BotClient extends Client {
+  /** Which application this client is. */
+  readonly identity: BotIdentity;
+  /**
+   * Per-client run id.
+   *
+   * Was process-wide, which was fine when a process was one bot. With a fleet
+   * it has to be per client, or the "is a second bot running on this token?"
+   * diagnostic reports every player under one id and answers nothing.
+   */
+  readonly instanceId: string = randomUUID().slice(0, 8);
   readonly commands = new CommandRegistry();
   readonly events = new EventRegistry();
   readonly logger: Logger = logger;
@@ -106,9 +142,16 @@ export class BotClient extends Client {
   #commandSubscriber: PlayerCommandSubscriber | undefined;
   #shuttingDown = false;
 
-  constructor() {
+  constructor(identity?: BotIdentity) {
+    const resolved: BotIdentity = identity ?? {
+      token: getEnv().BOT_TOKEN,
+      clientId: getEnv().BOT_CLIENT_ID,
+      label: 'main',
+      role: 'primary',
+    };
+
     super({
-      intents: [...INTENTS],
+      intents: resolved.role === 'worker' ? [...WORKER_INTENTS] : [...INTENTS],
       partials: [Partials.Channel, Partials.GuildMember],
       // Cache only what the bot reads. Message/reaction caches would grow unbounded.
       makeCache: Options.cacheWithLimits({
@@ -120,6 +163,7 @@ export class BotClient extends Client {
       allowedMentions: { parse: ['users'], repliedUser: false },
     });
 
+    this.identity = resolved;
     const env = getEnv();
 
     this.prisma = getPrismaClient({
@@ -188,7 +232,22 @@ export class BotClient extends Client {
       spotify: this.services.spotify,
       ...(this.#redis && { redis: this.#redis }),
     });
-    this.music?.attachAutoplay(this.ai.autoplay, this.ai.orchestrator, this.ai.planner);
+    /**
+     * Only the primary wires autoplay for now.
+     *
+     * `planner.setResolvers` and `orchestrator.setResolver` are single-slot
+     * setters on shared objects, so several managers calling `attachAutoplay`
+     * would leave whichever ran last owning every room's resolution — and
+     * `presentListeners` in particular would then report the audience of one
+     * arbitrary bot's channel for every room, personalising each room around
+     * the wrong people. That is silent and would be near-impossible to spot in
+     * logs. The router stage replaces these bound closures with a per-room
+     * lookup; until then a worker's manager simply has no autoplay, which is
+     * safe because it serves no rooms yet.
+     */
+    if (this.identity.role === 'primary') {
+      this.music?.attachAutoplay(this.ai.autoplay, this.ai.orchestrator, this.ai.planner);
+    }
   }
 
   /**
@@ -208,15 +267,29 @@ export class BotClient extends Client {
       ? join(moduleDirectory, '..', 'events')
       : join(moduleDirectory, 'events');
 
-    await this.commands.loadFrom(commandsDirectory);
+    // A worker registers no slash commands with Discord, so loading them would
+    // only build a registry nothing can ever reach. It still needs the event
+    // handlers — voice state changes are how its own player learns the room
+    // emptied.
+    if (this.identity.role === 'primary') {
+      await this.commands.loadFrom(commandsDirectory);
+    }
     await this.events.loadFrom(eventsDirectory);
     this.events.attach(this);
 
     await this.#verifyDependencies();
     await this.#connect();
-    await this.#startCommandSubscriber();
+    // Only the primary listens for dashboard commands. Every bot subscribing
+    // would mean N handlers racing one instruction, and it would break the
+    // publisher's subscriber-count check for whether the bot is online at all.
+    if (this.identity.role === 'primary') {
+      await this.#startCommandSubscriber();
+    }
 
-    this.logger.info({ durationMs: Date.now() - startedAt }, 'Bot startup complete');
+    this.logger.info(
+      { durationMs: Date.now() - startedAt, player: this.identity.label },
+      'Bot startup complete',
+    );
   }
 
   /**
@@ -230,11 +303,12 @@ export class BotClient extends Client {
    */
   async #connect(): Promise<void> {
     try {
-      await this.login(getEnv().BOT_TOKEN);
+      await this.login(this.identity.token);
     } catch (error) {
       if (isInvalidTokenError(error)) {
         throw new ConfigurationError(
-          'BOT_TOKEN is not a valid Discord bot token. Copy it from ' +
+          `The token for player "${this.identity.label}" is not a valid Discord bot token. ` +
+            'Copy it from ' +
             'https://discord.com/developers/applications → your application → Bot → Reset Token, ' +
             'then set BOT_TOKEN in .env and re-run `pnpm run check:env`.',
           { cause: error },
@@ -376,11 +450,14 @@ export class BotClient extends Client {
       });
     }
 
+    // Prisma is deliberately absent: `getPrismaClient` is a process-wide
+    // singleton, so a client disconnecting it would pull the database out from
+    // under every other player in the fleet. The entry point owns it and
+    // disconnects once, after everyone has stopped.
     const results = await Promise.allSettled([
       this.destroy(),
       this.#redis === undefined ? Promise.resolve() : closeRedis(this.#redis),
       this.#commandSubscriber === undefined ? Promise.resolve() : this.#commandSubscriber.stop(),
-      this.prisma.$disconnect(),
     ]);
 
     for (const result of results) {
@@ -389,6 +466,6 @@ export class BotClient extends Client {
       }
     }
 
-    this.logger.info('Shutdown complete');
+    this.logger.info({ player: this.identity.label }, 'Shutdown complete');
   }
 }

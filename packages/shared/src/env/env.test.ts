@@ -65,6 +65,59 @@ describe('botEnvSchema', () => {
     expect(env.BOT_DEV_GUILD_ID).toBe('987654321098765432');
   });
 
+  describe('BOT_FLEET', () => {
+    const entry = { token: 'tok-2', clientId: '987654321098765432', label: 'player-2' };
+
+    /** Unset is the single-bot deployment every server runs today. */
+    it('defaults to no extra players', () => {
+      expect(parseEnv(botEnvSchema, validBotEnv, 'apps/bot').BOT_FLEET).toEqual([]);
+    });
+
+    it('treats a blank value as no extra players', () => {
+      const env = parseEnv(botEnvSchema, { ...validBotEnv, BOT_FLEET: '   ' }, 'apps/bot');
+      expect(env.BOT_FLEET).toEqual([]);
+    });
+
+    it('parses a JSON array of players', () => {
+      const env = parseEnv(
+        botEnvSchema,
+        { ...validBotEnv, BOT_FLEET: JSON.stringify([entry]) },
+        'apps/bot',
+      );
+      expect(env.BOT_FLEET).toEqual([entry]);
+    });
+
+    /**
+     * A fleet that silently parses to nothing would present as "the second
+     * channel just doesn't work", with nothing in the logs to explain it.
+     */
+    it('rejects malformed JSON rather than falling back to one bot', () => {
+      expect(() =>
+        parseEnv(botEnvSchema, { ...validBotEnv, BOT_FLEET: '[{oops' }, 'apps/bot'),
+      ).toThrow(ConfigurationError);
+    });
+
+    it('rejects an entry with a bad client id', () => {
+      expect(() =>
+        parseEnv(
+          botEnvSchema,
+          { ...validBotEnv, BOT_FLEET: JSON.stringify([{ ...entry, clientId: 'nope' }]) },
+          'apps/bot',
+        ),
+      ).toThrow(/Must be a valid Discord ID/u);
+    });
+
+    it('rejects an entry with no token', () => {
+      expect(() =>
+        parseEnv(
+          botEnvSchema,
+          { ...validBotEnv, BOT_FLEET: JSON.stringify([{ ...entry, token: '' }]) },
+          'apps/bot',
+        ),
+      ).toThrow(/needs a token/u);
+    });
+  });
+
   it('rejects a non-snowflake BOT_CLIENT_ID', () => {
     expect(() => parseEnv(botEnvSchema, { ...validBotEnv, BOT_CLIENT_ID: 'nope' })).toThrow(
       ConfigurationError,

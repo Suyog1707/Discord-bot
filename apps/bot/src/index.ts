@@ -6,6 +6,7 @@
  *   2. Construct and start the client (env is validated on first import).
  *   3. Shut down cleanly on SIGINT/SIGTERM so Docker and systemd restarts are graceful.
  */
+import { getPrismaClient } from '@discord-music/database';
 import { isAppError } from '@discord-music/shared';
 import { RestError } from 'shoukaku';
 
@@ -15,9 +16,28 @@ import { logger } from './lib/logger.js';
 
 // Validate configuration before anything else, so a missing variable is
 // reported immediately rather than after connections have been opened.
-getEnv();
+const env = getEnv();
 
-const client = new BotClient();
+/**
+ * The fleet: the primary, then one client per extra player.
+ *
+ * Discord allows one voice connection per guild per token, so a server playing
+ * in several channels at once needs one application per room. The primary is
+ * the bot users talk to; the rest are headless players it can hand a channel
+ * to. With `BOT_FLEET` unset this is a single client and the process behaves
+ * exactly as it always has.
+ */
+const primary = new BotClient();
+const workers = env.BOT_FLEET.map(
+  (entry) =>
+    new BotClient({
+      token: entry.token,
+      clientId: entry.clientId,
+      label: entry.label,
+      role: 'worker',
+    }),
+);
+const fleet = [primary, ...workers];
 
 /** Signals that should trigger a graceful shutdown. */
 const SHUTDOWN_SIGNALS = ['SIGINT', 'SIGTERM'] as const;
@@ -33,7 +53,16 @@ async function shutdown(reason: string, exitCode: number): Promise<void> {
   // Do not keep the event loop alive purely for this timer.
   timeout.unref();
 
-  await client.shutdown(reason);
+  // Every client stops before the database does. Prisma is a process-wide
+  // singleton, so a client disconnecting it on its own way out would pull the
+  // pool from under the players still shutting down.
+  await Promise.allSettled(fleet.map((client) => client.shutdown(reason)));
+  await getPrismaClient({ databaseUrl: env.DATABASE_URL })
+    .$disconnect()
+    .catch((error: unknown) => {
+      logger.warn({ err: error }, 'Database disconnect failed during shutdown');
+    });
+
   clearTimeout(timeout);
   process.exit(exitCode);
 }
@@ -95,7 +124,17 @@ process.on('uncaughtException', (error) => {
 });
 
 try {
-  await client.start();
+  // Sequentially, so a bad token names itself instead of arriving in a pile of
+  // concurrent failures — and so the primary is up before any player is.
+  for (const client of fleet) {
+    await client.start();
+  }
+  if (workers.length > 0) {
+    logger.info(
+      { players: workers.length + 1, labels: fleet.map((client) => client.identity.label) },
+      'Fleet ready',
+    );
+  }
 } catch (error) {
   // Configuration errors are the operator's problem, not a crash — print the
   // actionable message without a stack trace.

@@ -7,20 +7,9 @@
  * choosing the correct response verb for the current state, and treating a dead
  * interaction as terminal rather than something to retry into a second failure.
  */
-import { randomUUID } from 'node:crypto';
-
 import { MessageFlags, type ChatInputCommandInteraction, type Interaction } from 'discord.js';
 
 import type { Logger } from '../lib/logger.js';
-
-/**
- * Identifies this process in logs.
- *
- * Two bots sharing a token, or a stale `dist/` running beside `tsx watch`, look
- * identical in the logs until the lines carry the process they came from. A
- * duplicate interaction id reported under two different ids is the proof.
- */
-export const INSTANCE_ID = randomUUID().slice(0, 8);
 
 /** Interaction ids already dispatched, newest last so the oldest evicts first. */
 const claimedInteractions = new Set<string>();

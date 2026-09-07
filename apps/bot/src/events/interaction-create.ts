@@ -15,7 +15,6 @@ import { runGuards } from '../core/guards.js';
 import {
   acknowledge,
   claimInteraction,
-  INSTANCE_ID,
   rejectGuard,
   replyWithError,
 } from '../core/interaction-response.js';
@@ -266,7 +265,7 @@ export default defineEvent({
         {
           interactionId: interaction.id,
           command: interaction.commandName,
-          instanceId: INSTANCE_ID,
+          instanceId: client.instanceId,
           pid: process.pid,
         },
         'Duplicate dispatch for the same interaction id — dropping. ' +
