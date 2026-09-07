@@ -26,6 +26,7 @@ import type {
 } from './recommender.js';
 import type { Candidate, ScoredCandidate } from './scoring.js';
 import { AutoplaySessionStore, type SessionEntry } from './session.js';
+import { roomRefOf } from './room.js';
 import {
   EMPTY_RECENT_CONTEXT,
   EMPTY_TASTE_PROFILE,
@@ -33,6 +34,9 @@ import {
   type TasteProfile,
   type UserTasteService,
 } from './taste.js';
+
+/** Autoplay is scoped to a voice channel now; one room stands in for the old guild. */
+const ROOM = roomRefOf('guild', 'vc-1');
 
 /* ---------------------------------------------------------------- the clock */
 
@@ -212,10 +216,10 @@ function harness(options: {
   const artistTags = vi.fn(() => Promise.resolve([] as readonly string[]));
   const recommender = { rank, artistTags } as unknown as RecommendationService;
 
-  const resolveKnown = vi.fn((candidate: FamiliarCandidate) =>
+  const resolveKnown = vi.fn((_room: unknown, candidate: FamiliarCandidate) =>
     Promise.resolve(playable(candidate.artist, candidate.title)),
   );
-  const resolveDiscovery = vi.fn((candidate: { title: string; artist: string }) =>
+  const resolveDiscovery = vi.fn((_room: unknown, candidate: { title: string; artist: string }) =>
     Promise.resolve(playable(candidate.artist, candidate.title)),
   );
 
@@ -245,7 +249,7 @@ const LISTENER_ID = '111111111111111111';
  * the session can name, so every dislike test needs one.
  */
 async function withListener(session: AutoplaySessionStore): Promise<void> {
-  await session.syncQueue('guild', [
+  await session.syncQueue(ROOM.roomId, [
     entryOf(playable('Requester', 'Their Own Pick'), {
       origin: 'user',
       requestedById: LISTENER_ID,
@@ -269,9 +273,9 @@ async function playThrough(
 ): Promise<readonly (readonly QueuedTrack[])[]> {
   const cycles: (readonly QueuedTrack[])[] = [];
   for (let batch = 0; batch < batches; batch += 1) {
-    const generated = await h.planner.generate('guild', seeds, count, { background: false });
+    const generated = await h.planner.generate(ROOM, seeds, count, { background: false });
     for (const entry of generated) {
-      await h.session.recordPlayed('guild', {
+      await h.session.recordPlayed(ROOM.roomId, {
         ...entryOf(entry.track),
         origin: 'autoplay',
         ...(entry.track.autoplayKind === undefined ? {} : { kind: entry.track.autoplayKind }),
@@ -496,7 +500,7 @@ describe('AutoplayPlanner — a small library with nothing new to play', () => {
       lastSeenAt.set(key, position);
     }
 
-    const log = (await h.session.snapshot('guild')).recentEntries;
+    const log = (await h.session.snapshot(ROOM.roomId)).recentEntries;
     for (let index = 1; index < log.length; index += 1) {
       expect(log[index]?.key).not.toBe(log[index - 1]?.key);
     }
@@ -508,16 +512,16 @@ describe('AutoplayPlanner — the repeat cooldown', () => {
     const session = new AutoplaySessionStore({ now: () => clock });
     // Both songs sit outside the twelve-play window, so only the CLOCK can
     // separate them: thirteen unrelated plays are pushed on top of them.
-    await session.recordPlayed('guild', {
+    await session.recordPlayed(ROOM.roomId, {
       ...entryOf(playable('Rested Artist', 'Four Hours Ago')),
       playedAt: clock - 4 * HOUR,
     });
-    await session.recordPlayed('guild', {
+    await session.recordPlayed(ROOM.roomId, {
       ...entryOf(playable('Fresh Artist', 'One Hour Ago')),
       playedAt: clock - 1 * HOUR,
     });
     for (let index = 0; index < 13; index += 1) {
-      await session.recordPlayed('guild', {
+      await session.recordPlayed(ROOM.roomId, {
         ...entryOf(playable('Filler Artist', `Filler ${String(index)}`)),
         playedAt: clock - 30 * MINUTE,
       });
@@ -542,19 +546,19 @@ describe('AutoplayPlanner — the repeat cooldown', () => {
       ],
     });
 
-    const generated = await h.planner.generate('guild', seeds, 2, { background: false });
+    const generated = await h.planner.generate(ROOM, seeds, 2, { background: false });
 
     expect(generated.map((entry) => entry.track.title)).toEqual(['Four Hours Ago']);
   });
 
   it('refuses a song still inside the recent-plays window however long ago it played', async () => {
     const session = new AutoplaySessionStore({ now: () => clock });
-    await session.recordPlayed('guild', {
+    await session.recordPlayed(ROOM.roomId, {
       ...entryOf(playable('Ancient Artist', 'Ten Hours Ago')),
       playedAt: clock - 10 * HOUR,
     });
     for (let index = 0; index < 3; index += 1) {
-      await session.recordPlayed('guild', {
+      await session.recordPlayed(ROOM.roomId, {
         ...entryOf(playable('Filler Artist', `Filler ${String(index)}`)),
         playedAt: clock - 5 * MINUTE,
       });
@@ -578,7 +582,7 @@ describe('AutoplayPlanner — the repeat cooldown', () => {
       ],
     });
 
-    const generated = await h.planner.generate('guild', seeds, 2, { background: false });
+    const generated = await h.planner.generate(ROOM, seeds, 2, { background: false });
 
     // At index 3 of the recent ring it is still one of the last twelve plays.
     expect(generated.map((entry) => entry.track.title)).toEqual(['Never Played']);
@@ -593,7 +597,7 @@ describe('AutoplayPlanner — the relaxed second pass', () => {
     const session = new AutoplaySessionStore({ now: () => clock });
     const pool = library(4, 'Only');
     for (const candidate of pool) {
-      await session.recordPlayed('guild', {
+      await session.recordPlayed(ROOM.roomId, {
         ...entryOf(playable(candidate.artist, candidate.title)),
         playedAt: clock - 1 * HOUR,
       });
@@ -601,7 +605,7 @@ describe('AutoplayPlanner — the relaxed second pass', () => {
 
     const h = harness({ session, pool, discoveries: [], config: relaxable });
 
-    const generated = await h.planner.generate('guild', seeds, 2, { background: false });
+    const generated = await h.planner.generate(ROOM, seeds, 2, { background: false });
 
     // Normal pass: all four are inside the hour. Relaxed pass: the floor is
     // 30 minutes and the position window is three plays, so exactly the one at
@@ -613,7 +617,7 @@ describe('AutoplayPlanner — the relaxed second pass', () => {
     const session = new AutoplaySessionStore({ now: () => clock });
     const pool = library(4, 'Only');
     for (const candidate of pool) {
-      await session.recordPlayed('guild', {
+      await session.recordPlayed(ROOM.roomId, {
         ...entryOf(playable(candidate.artist, candidate.title)),
         playedAt: clock - 10 * MINUTE,
       });
@@ -621,7 +625,7 @@ describe('AutoplayPlanner — the relaxed second pass', () => {
 
     const h = harness({ session, pool, discoveries: [], config: relaxable });
 
-    expect(await h.planner.generate('guild', seeds, 2, { background: false })).toEqual([]);
+    expect(await h.planner.generate(ROOM, seeds, 2, { background: false })).toEqual([]);
   });
 });
 
@@ -669,7 +673,7 @@ describe('AutoplayPlanner — dislikes', () => {
 
   it('excludes from the session mirror alone, before any store is consulted', async () => {
     const session = new AutoplaySessionStore({ now: () => clock });
-    await session.recordDisliked('guild', [identityOf('Mirror Artist', 'Mirror Song').key]);
+    await session.recordDisliked(ROOM.roomId, [identityOf('Mirror Artist', 'Mirror Song').key]);
     const h = harness({
       session,
       discoveries: [],
@@ -684,7 +688,7 @@ describe('AutoplayPlanner — dislikes', () => {
       ],
     });
 
-    const generated = await h.planner.generate('guild', seeds, 2, { background: false });
+    const generated = await h.planner.generate(ROOM, seeds, 2, { background: false });
 
     expect(generated.map((entry) => entry.track.title)).toEqual(['Fine Song']);
   });
@@ -711,7 +715,7 @@ describe('AutoplayPlanner — dislikes', () => {
       dislikes: dislikeSource({ keys: [spotifyKey] }),
     });
 
-    const generated = await h.planner.generate('guild', seeds, 2, { background: false });
+    const generated = await h.planner.generate(ROOM, seeds, 2, { background: false });
 
     expect(generated.map((entry) => entry.track.title)).toEqual(['Fine Song']);
   });
@@ -797,7 +801,7 @@ describe('AutoplayPlanner — a skip is not a dislike', () => {
           .sort((a, b) => b.breakdown.final - a.breakdown.final),
     });
 
-    const generated = await h.planner.generate('guild', seeds, 2, { background: false });
+    const generated = await h.planner.generate(ROOM, seeds, 2, { background: false });
 
     expect(h.rank.mock.calls[0]?.[0]).toMatchObject({
       recent: expect.objectContaining({ skippedKeys: [rejectedKey] }) as unknown,
@@ -824,8 +828,8 @@ describe('AutoplayPlanner — surviving a restart', () => {
     // --- restart: new store, only the persisted queue's tracks come back ---
     const restored = new AutoplaySessionStore({ now: () => clock });
     const listenerId = '111111111111111111';
-    await restored.setListener('guild', listenerId);
-    await restored.syncQueue('guild', [
+    await restored.setListener(ROOM.roomId, listenerId);
+    await restored.syncQueue(ROOM.roomId, [
       {
         ...entryOf(playable('Someone', 'Their Request')),
         origin: 'user',
@@ -837,7 +841,7 @@ describe('AutoplayPlanner — surviving a restart', () => {
         ...(track.autoplayKind === undefined ? {} : { kind: track.autoplayKind }),
       })),
     ]);
-    const snap = await restored.snapshot('guild');
+    const snap = await restored.snapshot(ROOM.roomId);
     expect(snap.listenerIds[0]).toBe(listenerId);
     expect(snap.recentAutoplayKinds.length).toBe(3);
 
@@ -869,23 +873,23 @@ describe('AutoplayPlanner — surviving a restart', () => {
     });
     const h = harness({ pool: [favourite, ...library(3)], session });
 
-    const first = await h.planner.generate('guild', seeds, 1, { background: false });
+    const first = await h.planner.generate(ROOM, seeds, 1, { background: false });
     expect(first[0]?.track.title).toBe('Loved Song');
     await session.release(
-      'guild',
+      ROOM.roomId,
       first.map((entry) => entry.reservedKey),
     );
 
-    await session.recordDisliked('guild', [identityOf(favourite.artist, favourite.title).key]);
-    const disliked = await h.planner.generate('guild', seeds, 1, { background: false });
+    await session.recordDisliked(ROOM.roomId, [identityOf(favourite.artist, favourite.title).key]);
+    const disliked = await h.planner.generate(ROOM, seeds, 1, { background: false });
     expect(disliked[0]?.track.title).not.toBe('Loved Song');
     await session.release(
-      'guild',
+      ROOM.roomId,
       disliked.map((entry) => entry.reservedKey),
     );
 
-    await session.forgetDisliked('guild', [identityOf(favourite.artist, favourite.title).key]);
-    const forgiven = await h.planner.generate('guild', seeds, 1, { background: false });
+    await session.forgetDisliked(ROOM.roomId, [identityOf(favourite.artist, favourite.title).key]);
+    const forgiven = await h.planner.generate(ROOM, seeds, 1, { background: false });
     expect(forgiven[0]?.track.title).toBe('Loved Song');
   });
 });

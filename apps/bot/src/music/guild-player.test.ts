@@ -753,8 +753,11 @@ describe('GuildPlayer playback controls', () => {
     expect(h.gp.queue.current?.identifier).toBe('t2');
     expect(played(h.player)).toEqual(['encoded-t1', 'encoded-t2']);
     // A real skip is a rejection, and must be recorded as one.
+    // History is stamped with the room it played in, so two channels of one
+    // server keep separate anti-repeat.
     expect(h.store.recordHistory).toHaveBeenCalledWith(
       'guild-1',
+      'voice-1',
       expect.objectContaining({ identifier: 't1' }),
       expect.objectContaining({ skipped: true }),
     );

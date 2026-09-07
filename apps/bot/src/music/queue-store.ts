@@ -292,10 +292,50 @@ export class QueueStore {
    * Recent plays for a guild — autoplay's seed and dedup source.
    * Newest first; failures return an empty list (autoplay just parks).
    */
-  async recentHistory(discordGuildId: string, limit: number): Promise<readonly HistorySeed[]> {
+  async recentHistory(
+    discordGuildId: string,
+    limit: number,
+    voiceChannelId?: string,
+  ): Promise<readonly HistorySeed[]> {
     try {
+      /**
+       * A room's own past, topped up with the server's.
+       *
+       * Autoplay reads this to decide what not to repeat and what to seed
+       * from, and two channels sharing one history makes them one crowd —
+       * each spending the other's anti-repeat and seeding from the other's
+       * music. But a channel that has only just started playing has almost no
+       * past of its own, and seeding from nothing is worse than seeding from
+       * the server's taste. So the room leads and the guild fills the gap.
+       */
+      const rows = await this.#readHistory(discordGuildId, limit, voiceChannelId);
+      const rest =
+        voiceChannelId === undefined || rows.length >= limit
+          ? []
+          : await this.#readHistory(discordGuildId, limit - rows.length, undefined, voiceChannelId);
+      return [...rows, ...rest];
+    } catch (error) {
+      logger.warn({ err: error, guildId: discordGuildId }, 'History read failed');
+      return [];
+    }
+  }
+
+  async #readHistory(
+    discordGuildId: string,
+    limit: number,
+    voiceChannelId?: string,
+    excludeVoiceChannelId?: string,
+  ): Promise<readonly HistorySeed[]> {
+    if (limit <= 0) return [];
+    {
       const rows = await this.#prisma.songHistory.findMany({
-        where: { guild: { discordId: discordGuildId } },
+        where: {
+          guild: { discordId: discordGuildId },
+          ...(voiceChannelId === undefined ? {} : { voiceChannelId }),
+          ...(excludeVoiceChannelId === undefined
+            ? {}
+            : { NOT: { voiceChannelId: excludeVoiceChannelId } }),
+        },
         orderBy: { playedAt: 'desc' },
         take: limit,
         select: {
@@ -317,9 +357,6 @@ export class QueueStore {
         origin: row.origin === 'autoplay' ? ('autoplay' as const) : ('user' as const),
         skipped: row.skipped,
       }));
-    } catch (error) {
-      logger.warn({ err: error, guildId: discordGuildId }, 'History read failed');
-      return [];
     }
   }
 
@@ -427,6 +464,7 @@ export class QueueStore {
   /** Append one play to the analytics history. Best-effort. */
   async recordHistory(
     discordGuildId: string,
+    voiceChannelId: string,
     track: QueuedTrack,
     outcome: { readonly playedMs: number; readonly skipped: boolean },
   ): Promise<void> {
@@ -480,6 +518,7 @@ export class QueueStore {
           playedMs: Math.max(0, Math.round(outcome.playedMs)),
           skipped: outcome.skipped,
           origin: trackOrigin(track),
+          voiceChannelId,
         },
       });
     } catch (error) {

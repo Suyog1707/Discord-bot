@@ -17,6 +17,7 @@ import type {
 } from './recommender.js';
 import type { Candidate, ScoredCandidate } from './scoring.js';
 import { AutoplaySessionStore, type SessionEntry } from './session.js';
+import { roomRefOf } from './room.js';
 import {
   EMPTY_RECENT_CONTEXT,
   EMPTY_TASTE_PROFILE,
@@ -25,6 +26,9 @@ import {
   type TasteScope,
   type UserTasteService,
 } from './taste.js';
+
+/** Autoplay is scoped to a voice channel now; one room stands in for the old guild. */
+const ROOM = roomRefOf('guild', 'vc-1');
 
 /* ------------------------------------------------------------------ fixtures */
 
@@ -185,10 +189,10 @@ function harness(options: {
   );
   const recommender = { rank, artistTags } as unknown as RecommendationService;
 
-  const resolveKnown = vi.fn((candidate: FamiliarCandidate) =>
+  const resolveKnown = vi.fn((_room: unknown, candidate: FamiliarCandidate) =>
     Promise.resolve(playable(candidate.artist, candidate.title)),
   );
-  const resolveDiscovery = vi.fn((candidate: { title: string; artist: string }) =>
+  const resolveDiscovery = vi.fn((_room: unknown, candidate: { title: string; artist: string }) =>
     Promise.resolve(playable(candidate.artist, candidate.title)),
   );
 
@@ -230,10 +234,10 @@ async function playThrough(
 ): Promise<readonly QueuedTrack[]> {
   const played: QueuedTrack[] = [];
   for (let batch = 0; batch < batches; batch += 1) {
-    const generated = await h.planner.generate('guild', seeds, count, { background: false });
+    const generated = await h.planner.generate(ROOM, seeds, count, { background: false });
     for (const entry of generated) {
       played.push(entry.track);
-      await h.session.recordPlayed('guild', {
+      await h.session.recordPlayed(ROOM.roomId, {
         ...entryOf(entry.track),
         origin: 'autoplay',
         ...(entry.track.autoplayKind === undefined ? {} : { kind: entry.track.autoplayKind }),
@@ -332,7 +336,7 @@ describe('AutoplayPlanner — scenario D: a new user with nothing known', () => 
   it('serves discoveries seeded from the request rather than nothing', async () => {
     const h = harness({ pool: [], discoveries: manyDiscoveries(4) });
 
-    const generated = await h.planner.generate('guild', seeds, 2, { background: false });
+    const generated = await h.planner.generate(ROOM, seeds, 2, { background: false });
 
     expect(generated.length).toBe(2);
     expect(generated.every((entry) => entry.track.autoplayKind === 'discovery')).toBe(true);
@@ -343,7 +347,7 @@ describe('AutoplayPlanner — scenario D: a new user with nothing known', () => 
 
   it('returns nothing rather than filler when no pool has a candidate', async () => {
     const h = harness({ pool: [], discoveries: [] });
-    expect(await h.planner.generate('guild', seeds, 2, { background: false })).toEqual([]);
+    expect(await h.planner.generate(ROOM, seeds, 2, { background: false })).toEqual([]);
   });
 });
 
@@ -375,9 +379,9 @@ describe('AutoplayPlanner — duplicate prevention', () => {
     const queued = playable('Artist Q', 'Queued');
     const recent = playable('Artist R', 'Recent');
     const session = new AutoplaySessionStore();
-    await session.recordPlayed('guild', entryOf(recent));
-    await session.syncQueue('guild', [entryOf(playing), entryOf(queued)]);
-    await session.reserve('guild', [identityOf('Artist V', 'Reserved').key]);
+    await session.recordPlayed(ROOM.roomId, entryOf(recent));
+    await session.syncQueue(ROOM.roomId, [entryOf(playing), entryOf(queued)]);
+    await session.reserve(ROOM.roomId, [identityOf('Artist V', 'Reserved').key]);
 
     const pool = [
       familiar('Artist P', 'Playing', ['library']),
@@ -389,15 +393,15 @@ describe('AutoplayPlanner — duplicate prevention', () => {
     ];
     const h = harness({ pool, discoveries: [], session });
 
-    const generated = await h.planner.generate('guild', seeds, 5, { background: false });
+    const generated = await h.planner.generate(ROOM, seeds, 5, { background: false });
 
     expect(generated.map((entry) => entry.track.title)).toEqual(['Fine']);
   });
 
   it('blocks a pick whose resolved upload turns out to be an already-played song', async () => {
     const session = new AutoplaySessionStore();
-    await session.recordPlayed('guild', entryOf(playable('Artist X', 'Song X', 'vid-x')));
-    const resolveKnown = vi.fn((candidate: FamiliarCandidate) =>
+    await session.recordPlayed(ROOM.roomId, entryOf(playable('Artist X', 'Song X', 'vid-x')));
+    const resolveKnown = vi.fn((_room: unknown, candidate: FamiliarCandidate) =>
       // Two different catalogue spellings resolve to the very same upload.
       Promise.resolve(
         candidate.title === 'Song Y'
@@ -414,19 +418,19 @@ describe('AutoplayPlanner — duplicate prevention', () => {
       resolvers: { resolveKnown },
     });
 
-    const generated = await h.planner.generate('guild', seeds, 1, { background: false });
+    const generated = await h.planner.generate(ROOM, seeds, 1, { background: false });
 
     expect(generated.map((entry) => entry.track.title)).toEqual(['Song Z']);
     // The blocked pick's reservation was handed back.
     expect(
-      (await session.snapshot('guild')).reservedKeys.has(identityOf('Artist Y', 'Song Y').key),
+      (await session.snapshot(ROOM.roomId)).reservedKeys.has(identityOf('Artist Y', 'Song Y').key),
     ).toBe(false);
   });
 
   it('reserves every served pick so a concurrent pass cannot select it', async () => {
     const h = harness({ pool: bigLibrary(3) });
-    const generated = await h.planner.generate('guild', seeds, 2, { background: false });
-    const snapshot = await h.session.snapshot('guild');
+    const generated = await h.planner.generate(ROOM, seeds, 2, { background: false });
+    const snapshot = await h.session.snapshot(ROOM.roomId);
     for (const entry of generated) expect(snapshot.reservedKeys.has(entry.reservedKey)).toBe(true);
   });
 });
@@ -442,7 +446,7 @@ describe('AutoplayPlanner — behavioural signals', () => {
       familiar('Artist K', 'Kept Song', ['library'], { plays: 3, completions: 3 }),
     ];
     const h = harness({ pool });
-    const generated = await h.planner.generate('guild', seeds, 1, { background: false });
+    const generated = await h.planner.generate(ROOM, seeds, 1, { background: false });
     expect(generated[0]?.track.title).toBe('Kept Song');
   });
 
@@ -452,7 +456,7 @@ describe('AutoplayPlanner — behavioural signals', () => {
       familiar('Artist Loved', 'Replayed', ['history'], { plays: 6, userPlays: 3, completions: 6 }),
     ];
     const h = harness({ pool });
-    const generated = await h.planner.generate('guild', seeds, 1, { background: false });
+    const generated = await h.planner.generate(ROOM, seeds, 1, { background: false });
     expect(generated[0]?.track.title).toBe('Replayed');
   });
 
@@ -462,7 +466,7 @@ describe('AutoplayPlanner — behavioural signals', () => {
       familiar('Seed Artist', 'Same Artist Song', ['library']),
     ];
     const h = harness({ pool });
-    const generated = await h.planner.generate('guild', seeds, 1, { background: false });
+    const generated = await h.planner.generate(ROOM, seeds, 1, { background: false });
     expect(generated[0]?.track.title).toBe('Same Artist Song');
   });
 
@@ -472,18 +476,18 @@ describe('AutoplayPlanner — behavioural signals', () => {
       familiar('Artist Rested', 'Rested', ['library'], { lastPlayedAt: NOW - 3 * 24 * HOUR }),
     ];
     const h = harness({ pool });
-    const generated = await h.planner.generate('guild', seeds, 1, { background: false });
+    const generated = await h.planner.generate(ROOM, seeds, 1, { background: false });
     expect(generated[0]?.track.title).toBe('Rested');
   });
 
   it("blends each listener's own profile with the guild profile", async () => {
     const session = new AutoplaySessionStore();
-    await session.syncQueue('guild', [
+    await session.syncQueue(ROOM.roomId, [
       entryOf(playable('U', 'One'), { origin: 'user', requestedById: '111111111111111111' }),
       entryOf(playable('U', 'Two'), { origin: 'user', requestedById: '222222222222222222' }),
     ]);
     const h = harness({ pool: bigLibrary(2), session });
-    await h.planner.generate('guild', seeds, 1, { background: false });
+    await h.planner.generate(ROOM, seeds, 1, { background: false });
     // Each listener's profile is scoped to THIS guild: their listening in
     // another server is that server's music, not this room's.
     expect(h.profileCalls).toEqual(
@@ -497,7 +501,7 @@ describe('AutoplayPlanner — behavioural signals', () => {
 
   it('personalises only around listeners who are still in the voice channel', async () => {
     const session = new AutoplaySessionStore();
-    await session.syncQueue('guild', [
+    await session.syncQueue(ROOM.roomId, [
       entryOf(playable('U', 'One'), { origin: 'user', requestedById: '111111111111111111' }),
       entryOf(playable('U', 'Two'), { origin: 'user', requestedById: '222222222222222222' }),
     ]);
@@ -509,7 +513,7 @@ describe('AutoplayPlanner — behavioural signals', () => {
       resolvers: { presentListeners: () => ['111111111111111111'] },
     });
 
-    await h.planner.generate('guild', seeds, 1, { background: false });
+    await h.planner.generate(ROOM, seeds, 1, { background: false });
 
     expect(h.profileCalls).toEqual(
       expect.arrayContaining([{ guildId: 'guild', userId: '111111111111111111' }]),
@@ -522,7 +526,7 @@ describe('AutoplayPlanner — behavioural signals', () => {
 
 describe('AutoplayPlanner — resolution and provider independence', () => {
   it('falls through to the next-ranked known song when the best one cannot be resolved', async () => {
-    const resolveKnown = vi.fn((candidate: FamiliarCandidate) =>
+    const resolveKnown = vi.fn((_room: unknown, candidate: FamiliarCandidate) =>
       Promise.resolve(
         candidate.title === 'Dead Upload' ? null : playable(candidate.artist, candidate.title),
       ),
@@ -537,11 +541,11 @@ describe('AutoplayPlanner — resolution and provider independence', () => {
     ];
     const h = harness({ pool, resolvers: { resolveKnown } });
 
-    const generated = await h.planner.generate('guild', seeds, 1, { background: false });
+    const generated = await h.planner.generate(ROOM, seeds, 1, { background: false });
 
     expect(generated.map((entry) => entry.track.title)).toEqual(['Alive']);
     expect(
-      (await h.session.snapshot('guild')).reservedKeys.has(
+      (await h.session.snapshot(ROOM.roomId)).reservedKeys.has(
         identityOf('Artist Dead', 'Dead Upload').key,
       ),
     ).toBe(false);
@@ -550,24 +554,25 @@ describe('AutoplayPlanner — resolution and provider independence', () => {
   it('never decides a provider: known songs go to resolveKnown with their runtime, discoveries to resolveDiscovery', async () => {
     const h = harness({ pool: bigLibrary(2), discoveries: manyDiscoveries(2) });
     const session = h.session;
-    await session.recordPlayed('guild', {
+    await session.recordPlayed(ROOM.roomId, {
       ...entryOf(playable('a', 'b')),
       origin: 'autoplay',
       kind: 'familiar',
     });
-    await session.recordPlayed('guild', {
+    await session.recordPlayed(ROOM.roomId, {
       ...entryOf(playable('c', 'd')),
       origin: 'autoplay',
       kind: 'familiar',
     });
 
-    const generated = await h.planner.generate('guild', seeds, 2, { background: false });
+    const generated = await h.planner.generate(ROOM, seeds, 2, { background: false });
 
     expect(generated.map((entry) => entry.track.autoplayKind)).toEqual(['discovery', 'familiar']);
     expect(h.resolveKnown).toHaveBeenCalledTimes(1);
-    expect(h.resolveKnown.mock.calls[0]?.[0]).toMatchObject({ durationMs: 200_000 });
+    expect(h.resolveKnown.mock.calls[0]?.[0]).toMatchObject({ roomId: ROOM.roomId });
+    expect(h.resolveKnown.mock.calls[0]?.[1]).toMatchObject({ durationMs: 200_000 });
     expect(h.resolveDiscovery).toHaveBeenCalledTimes(1);
-    expect(h.resolveDiscovery.mock.calls[0]?.[0]).toEqual({
+    expect(h.resolveDiscovery.mock.calls[0]?.[1]).toEqual({
       title: 'New Song 0',
       artist: 'New Artist 0',
     });
@@ -575,7 +580,7 @@ describe('AutoplayPlanner — resolution and provider independence', () => {
 
   it('stamps every served track as autoplay-originated with its kind and candidate key', async () => {
     const h = harness({ pool: bigLibrary(1) });
-    const [entry] = await h.planner.generate('guild', seeds, 1, { background: false });
+    const [entry] = await h.planner.generate(ROOM, seeds, 1, { background: false });
     expect(entry?.track.origin).toBe('autoplay');
     expect(entry?.track.autoplayKind).toBe('familiar');
     expect(entry?.track.sourceKey).toBe(entry?.reservedKey);
@@ -613,7 +618,7 @@ describe('AutoplayPlanner — resolution and provider independence', () => {
     });
     const hindiSeeds: readonly TrackSeed[] = [{ title: 'तुम ही हो', artist: 'Arijit Singh' }];
 
-    const generated = await h.planner.generate('guild', hindiSeeds, 1, { background: false });
+    const generated = await h.planner.generate(ROOM, hindiSeeds, 1, { background: false });
 
     expect(generated[0]?.track.title).toBe('Koi Gaana');
   });
@@ -621,39 +626,39 @@ describe('AutoplayPlanner — resolution and provider independence', () => {
   it('releases every committed reservation when a later slot throws', async () => {
     const session = new AutoplaySessionStore();
     let calls = 0;
-    const resolveKnown = vi.fn((candidate: FamiliarCandidate) => {
+    const resolveKnown = vi.fn((_room: unknown, candidate: FamiliarCandidate) => {
       calls += 1;
       if (calls > 1) throw new Error('resolver exploded');
       return Promise.resolve(playable(candidate.artist, candidate.title));
     });
     const reserve = session.reserve.bind(session);
     let reserves = 0;
-    vi.spyOn(session, 'reserve').mockImplementation((guildId, keys) => {
+    vi.spyOn(session, 'reserve').mockImplementation((roomId, keys) => {
       reserves += 1;
       if (reserves === 2) return Promise.reject(new Error('redis down'));
-      return reserve(guildId, keys);
+      return reserve(roomId, keys);
     });
     const h = harness({ pool: bigLibrary(3), session, resolvers: { resolveKnown } });
 
-    await expect(h.planner.generate('guild', seeds, 2, { background: false })).rejects.toThrow(
+    await expect(h.planner.generate(ROOM, seeds, 2, { background: false })).rejects.toThrow(
       /redis down/u,
     );
 
-    expect((await session.snapshot('guild')).reservedKeys.size).toBe(0);
+    expect((await session.snapshot(ROOM.roomId)).reservedKeys.size).toBe(0);
   });
 
   it('only refreshes listener profiles in the background', async () => {
     const session = new AutoplaySessionStore();
-    await session.syncQueue('guild', [
+    await session.syncQueue(ROOM.roomId, [
       entryOf(playable('U', 'One'), { origin: 'user', requestedById: '111111111111111111' }),
     ]);
     const h = harness({ pool: bigLibrary(2), session });
 
-    await h.planner.generate('guild', seeds, 1, { background: false });
+    await h.planner.generate(ROOM, seeds, 1, { background: false });
     const foreground = h.profileOptions.find((call) => 'userId' in call.scope);
     expect(foreground?.options).toEqual({ allowRefresh: false });
 
-    await h.planner.generate('guild', seeds, 1, { background: true });
+    await h.planner.generate(ROOM, seeds, 1, { background: true });
     const background = h.profileOptions.filter((call) => 'userId' in call.scope).at(-1);
     expect(background?.options).toEqual({ allowRefresh: true });
   });
@@ -665,7 +670,7 @@ describe('AutoplayPlanner — resolution and provider independence', () => {
       familiar: {} as FamiliarPoolService,
       recommender: {} as RecommendationService,
     });
-    await expect(planner.generate('guild', seeds, 1, { background: false })).rejects.toThrow(
+    await expect(planner.generate(ROOM, seeds, 1, { background: false })).rejects.toThrow(
       /resolvers/u,
     );
   });
@@ -685,7 +690,7 @@ describe('AutoplayPlanner — behavioural similarity and track profiles', () => 
     };
     const h = harness({ pool, behaviour });
 
-    const generated = await h.planner.generate('guild', seeds, 1, { background: false });
+    const generated = await h.planner.generate(ROOM, seeds, 1, { background: false });
 
     expect(generated[0]?.track.title).toBe('Played Together');
   });
@@ -714,7 +719,7 @@ describe('AutoplayPlanner — behavioural similarity and track profiles', () => 
     ];
     const h = harness({ pool, profile, profiles });
 
-    const generated = await h.planner.generate('guild', seeds, 1, { background: false });
+    const generated = await h.planner.generate(ROOM, seeds, 1, { background: false });
 
     expect(generated[0]?.track.title).toBe('Dil Ki Baat');
   });
@@ -734,7 +739,7 @@ describe('AutoplayPlanner — behavioural similarity and track profiles', () => 
     ];
     const h = harness({ pool, profiles });
 
-    const generated = await h.planner.generate('guild', hindiSeeds, 2, { background: false });
+    const generated = await h.planner.generate(ROOM, hindiSeeds, 2, { background: false });
 
     expect(generated).toHaveLength(2);
   });

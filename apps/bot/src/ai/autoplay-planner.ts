@@ -48,6 +48,7 @@ import {
   type InterleaveConfig,
 } from './interleave.js';
 import { languageFromText } from './language.js';
+import type { RoomRef } from './room.js';
 import type { SpotifyTasteService } from './spotify-taste.js';
 import { TrackProfileResolver, type TrackProfile } from './track-profile.js';
 import { MusicOrchestrator } from './orchestrator.js';
@@ -77,7 +78,7 @@ export interface GeneratedTrack {
  */
 export interface AutoplayGenerator {
   generate(
-    guildId: string,
+    room: RoomRef,
     seeds: readonly TrackSeed[],
     count: number,
     options: { readonly background: boolean },
@@ -93,21 +94,25 @@ export interface AutoplayGenerator {
  * far more certain than a bare artist–title pair ever can be.
  */
 export interface PlannerResolvers {
-  readonly resolveKnown: (candidate: FamiliarCandidate) => Promise<QueuedTrack | null>;
-  readonly resolveDiscovery: (candidate: {
-    readonly title: string;
-    readonly artist: string;
-  }) => Promise<QueuedTrack | null>;
+  readonly resolveKnown: (
+    room: RoomRef,
+    candidate: FamiliarCandidate,
+  ) => Promise<QueuedTrack | null>;
+  readonly resolveDiscovery: (
+    room: RoomRef,
+    candidate: { readonly title: string; readonly artist: string },
+  ) => Promise<QueuedTrack | null>;
   /**
    * Narrow the session's remembered listeners to the ones actually in the
    * voice channel right now. Only the music layer can answer this — the
    * planner sees a ledger, not a room. Absent, every remembered listener
    * counts, which is the old behaviour.
+   *
+   * Takes the room rather than the guild because the answer is different for
+   * each channel, and asking the wrong one would tune a room to the people
+   * next door.
    */
-  readonly presentListeners?: (
-    guildId: string,
-    listenerIds: readonly string[],
-  ) => readonly string[];
+  readonly presentListeners?: (room: RoomRef, listenerIds: readonly string[]) => readonly string[];
 }
 
 export interface PlannerConfig {
@@ -278,7 +283,7 @@ export class AutoplayPlanner implements AutoplayGenerator {
   }
 
   async generate(
-    guildId: string,
+    room: RoomRef,
     seeds: readonly TrackSeed[],
     count: number,
     options: { readonly background: boolean },
@@ -290,7 +295,14 @@ export class AutoplayPlanner implements AutoplayGenerator {
     if (count <= 0) return [];
     const startedAt = Date.now();
 
-    const snapshot = await this.#services.session.snapshot(guildId);
+    /**
+     * `room.roomId` for anything about this channel — the ledger, the
+     * reservations, who is standing here. `room.guildId` for the server's own
+     * data: playlists, favourites, the long-term taste profile. Mixing the two
+     * up is exactly how two channels would start playing each other's music.
+     */
+    const { roomId, guildId } = room;
+    const snapshot = await this.#services.session.snapshot(roomId);
     // Who this radio is for is a question about the room, and the session
     // ledger cannot answer it: it remembers every requester and the persisted
     // owner long after they have left, so a guild sitting in 24/7 mode with an
@@ -298,7 +310,7 @@ export class AutoplayPlanner implements AutoplayGenerator {
     // whose library and dislikes follow them into whatever server they are
     // listening in now. Only people currently in the voice channel count.
     const present =
-      resolvers.presentListeners?.(guildId, snapshot.listenerIds) ?? snapshot.listenerIds;
+      resolvers.presentListeners?.(room, snapshot.listenerIds) ?? snapshot.listenerIds;
     const listenerIds = present.slice(0, this.#config.maxListeners);
 
     // Taste, recency, the known pool and the dislike ledger are independent reads.
@@ -456,14 +468,14 @@ export class AutoplayPlanner implements AutoplayGenerator {
         const primary = kind === 'familiar' ? familiarQueue : discoveryQueue;
         const secondary = kind === 'familiar' ? discoveryQueue : familiarQueue;
 
-        let filled = await this.#fillSlot(guildId, primary, cycle, resolvers);
+        let filled = await this.#fillSlot(room, primary, cycle, resolvers);
         blocked += filled.blocked;
         // The plan asked for a kind the pool could not deliver (every candidate
         // failed to resolve, or lost its reservation). The other pool is a
         // better outcome than a hole — but only one swap, so a dead discovery
         // pool cannot turn the whole batch into discoveries.
         if (filled.entry === null && secondary.length > 0) {
-          filled = await this.#fillSlot(guildId, secondary, cycle, resolvers);
+          filled = await this.#fillSlot(room, secondary, cycle, resolvers);
           blocked += filled.blocked;
         }
         if (filled.entry !== null) results.push(filled.entry);
@@ -474,7 +486,7 @@ export class AutoplayPlanner implements AutoplayGenerator {
       // out for the full reservation TTL.
       await this.#services.session
         .release(
-          guildId,
+          roomId,
           results.map((entry) => entry.reservedKey),
         )
         .catch(() => undefined);
@@ -483,7 +495,7 @@ export class AutoplayPlanner implements AutoplayGenerator {
 
     if (blocked > 0) {
       void this.#services.session
-        .recordOutcome(guildId, 'duplicatesBlocked', blocked)
+        .recordOutcome(roomId, 'duplicatesBlocked', blocked)
         .catch(() => undefined);
     }
 
@@ -606,11 +618,14 @@ export class AutoplayPlanner implements AutoplayGenerator {
    * play is released and the next-best is tried, up to the retry budget.
    */
   async #fillSlot(
-    guildId: string,
+    room: RoomRef,
     queue: SlotCandidate[],
     cycle: CycleState,
     resolvers: PlannerResolvers,
   ): Promise<{ readonly entry: GeneratedTrack | null; readonly blocked: number }> {
+    // Reservations and the resolvers are the room's; the logs name it too, so
+    // two channels in one server can be told apart in a trace.
+    const { roomId, guildId } = room;
     let attempts = 0;
     let iterations = 0;
     let blocked = 0;
@@ -624,7 +639,7 @@ export class AutoplayPlanner implements AutoplayGenerator {
       if (candidate === null) break;
       attempts += 1;
 
-      const granted = await this.#services.session.reserve(guildId, [candidate.key]);
+      const granted = await this.#services.session.reserve(roomId, [candidate.key]);
       if (!granted.has(candidate.key)) {
         // Another generation pass claimed it first. Not a failure of this
         // candidate, so it does not spend a retry.
@@ -632,9 +647,9 @@ export class AutoplayPlanner implements AutoplayGenerator {
         continue;
       }
 
-      const track = await this.#resolve(candidate, resolvers);
+      const track = await this.#resolve(room, candidate, resolvers);
       if (track === null) {
-        await this.#services.session.release(guildId, [candidate.key]).catch(() => undefined);
+        await this.#services.session.release(roomId, [candidate.key]).catch(() => undefined);
         logger.debug(
           { guildId, track: candidate.label, kind: candidate.kind },
           'Autoplay pick failed to resolve',
@@ -646,9 +661,9 @@ export class AutoplayPlanner implements AutoplayGenerator {
       const resolvedKey = identityOf(track.author, track.title).key;
       if (cycle.isDuplicate(track.identifier, resolvedKey)) {
         blocked += 1;
-        await this.#services.session.release(guildId, [candidate.key]).catch(() => undefined);
+        await this.#services.session.release(roomId, [candidate.key]).catch(() => undefined);
         logger.debug(
-          { event: 'CANDIDATE_EXCLUDED', guildId, track: candidate.label },
+          { event: 'CANDIDATE_EXCLUDED', guildId, roomId, track: candidate.label },
           'Post-resolution duplicate blocked',
         );
         continue;
@@ -658,6 +673,7 @@ export class AutoplayPlanner implements AutoplayGenerator {
         {
           event: 'AUTOPLAY_SELECTION',
           guildId,
+          roomId,
           slot: candidate.kind,
           track: candidate.label,
           score: Number(candidate.score.toFixed(3)),
@@ -684,13 +700,17 @@ export class AutoplayPlanner implements AutoplayGenerator {
   }
 
   async #resolve(
+    room: RoomRef,
     candidate: SlotCandidate,
     resolvers: PlannerResolvers,
   ): Promise<QueuedTrack | null> {
     try {
-      if (candidate.familiar !== undefined) return await resolvers.resolveKnown(candidate.familiar);
-      if (candidate.discovery !== undefined)
-        return await resolvers.resolveDiscovery(candidate.discovery);
+      if (candidate.familiar !== undefined) {
+        return await resolvers.resolveKnown(room, candidate.familiar);
+      }
+      if (candidate.discovery !== undefined) {
+        return await resolvers.resolveDiscovery(room, candidate.discovery);
+      }
       return null;
     } catch (error) {
       logger.debug({ err: error, track: candidate.label }, 'Autoplay resolution threw');

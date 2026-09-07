@@ -1155,7 +1155,10 @@ export class GuildPlayer {
       // model to avoid whatever song the listener happened to jump away from.
       const rejected = reason === 'stopped' && intent === 'skip';
       historyWrite = this.#store
-        .recordHistory(this.guildId, finished, { playedMs, skipped: rejected })
+        .recordHistory(this.guildId, this.#voiceChannelId, finished, {
+          playedMs,
+          skipped: rejected,
+        })
         .catch(() => undefined);
       this.#onTrackFinished?.(this.guildId, finished, { skipped: rejected, playedMs });
     }

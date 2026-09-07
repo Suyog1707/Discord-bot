@@ -5,8 +5,12 @@ import type { QueuedTrack } from '../music/track.js';
 import type { AutoplayGenerator, GeneratedTrack } from './autoplay-planner.js';
 import { AutoplayEngine } from './autoplay.js';
 import { identityOf, trackKeyOf } from './identity.js';
+import { roomRefOf } from './room.js';
 import type { RecommendationExclusions, TrackSeed } from './recommender.js';
 import { AutoplaySessionStore, type SessionEntry } from './session.js';
+
+/** Autoplay is scoped to a voice channel now; one room stands in for the old guild. */
+const ROOM = roomRefOf('guild', 'vc-1');
 
 /** Build a QueuedTrack the way autoplay's own resolver would — see `track()` in recommender.test.ts. */
 function queuedTrack(id: string, artist: string, title: string): QueuedTrack {
@@ -53,11 +57,11 @@ function makeFakeGenerator(
   const calls: GenerateCall[] = [];
 
   const generate = async (
-    guildId: string,
+    room: { readonly roomId: string },
     seeds: readonly TrackSeed[],
     count: number,
   ): Promise<readonly GeneratedTrack[]> => {
-    const snapshot = await session.snapshot(guildId);
+    const snapshot = await session.snapshot(room.roomId);
     const exclusions: RecommendationExclusions = {
       trackKeys: new Set([
         ...snapshot.recentKeys,
@@ -66,7 +70,7 @@ function makeFakeGenerator(
       ]),
       identifiers: new Set([...snapshot.recentIdentifiers, ...snapshot.queuedIdentifiers]),
     };
-    const call: GenerateCall = { guildId, seeds, count, exclusions };
+    const call: GenerateCall = { guildId: room.roomId, seeds, count, exclusions };
     calls.push(call);
 
     const offered = supply(call);
@@ -78,7 +82,7 @@ function makeFakeGenerator(
     });
 
     const keys = survivors.map((candidate) => trackKeyOf(candidate.author, candidate.title));
-    const grantedKeys = await session.reserve(guildId, keys);
+    const grantedKeys = await session.reserve(room.roomId, keys);
     return survivors
       .filter((candidate) => grantedKeys.has(trackKeyOf(candidate.author, candidate.title)))
       .slice(0, count)
@@ -109,13 +113,13 @@ describe('AutoplayEngine — no duplicate across consecutive takes', () => {
     const { generator } = makeFakeGenerator(session, () => [trackA, trackB]);
     const engine = new AutoplayEngine(generator, session, { prefetchSize: 2 });
 
-    const first = await engine.take('guild', 2, seeds);
+    const first = await engine.take(ROOM, 2, seeds);
     expect(first.length).toBeGreaterThan(0);
 
     // Simulate playback actually starting on the first served track.
-    await session.recordPlayed('guild', sessionEntryFor(trackA));
+    await session.recordPlayed(ROOM.roomId, sessionEntryFor(trackA));
 
-    const second = await engine.take('guild', 2, seeds);
+    const second = await engine.take(ROOM, 2, seeds);
 
     const firstIds = new Set(first.map((entry) => entry.identifier));
     expect(second.some((entry) => entry.identifier === 'a1')).toBe(false);
@@ -131,10 +135,10 @@ describe('AutoplayEngine — exclusions passed to generation', () => {
     const { generator, calls } = makeFakeGenerator(session, () => []);
     const engine = new AutoplayEngine(generator, session, { prefetchSize: 2 });
 
-    await session.recordPlayed('guild', sessionEntryFor(played));
-    await session.syncQueue('guild', [sessionEntryFor(queued)]);
+    await session.recordPlayed(ROOM.roomId, sessionEntryFor(played));
+    await session.syncQueue(ROOM.roomId, [sessionEntryFor(queued)]);
 
-    await engine.take('guild', 2, seeds);
+    await engine.take(ROOM, 2, seeds);
 
     const request = calls.at(-1);
     expect(request?.exclusions.trackKeys.has(trackKeyOf(played.author, played.title))).toBe(true);
@@ -162,8 +166,8 @@ describe('AutoplayEngine — concurrent take + prefetch coalesce', () => {
 
     const engine = new AutoplayEngine(generator, session, { prefetchSize: 1 });
 
-    engine.prefetch('guild', seeds);
-    const takePromise = engine.take('guild', 1, seeds);
+    engine.prefetch(ROOM, seeds);
+    const takePromise = engine.take(ROOM, 1, seeds);
 
     await waitUntil(() => releaseHang !== undefined);
     releaseHang?.();
@@ -186,11 +190,11 @@ describe('AutoplayEngine — buffer serves on matching seeds', () => {
     const { generator, calls } = makeFakeGenerator(session, () => [trackA, trackB, trackC]);
     const engine = new AutoplayEngine(generator, session, { prefetchSize: 3 });
 
-    engine.prefetch('guild', seeds);
+    engine.prefetch(ROOM, seeds);
 
     let served: readonly QueuedTrack[] = [];
     for (let attempt = 0; attempt < 50 && served.length === 0; attempt += 1) {
-      served = await engine.take('guild', 2, seeds);
+      served = await engine.take(ROOM, 2, seeds);
       if (served.length === 0) await new Promise((resolve) => setTimeout(resolve, 1));
     }
 
@@ -212,16 +216,16 @@ describe('AutoplayEngine — seed drift invalidates the buffer', () => {
     const seedS1: readonly TrackSeed[] = [{ title: 'Song S1', artist: 'Artist S1' }];
     const seedS2: readonly TrackSeed[] = [{ title: 'Song S2', artist: 'Artist S2' }];
 
-    engine.prefetch('guild', seedS1);
+    engine.prefetch(ROOM, seedS1);
     await waitUntil(() => calls.length >= 1);
     // Let the refill's own buffer write (after recommend resolves) land.
     await new Promise((resolve) => setTimeout(resolve, 5));
 
     const reservedKey = trackKeyOf(trackA.author, trackA.title);
-    expect((await session.snapshot('guild')).reservedKeys.has(reservedKey)).toBe(true);
+    expect((await session.snapshot(ROOM.roomId)).reservedKeys.has(reservedKey)).toBe(true);
 
     offered = [];
-    const drifted = await engine.take('guild', 1, seedS2);
+    const drifted = await engine.take(ROOM, 1, seedS2);
 
     // The S1 buffer was discarded rather than served for an unrelated seed,
     // so a fresh generation runs for S2.
@@ -229,7 +233,7 @@ describe('AutoplayEngine — seed drift invalidates the buffer', () => {
     expect(drifted).toEqual([]);
     // And the discarded buffer's reservation was released, not leaked — with
     // nothing offered for S2, an empty set here can only mean `clear()` freed it.
-    expect((await session.snapshot('guild')).reservedKeys.has(reservedKey)).toBe(false);
+    expect((await session.snapshot(ROOM.roomId)).reservedKeys.has(reservedKey)).toBe(false);
   });
 
   it('releases buffered reservations directly via clear()', async () => {
@@ -238,16 +242,16 @@ describe('AutoplayEngine — seed drift invalidates the buffer', () => {
     const { generator, calls } = makeFakeGenerator(session, () => [trackA]);
     const engine = new AutoplayEngine(generator, session, { prefetchSize: 1 });
 
-    engine.prefetch('guild', seeds);
+    engine.prefetch(ROOM, seeds);
     await waitUntil(() => calls.length >= 1);
     await new Promise((resolve) => setTimeout(resolve, 5));
 
     const reservedKey = trackKeyOf(trackA.author, trackA.title);
-    expect((await session.snapshot('guild')).reservedKeys.has(reservedKey)).toBe(true);
+    expect((await session.snapshot(ROOM.roomId)).reservedKeys.has(reservedKey)).toBe(true);
 
-    engine.clear('guild');
+    engine.clear(ROOM.roomId);
 
-    expect((await session.snapshot('guild')).reservedKeys.has(reservedKey)).toBe(false);
+    expect((await session.snapshot(ROOM.roomId)).reservedKeys.has(reservedKey)).toBe(false);
   });
 });
 
@@ -259,15 +263,15 @@ describe('AutoplayEngine — evict', () => {
     const { generator, calls } = makeFakeGenerator(session, () => [trackA, trackB]);
     const engine = new AutoplayEngine(generator, session, { prefetchSize: 2 });
 
-    engine.prefetch('guild', seeds);
+    engine.prefetch(ROOM, seeds);
     await waitUntil(() => calls.length >= 1);
     await new Promise((resolve) => setTimeout(resolve, 5));
 
     const keyA = trackKeyOf(trackA.author, trackA.title);
-    expect(engine.evict('guild', new Set([keyA]))).toBe(1);
-    expect((await session.snapshot('guild')).reservedKeys.has(keyA)).toBe(false);
+    expect(engine.evict(ROOM.roomId, new Set([keyA]))).toBe(1);
+    expect((await session.snapshot(ROOM.roomId)).reservedKeys.has(keyA)).toBe(false);
 
-    const served = await engine.take('guild', 2, seeds);
+    const served = await engine.take(ROOM, 2, seeds);
     expect(served.map((entry) => entry.identifier)).toEqual(['b1']);
   });
 });
@@ -280,7 +284,7 @@ describe('AutoplayEngine — generation failure', () => {
     };
     const engine = new AutoplayEngine(generator, session, { prefetchSize: 2 });
 
-    const served = await engine.take('guild', 2, seeds);
+    const served = await engine.take(ROOM, 2, seeds);
 
     expect(served).toEqual([]);
   });
@@ -294,12 +298,12 @@ describe('AutoplayEngine — recordOutcome wiring', () => {
     const { generator } = makeFakeGenerator(session, () => [trackA, trackB]);
     const engine = new AutoplayEngine(generator, session, { prefetchSize: 2 });
 
-    const served = await engine.take('guild', 2, seeds);
+    const served = await engine.take(ROOM, 2, seeds);
 
     // recordOutcome is fire-and-forget from #generate; give its microtask a tick.
     await new Promise((resolve) => setTimeout(resolve, 5));
 
-    const snapshot = await session.snapshot('guild');
+    const snapshot = await session.snapshot(ROOM.roomId);
     expect(snapshot.outcomes.recommended).toBe(served.length);
   });
 });

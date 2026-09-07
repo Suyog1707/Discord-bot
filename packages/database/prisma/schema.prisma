@@ -478,12 +478,17 @@ model SongHistory {
   /// never carry the same authority as explicit user selections, or the
   /// recommender's own output becomes its dominant input (taste drift).
   origin         String       @default("user")
+  /// Which voice channel this played in. Nullable because rows predating
+  /// multi-room playback have no room, and a brand-new room reads them as
+  /// the server's shared past rather than starting with no taste at all.
+  voiceChannelId String?
   playedAt       DateTime     @default(now()) @db.Timestamptz(3)
 
   guild Guild @relation(fields: [guildId], references: [id], onDelete: Cascade)
   user  User? @relation(fields: [userId], references: [id], onDelete: SetNull)
 
   @@index([guildId, playedAt])
+  @@index([guildId, voiceChannelId, playedAt])
   @@index([userId, playedAt])
   @@index([identifier])
   @@map("song_history")

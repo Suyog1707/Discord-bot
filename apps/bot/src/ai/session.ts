@@ -26,6 +26,16 @@ import type { AutoplayKind } from './interleave.js';
 
 const logger = getLogger('ai-session');
 
+/**
+ * Every key here is scoped to a ROOM — one voice channel — not to a server.
+ *
+ * A guild can have several channels playing at once, each with its own
+ * listeners, its own queue and its own idea of what it wants to hear next. A
+ * shared ledger would have them excluding each other's songs, blending each
+ * other's anti-repeat and reserving against one another. The ids passed in are
+ * `guildId:voiceChannelId`; nothing here inspects them, so the only visible
+ * difference is a longer key.
+ */
 const SESSION_PREFIX = 'autoplay:sess:';
 const RESERVATION_PREFIX = 'autoplay:resv:';
 
@@ -39,9 +49,15 @@ const DEFAULT_TTL_SECONDS = 6 * 60 * 60;
  */
 const DEFAULT_RESERVATION_TTL_SECONDS = 20 * 60;
 
-/** Bounded so a long-running, many-guild bot cannot leak memory. */
-const MAX_GUILD_SESSIONS = 500;
-/** Session dislikes kept per guild; the durable record has no such cap. */
+/**
+ * Bounded so a long-running, many-guild bot cannot leak memory.
+ *
+ * Counted in *rooms*, not servers: a guild playing in several voice channels
+ * at once holds one session per channel, so the same number of servers now
+ * needs more room than it used to.
+ */
+const MAX_ROOM_SESSIONS = 2_000;
+/** Session dislikes kept per room; the durable record has no such cap. */
 const MAX_SESSION_DISLIKES = 500;
 /**
  * How long the session mirror of a dislike stays authoritative. Long enough
@@ -186,7 +202,7 @@ export interface SessionStoreOptions {
   readonly now?: () => number;
 }
 
-interface GuildSession {
+interface RoomSession {
   recent: SessionEntry[];
   queued: SessionEntry[];
   /**
@@ -209,28 +225,28 @@ function emptyOutcomes(): SessionOutcomes {
   return { recommended: 0, played: 0, completed: 0, skipped: 0, duplicatesBlocked: 0 };
 }
 
-function recentKey(guildId: string): string {
-  return `${SESSION_PREFIX}${guildId}:recent`;
+function recentKey(roomId: string): string {
+  return `${SESSION_PREFIX}${roomId}:recent`;
 }
 
-function queuedKey(guildId: string): string {
-  return `${SESSION_PREFIX}${guildId}:queued`;
+function queuedKey(roomId: string): string {
+  return `${SESSION_PREFIX}${roomId}:queued`;
 }
 
-function outcomesKey(guildId: string): string {
-  return `${SESSION_PREFIX}${guildId}:outcomes`;
+function outcomesKey(roomId: string): string {
+  return `${SESSION_PREFIX}${roomId}:outcomes`;
 }
 
-function dislikedKey(guildId: string): string {
-  return `${SESSION_PREFIX}${guildId}:disliked`;
+function dislikedKey(roomId: string): string {
+  return `${SESSION_PREFIX}${roomId}:disliked`;
 }
 
-function listenerKey(guildId: string): string {
-  return `${SESSION_PREFIX}${guildId}:listener`;
+function listenerKey(roomId: string): string {
+  return `${SESSION_PREFIX}${roomId}:listener`;
 }
 
-function reservationKey(guildId: string, trackKey: string): string {
-  return `${RESERVATION_PREFIX}${guildId}:${trackKey}`;
+function reservationKey(roomId: string, trackKey: string): string {
+  return `${RESERVATION_PREFIX}${roomId}:${trackKey}`;
 }
 
 function clamp01(value: number): number {
@@ -338,7 +354,7 @@ export class AutoplaySessionStore {
   readonly #reservationTtlSeconds: number;
   readonly #now: () => number;
 
-  readonly #sessions = new Map<string, GuildSession>();
+  readonly #sessions = new Map<string, RoomSession>();
 
   #redisErrors = 0;
 
@@ -355,12 +371,12 @@ export class AutoplaySessionStore {
     return this.#redisErrors;
   }
 
-  async snapshot(guildId: string): Promise<SessionSnapshot> {
-    const session = this.#touch(guildId);
+  async snapshot(roomId: string): Promise<SessionSnapshot> {
+    const session = this.#touch(roomId);
 
-    const recent = await this.#readRecent(guildId, session);
-    const queued = await this.#readQueued(guildId, session);
-    const outcomes = await this.#readOutcomes(guildId, session);
+    const recent = await this.#readRecent(roomId, session);
+    const queued = await this.#readQueued(roomId, session);
+    const outcomes = await this.#readOutcomes(roomId, session);
 
     const identifiers = new Set<string>();
     for (const entry of queued) {
@@ -378,9 +394,9 @@ export class AutoplaySessionStore {
       reservedKeys: new Set(session.reservations.keys()),
       artistFatigue: computeArtistFatigue(recent.map((entry) => entry.artistKey)),
       recentEntries: recent,
-      dislikedKeys: await this.#readDisliked(guildId, session),
+      dislikedKeys: await this.#readDisliked(roomId, session),
       recentAutoplayKinds: autoplayKindsOf(recent, queued),
-      listenerIds: listenersOf(recent, queued, await this.#readListener(guildId, session)),
+      listenerIds: listenersOf(recent, queued, await this.#readListener(roomId, session)),
       primaryListenerId: session.primaryListenerId,
       outcomes,
     };
@@ -391,33 +407,33 @@ export class AutoplaySessionStore {
    * so a restart with Redis remembers the owner even before the persisted
    * queue is reloaded.
    */
-  async setListener(guildId: string, discordId: string | null): Promise<void> {
-    const session = this.#touch(guildId);
+  async setListener(roomId: string, discordId: string | null): Promise<void> {
+    const session = this.#touch(roomId);
     session.primaryListenerId = discordId;
 
     if (this.#redis === undefined) return;
     try {
-      if (discordId === null) await this.#redis.del(listenerKey(guildId));
-      else await this.#redis.set(listenerKey(guildId), discordId, 'EX', this.#ttlSeconds);
+      if (discordId === null) await this.#redis.del(listenerKey(roomId));
+      else await this.#redis.set(listenerKey(roomId), discordId, 'EX', this.#ttlSeconds);
     } catch (error) {
       this.#redisErrors += 1;
       logger.debug(
-        { err: error, guildId },
+        { err: error, roomId },
         'Writing listener to Redis failed; memory tier holds it',
       );
     }
   }
 
-  async #readListener(guildId: string, session: GuildSession): Promise<string | null> {
+  async #readListener(roomId: string, session: RoomSession): Promise<string | null> {
     if (session.primaryListenerId !== null || this.#redis === undefined) {
       return session.primaryListenerId;
     }
     try {
-      const raw = await this.#redis.get(listenerKey(guildId));
+      const raw = await this.#redis.get(listenerKey(roomId));
       if (raw !== null) session.primaryListenerId = raw;
     } catch (error) {
       this.#redisErrors += 1;
-      logger.debug({ err: error, guildId }, 'Reading listener from Redis failed; using memory');
+      logger.debug({ err: error, roomId }, 'Reading listener from Redis failed; using memory');
     }
     return session.primaryListenerId;
   }
@@ -430,8 +446,8 @@ export class AutoplaySessionStore {
    * pick for the same song is recognised without a query. Reservations on
    * the keys are dropped too: nothing should be holding a disliked song.
    */
-  async recordDisliked(guildId: string, keys: readonly string[]): Promise<void> {
-    const session = this.#touch(guildId);
+  async recordDisliked(roomId: string, keys: readonly string[]): Promise<void> {
+    const session = this.#touch(roomId);
     // Guild-wide on purpose: the room shares one queue, so one listener's
     // "not like" keeps the song out for everyone present this session — the
     // durable per-user record is what carries it into other rooms. Bounded
@@ -452,44 +468,41 @@ export class AutoplaySessionStore {
 
     try {
       const pipeline = this.#redis.multi();
-      pipeline.hset(
-        dislikedKey(guildId),
-        Object.fromEntries(keys.map((key) => [key, String(now)])),
-      );
-      pipeline.expire(dislikedKey(guildId), this.#ttlSeconds);
-      for (const key of keys) pipeline.del(reservationKey(guildId, key));
+      pipeline.hset(dislikedKey(roomId), Object.fromEntries(keys.map((key) => [key, String(now)])));
+      pipeline.expire(dislikedKey(roomId), this.#ttlSeconds);
+      for (const key of keys) pipeline.del(reservationKey(roomId, key));
       await pipeline.exec();
     } catch (error) {
       this.#redisErrors += 1;
       logger.debug(
-        { err: error, guildId },
+        { err: error, roomId },
         'Recording dislike in Redis failed; memory tier still holds it',
       );
     }
   }
 
   /** A forgiven song: `/dislike remove` must take effect this session, not after the TTL. */
-  async forgetDisliked(guildId: string, keys: readonly string[]): Promise<void> {
-    const session = this.#touch(guildId);
+  async forgetDisliked(roomId: string, keys: readonly string[]): Promise<void> {
+    const session = this.#touch(roomId);
     for (const key of keys) session.disliked.delete(key);
 
     if (this.#redis === undefined || keys.length === 0) return;
 
     try {
-      await this.#redis.hdel(dislikedKey(guildId), ...keys);
+      await this.#redis.hdel(dislikedKey(roomId), ...keys);
     } catch (error) {
       this.#redisErrors += 1;
       logger.debug(
-        { err: error, guildId },
+        { err: error, roomId },
         'Forgetting dislike in Redis failed; memory already cleared',
       );
     }
   }
 
-  async #readDisliked(guildId: string, session: GuildSession): Promise<ReadonlySet<string>> {
+  async #readDisliked(roomId: string, session: RoomSession): Promise<ReadonlySet<string>> {
     if (this.#redis !== undefined) {
       try {
-        const raw = await this.#redis.hgetall(dislikedKey(guildId));
+        const raw = await this.#redis.hgetall(dislikedKey(roomId));
         for (const [key, at] of Object.entries(raw)) {
           const parsed = Number(at);
           if (Number.isFinite(parsed) && !session.disliked.has(key))
@@ -497,7 +510,7 @@ export class AutoplaySessionStore {
         }
       } catch (error) {
         this.#redisErrors += 1;
-        logger.debug({ err: error, guildId }, 'Reading dislikes from Redis failed; using memory');
+        logger.debug({ err: error, roomId }, 'Reading dislikes from Redis failed; using memory');
       }
     }
     const cutoff = this.#now() - SESSION_DISLIKE_TTL_MS;
@@ -526,8 +539,8 @@ export class AutoplaySessionStore {
    * a single process degraded to memory-only reservations is still correct —
    * only cross-process correctness was lost, and that loss was there anyway.
    */
-  async reserve(guildId: string, keys: readonly string[]): Promise<ReadonlySet<string>> {
-    const session = this.#touch(guildId);
+  async reserve(roomId: string, keys: readonly string[]): Promise<ReadonlySet<string>> {
+    const session = this.#touch(roomId);
     const now = this.#now();
 
     const granted = new Set<string>();
@@ -545,7 +558,7 @@ export class AutoplaySessionStore {
       const outcomes = await Promise.all(
         [...granted].map(async (key) => {
           const result = await redis.set(
-            reservationKey(guildId, key),
+            reservationKey(roomId, key),
             '1',
             'EX',
             this.#reservationTtlSeconds,
@@ -562,42 +575,39 @@ export class AutoplaySessionStore {
       }
     } catch (error) {
       this.#redisErrors += 1;
-      logger.debug(
-        { err: error, guildId },
-        'Reservation sync to Redis failed; memory grant stands',
-      );
+      logger.debug({ err: error, roomId }, 'Reservation sync to Redis failed; memory grant stands');
     }
 
     return granted;
   }
 
-  async release(guildId: string, keys: readonly string[]): Promise<void> {
-    const session = this.#touch(guildId);
+  async release(roomId: string, keys: readonly string[]): Promise<void> {
+    const session = this.#touch(roomId);
     for (const key of keys) session.reservations.delete(key);
 
     if (this.#redis === undefined || keys.length === 0) return;
 
     try {
-      await this.#redis.del(...keys.map((key) => reservationKey(guildId, key)));
+      await this.#redis.del(...keys.map((key) => reservationKey(roomId, key)));
     } catch (error) {
       this.#redisErrors += 1;
       logger.debug(
-        { err: error, guildId },
+        { err: error, roomId },
         'Reservation release in Redis failed; memory already cleared',
       );
     }
   }
 
   /** Authoritative replace of the queued set from the live queue. */
-  async syncQueue(guildId: string, entries: readonly SessionEntry[]): Promise<void> {
-    const session = this.#touch(guildId);
+  async syncQueue(roomId: string, entries: readonly SessionEntry[]): Promise<void> {
+    const session = this.#touch(roomId);
     session.queued = [...entries];
 
     if (this.#redis === undefined) return;
 
     try {
       await this.#redis.set(
-        queuedKey(guildId),
+        queuedKey(roomId),
         JSON.stringify(session.queued),
         'EX',
         this.#ttlSeconds,
@@ -605,15 +615,15 @@ export class AutoplaySessionStore {
     } catch (error) {
       this.#redisErrors += 1;
       logger.debug(
-        { err: error, guildId },
+        { err: error, roomId },
         'Queue sync to Redis failed; memory tier still holds it',
       );
     }
   }
 
   /** A track started playing: push to recent ring, drop from queued+reserved. */
-  async recordPlayed(guildId: string, entry: SessionEntry): Promise<void> {
-    const session = this.#touch(guildId);
+  async recordPlayed(roomId: string, entry: SessionEntry): Promise<void> {
+    const session = this.#touch(roomId);
     const entryKeys = new Set(keysOf(entry));
     const stamped: SessionEntry =
       entry.playedAt === undefined ? { ...entry, playedAt: this.#now() } : entry;
@@ -627,42 +637,42 @@ export class AutoplaySessionStore {
 
     try {
       const pipeline = this.#redis.multi();
-      pipeline.lpush(recentKey(guildId), JSON.stringify(stamped));
-      pipeline.ltrim(recentKey(guildId), 0, this.#recentLimit - 1);
-      pipeline.expire(recentKey(guildId), this.#ttlSeconds);
-      for (const key of entryKeys) pipeline.del(reservationKey(guildId, key));
+      pipeline.lpush(recentKey(roomId), JSON.stringify(stamped));
+      pipeline.ltrim(recentKey(roomId), 0, this.#recentLimit - 1);
+      pipeline.expire(recentKey(roomId), this.#ttlSeconds);
+      for (const key of entryKeys) pipeline.del(reservationKey(roomId, key));
       await pipeline.exec();
     } catch (error) {
       this.#redisErrors += 1;
       logger.debug(
-        { err: error, guildId },
+        { err: error, roomId },
         'Recording played track in Redis failed; memory tier still holds it',
       );
     }
   }
 
-  async recordOutcome(guildId: string, outcome: keyof SessionOutcomes, count = 1): Promise<void> {
-    const session = this.#touch(guildId);
+  async recordOutcome(roomId: string, outcome: keyof SessionOutcomes, count = 1): Promise<void> {
+    const session = this.#touch(roomId);
     session.outcomes = { ...session.outcomes, [outcome]: session.outcomes[outcome] + count };
 
     if (this.#redis === undefined) return;
 
     try {
       const pipeline = this.#redis.multi();
-      pipeline.hincrby(outcomesKey(guildId), outcome, count);
-      pipeline.expire(outcomesKey(guildId), this.#ttlSeconds);
+      pipeline.hincrby(outcomesKey(roomId), outcome, count);
+      pipeline.expire(outcomesKey(roomId), this.#ttlSeconds);
       await pipeline.exec();
     } catch (error) {
       this.#redisErrors += 1;
       logger.debug(
-        { err: error, guildId },
+        { err: error, roomId },
         'Recording outcome in Redis failed; memory tier still holds it',
       );
     }
   }
 
-  async clear(guildId: string): Promise<void> {
-    this.#sessions.delete(guildId);
+  async clear(roomId: string): Promise<void> {
+    this.#sessions.delete(roomId);
 
     if (this.#redis === undefined) return;
 
@@ -671,26 +681,26 @@ export class AutoplaySessionStore {
       // default) and self-expire, and clearing a guild that just finished a
       // session is not on a path where a stale reservation matters.
       await this.#redis.del(
-        recentKey(guildId),
-        queuedKey(guildId),
-        outcomesKey(guildId),
-        dislikedKey(guildId),
-        listenerKey(guildId),
+        recentKey(roomId),
+        queuedKey(roomId),
+        outcomesKey(roomId),
+        dislikedKey(roomId),
+        listenerKey(roomId),
       );
     } catch (error) {
       this.#redisErrors += 1;
       logger.debug(
-        { err: error, guildId },
+        { err: error, roomId },
         'Clearing session in Redis failed; memory tier already cleared',
       );
     }
   }
 
-  async #readRecent(guildId: string, session: GuildSession): Promise<readonly SessionEntry[]> {
+  async #readRecent(roomId: string, session: RoomSession): Promise<readonly SessionEntry[]> {
     if (this.#redis === undefined) return session.recent;
 
     try {
-      const raw = await this.#redis.lrange(recentKey(guildId), 0, this.#recentLimit - 1);
+      const raw = await this.#redis.lrange(recentKey(roomId), 0, this.#recentLimit - 1);
       // An empty list while memory holds history means the Redis key expired
       // or a blip dropped writes — NOT that nothing played. Adopting the empty
       // read would wipe the whole anti-repeat window in one snapshot; memory
@@ -701,45 +711,39 @@ export class AutoplaySessionStore {
       return entries;
     } catch (error) {
       this.#redisErrors += 1;
-      logger.debug(
-        { err: error, guildId },
-        'Reading recent tracks from Redis failed; using memory',
-      );
+      logger.debug({ err: error, roomId }, 'Reading recent tracks from Redis failed; using memory');
       return session.recent;
     }
   }
 
-  async #readQueued(guildId: string, session: GuildSession): Promise<readonly SessionEntry[]> {
+  async #readQueued(roomId: string, session: RoomSession): Promise<readonly SessionEntry[]> {
     if (this.#redis === undefined) return session.queued;
 
     try {
-      const raw = await this.#redis.get(queuedKey(guildId));
+      const raw = await this.#redis.get(queuedKey(roomId));
       if (raw === null) return session.queued;
       const entries = JSON.parse(raw) as SessionEntry[];
       session.queued = entries;
       return entries;
     } catch (error) {
       this.#redisErrors += 1;
-      logger.debug(
-        { err: error, guildId },
-        'Reading queued tracks from Redis failed; using memory',
-      );
+      logger.debug({ err: error, roomId }, 'Reading queued tracks from Redis failed; using memory');
       return session.queued;
     }
   }
 
-  async #readOutcomes(guildId: string, session: GuildSession): Promise<SessionOutcomes> {
+  async #readOutcomes(roomId: string, session: RoomSession): Promise<SessionOutcomes> {
     if (this.#redis === undefined) return session.outcomes;
 
     try {
-      const raw = await this.#redis.hgetall(outcomesKey(guildId));
+      const raw = await this.#redis.hgetall(outcomesKey(roomId));
       if (Object.keys(raw).length === 0) return session.outcomes;
       const outcomes = parseOutcomes(raw);
       session.outcomes = outcomes;
       return outcomes;
     } catch (error) {
       this.#redisErrors += 1;
-      logger.debug({ err: error, guildId }, 'Reading outcomes from Redis failed; using memory');
+      logger.debug({ err: error, roomId }, 'Reading outcomes from Redis failed; using memory');
       return session.outcomes;
     }
   }
@@ -751,10 +755,10 @@ export class AutoplaySessionStore {
    * — stale or excess guilds at the front of the map, which is the
    * least-recently-touched end.
    */
-  #touch(guildId: string): GuildSession {
+  #touch(roomId: string): RoomSession {
     const now = this.#now();
 
-    let session = this.#sessions.get(guildId);
+    let session = this.#sessions.get(roomId);
     if (session === undefined) {
       session = {
         recent: [],
@@ -766,10 +770,10 @@ export class AutoplaySessionStore {
         touchedAt: now,
       };
     } else {
-      this.#sessions.delete(guildId);
+      this.#sessions.delete(roomId);
     }
     session.touchedAt = now;
-    this.#sessions.set(guildId, session);
+    this.#sessions.set(roomId, session);
 
     for (const [key, expiresAt] of session.reservations) {
       if (expiresAt <= now) session.reservations.delete(key);
@@ -777,13 +781,13 @@ export class AutoplaySessionStore {
 
     const cutoff = now - this.#ttlSeconds * 1000;
     for (const [otherGuildId, otherSession] of this.#sessions) {
-      if (otherGuildId === guildId || otherSession.touchedAt >= cutoff) break;
+      if (otherGuildId === roomId || otherSession.touchedAt >= cutoff) break;
       this.#sessions.delete(otherGuildId);
     }
 
-    while (this.#sessions.size > MAX_GUILD_SESSIONS) {
+    while (this.#sessions.size > MAX_ROOM_SESSIONS) {
       const oldest = this.#sessions.keys().next();
-      if (oldest.done === true || oldest.value === guildId) break;
+      if (oldest.done === true || oldest.value === roomId) break;
       this.#sessions.delete(oldest.value);
     }
 

@@ -46,6 +46,7 @@ import type { SpotifyService } from '../services/spotify-service.js';
 import { decideHandover } from './channel-handover.js';
 import { decideVoiceCleanup } from './voice-cleanup.js';
 import { SessionDjRegistry } from './session-dj.js';
+import { roomIdOf, roomRefOf, type RoomRef } from '../ai/room.js';
 import {
   claimReconnect,
   decideVoiceClose,
@@ -604,6 +605,18 @@ export class MusicManager {
     return this.#players.size;
   }
 
+  /**
+   * The room this manager is serving in a guild, if any.
+   *
+   * Autoplay is scoped to a voice channel, not a server, and this manager can
+   * only ever hold one channel per guild — so the room is simply the guild
+   * plus wherever its player currently is.
+   */
+  #roomOf(guildId: string): RoomRef | undefined {
+    const player = this.#players.get(guildId);
+    return player === undefined ? undefined : roomRefOf(guildId, player.voiceChannelId);
+  }
+
   getPlayer(guildId: string): GuildPlayer | undefined {
     return this.#players.get(guildId);
   }
@@ -642,10 +655,13 @@ export class MusicManager {
         { guildId: options.guildId, from: existing.voiceChannelId, to: options.voiceChannelId },
         'Handing the bot over to another voice channel',
       );
+      // Captured before the teardown: after it there is no player to ask
+      // which room is being abandoned.
+      const abandoned = roomRefOf(options.guildId, existing.voiceChannelId);
       await this.destroyPlayer(options.guildId);
       // The session ledger describes a room — what played there, who was
       // listening. None of it applies to the channel being entered.
-      await this.#autoplaySession?.clear(options.guildId).catch(() => undefined);
+      await this.#autoplaySession?.clear(abandoned.roomId).catch(() => undefined);
     }
 
     if (!this.isAvailable) {
@@ -720,7 +736,10 @@ export class MusicManager {
       // dislikes the planner reads is decided here, not by whoever's request
       // happens to be the most recent.
       onListenerChange: (guildId, listenerId) => {
-        void this.#autoplaySession?.setListener(guildId, listenerId).catch(() => undefined);
+        const room = this.#roomOf(guildId);
+        if (room !== undefined) {
+          void this.#autoplaySession?.setListener(room.roomId, listenerId).catch(() => undefined);
+        }
         // The session's listener is also its host: whoever's request started
         // the music runs the room until the bot leaves.
         if (listenerId !== null) this.sessionDj.setHost(guildId, listenerId);
@@ -732,10 +751,15 @@ export class MusicManager {
       // so the next top-up is a map lookup rather than a generation pass.
       onTrackStarted: (guildId, track) => {
         const session = this.#autoplaySession;
-        if (session !== undefined) {
-          void session.recordPlayed(guildId, this.#sessionEntryOf(track)).catch(() => undefined);
+        const room = this.#roomOf(guildId);
+        if (session !== undefined && room !== undefined) {
+          void session
+            .recordPlayed(room.roomId, this.#sessionEntryOf(track))
+            .catch(() => undefined);
           if (track.requestedByName === 'Autoplay') {
-            void session.recordOutcome(guildId, 'played').catch(() => undefined);
+            {
+              void session.recordOutcome(room.roomId, 'played').catch(() => undefined);
+            }
             logger.debug(
               { event: 'RECOMMENDATION_PLAYED', guildId, track: track.title },
               'Autoplay pick started',
@@ -754,7 +778,10 @@ export class MusicManager {
         if (this.#autoplay !== undefined) {
           void this.#anchorSeeds(guildId, track)
             .then((seeds) => {
-              if (seeds.length > 0) this.#autoplay?.prefetch(guildId, seeds);
+              const room = this.#roomOf(guildId);
+              if (seeds.length > 0 && room !== undefined) {
+                this.#autoplay?.prefetch(room, seeds);
+              }
             })
             .catch(() => undefined);
         }
@@ -767,8 +794,9 @@ export class MusicManager {
         const completed =
           !outcome.skipped && track.durationMs > 0 && outcome.playedMs / track.durationMs >= 0.8;
         const kind = outcome.skipped ? 'skipped' : completed ? 'completed' : null;
-        if (kind !== null) {
-          void session.recordOutcome(guildId, kind).catch(() => undefined);
+        const room = this.#roomOf(guildId);
+        if (kind !== null && room !== undefined) {
+          void session.recordOutcome(room.roomId, kind).catch(() => undefined);
           logger.debug(
             {
               event: kind === 'skipped' ? 'RECOMMENDATION_SKIPPED' : 'RECOMMENDATION_COMPLETED',
@@ -790,7 +818,7 @@ export class MusicManager {
         // be the wrong music for whatever comes next, and their reservations
         // must be released so the songs are not penalised unheard.
         if (type === 'QUEUE_CLEAR') {
-          this.#autoplay?.clear(options.guildId);
+          this.#autoplay?.clear(roomIdOf(options.guildId, options.voiceChannelId));
         }
         this.#emitEvent(options.guildId, type, state);
       },
@@ -983,11 +1011,16 @@ export class MusicManager {
     // Two resolvers because the planner's two pools carry different evidence:
     // a known song has a runtime and a catalogue URL, a discovery has a name.
     planner?.setResolvers({
-      resolveKnown: async (candidate) => this.resolveKnown(candidate),
-      resolveDiscovery: async (candidate) => this.resolveCandidate(candidate),
+      // Resolution is bot-agnostic — Lavalink does not care which session
+      // asks — but it must run on THIS manager's node, and this planner only
+      // ever serves this manager's rooms, so the room is not needed here.
+      resolveKnown: async (_room, candidate) => this.resolveKnown(candidate),
+      resolveDiscovery: async (_room, candidate) => this.resolveCandidate(candidate),
       // The planner is handed a ledger of remembered listeners; only this
-      // layer can say which of them are still in the room.
-      presentListeners: (guildId, listenerIds) => this.#listenersInVoice(guildId, listenerIds),
+      // layer can say which of them are still in the room. Answered from the
+      // room's own channel, so a bot that has since moved cannot report the
+      // wrong audience.
+      presentListeners: (room, listenerIds) => this.#listenersInVoice(room, listenerIds),
     });
   }
 
@@ -1006,13 +1039,10 @@ export class MusicManager {
    * because silently de-personalising a live session is worse than trusting a
    * ledger for one generation pass.
    */
-  #listenersInVoice(guildId: string, listenerIds: readonly string[]): readonly string[] {
+  #listenersInVoice(room: RoomRef, listenerIds: readonly string[]): readonly string[] {
     if (listenerIds.length === 0) return listenerIds;
 
-    const player = this.#players.get(guildId);
-    if (player === undefined) return listenerIds;
-
-    const channel = this.#client.channels.cache.get(player.voiceChannelId);
+    const channel = this.#client.channels.cache.get(room.voiceChannelId);
     if (channel?.isVoiceBased() !== true) return listenerIds;
 
     // `members` is derived from voice states, which the GuildVoiceStates
@@ -1022,7 +1052,7 @@ export class MusicManager {
     const inRoom = listenerIds.filter((id) => present.has(id));
     if (inRoom.length !== listenerIds.length) {
       logger.debug(
-        { guildId, remembered: listenerIds.length, present: inRoom.length },
+        { roomId: room.roomId, remembered: listenerIds.length, present: inRoom.length },
         'Autoplay listeners narrowed to the voice channel',
       );
     }
@@ -1070,14 +1100,16 @@ export class MusicManager {
   }
 
   /**
-   * Mirror a guild's live queue (current track included) into the session
+   * Mirror a room's live queue (current track included) into the session
    * store. Called on every queue mutation, so the recommendation pipeline's
-   * "already queued" exclusion can never drift from the real queue.
+   * "already queued" exclusion can never drift from the real queue — and so
+   * one channel's queue never excludes songs from another's.
    */
   #syncSessionQueue(guildId: string): void {
     const session = this.#autoplaySession;
     if (session === undefined) return;
     const player = this.#players.get(guildId);
+    const room = this.#roomOf(guildId);
     const entries =
       player === undefined
         ? []
@@ -1085,7 +1117,9 @@ export class MusicManager {
             ...(player.queue.current === null ? [] : [player.queue.current]),
             ...player.queue.upcoming,
           ].map((track) => this.#sessionEntryOf(track));
-    void session.syncQueue(guildId, entries).catch(() => undefined);
+    // No player means no room; there is nothing to mirror and nowhere to
+    // mirror it to.
+    if (room !== undefined) void session.syncQueue(room.roomId, entries).catch(() => undefined);
   }
 
   /**
@@ -1264,8 +1298,11 @@ export class MusicManager {
       if (gone.sourceKey !== undefined) keys.add(gone.sourceKey);
     }
 
-    const evicted = this.#autoplay?.evict(guildId, keys) ?? 0;
-    void this.#autoplaySession?.recordDisliked(guildId, [...keys]).catch(() => undefined);
+    const room = this.#roomOf(guildId);
+    const evicted = room === undefined ? 0 : (this.#autoplay?.evict(room.roomId, keys) ?? 0);
+    if (room !== undefined) {
+      void this.#autoplaySession?.recordDisliked(room.roomId, [...keys]).catch(() => undefined);
+    }
 
     logger.info(
       {
@@ -1297,13 +1334,17 @@ export class MusicManager {
 
   /** A dislike withdrawn: the session mirror must stop excluding the song. */
   forgetDislike(guildId: string, trackKey: string): void {
-    void this.#autoplaySession?.forgetDisliked(guildId, [trackKey]).catch(() => undefined);
+    const room = this.#roomOf(guildId);
+    if (room !== undefined) {
+      void this.#autoplaySession?.forgetDisliked(room.roomId, [trackKey]).catch(() => undefined);
+    }
     logger.info({ event: 'AUTOPLAY_UNDISLIKE', guildId, key: trackKey }, 'Dislike withdrawn');
   }
 
-  /** Drop a guild's prefetched autoplay buffer — on stop or disconnect. */
+  /** Drop this room's prefetched autoplay buffer — on stop or disconnect. */
   clearAutoplayBuffer(guildId: string): void {
-    this.#autoplay?.clear(guildId);
+    const room = this.#roomOf(guildId);
+    if (room !== undefined) this.#autoplay?.clear(room.roomId);
   }
 
   /**
@@ -1312,7 +1353,11 @@ export class MusicManager {
    * ends). One indexed query; the anchor selection itself is pure.
    */
   async #anchorSeeds(guildId: string, current?: QueuedTrack): Promise<readonly TrackSeed[]> {
-    const history = await this.#store.recentHistory(guildId, 40);
+    const history = await this.#store.recentHistory(
+      guildId,
+      40,
+      this.#players.get(guildId)?.voiceChannelId,
+    );
     const entries: AnchorHistoryEntry[] = [
       ...(current === undefined
         ? []
@@ -1711,7 +1756,11 @@ export class MusicManager {
     if (node === undefined) return [];
     const wanted = Math.max(1, Math.min(count, AUTOPLAY_MAX_PICKS));
 
-    const history = await this.#store.recentHistory(guildId, 40);
+    const history = await this.#store.recentHistory(
+      guildId,
+      40,
+      this.#players.get(guildId)?.voiceChannelId,
+    );
     // The very first song of a fresh guild is still playing when the low-
     // water refill first asks, and its history row is only written when it
     // ends. What is playing IS the session; it seeds until history exists —
@@ -1764,12 +1813,14 @@ export class MusicManager {
         ...queued,
       ]);
 
-      const recommended = await engine.take(guildId, wanted, seeds);
+      const room = this.#roomOf(guildId);
+      const recommended = room === undefined ? [] : await engine.take(room, wanted, seeds);
       if (recommended.length > 0) {
         logger.info(
           {
             event: 'RECOMMENDATION_QUEUED',
             guildId,
+            roomId: room?.roomId,
             strategy: 'recommender',
             picked: recommended.length,
           },
@@ -1783,7 +1834,11 @@ export class MusicManager {
     // The mix fallback shares the recommender's exclusion state where it can:
     // history identifiers always, plus the session's queued/recent sets when
     // the AI stack is wired.
-    const sessionSnapshot = await this.#autoplaySession?.snapshot(guildId).catch(() => undefined);
+    const fallbackRoom = this.#roomOf(guildId);
+    const sessionSnapshot =
+      fallbackRoom === undefined
+        ? undefined
+        : await this.#autoplaySession?.snapshot(fallbackRoom.roomId).catch(() => undefined);
     const playedIdentifiers = new Set([
       ...history.map((entry) => entry.identifier),
       ...(sessionSnapshot?.recentIdentifiers ?? []),
@@ -1974,7 +2029,9 @@ export class MusicManager {
         player.queue.restore(persisted.tracks, persisted.currentIndex, persisted.loopMode);
         await player.setVolume(persisted.volume);
         if (listener !== null) {
-          void this.#autoplaySession?.setListener(guildId, listener).catch(() => undefined);
+          void this.#autoplaySession
+            ?.setListener(roomIdOf(guildId, persisted.voiceChannelId), listener)
+            .catch(() => undefined);
         }
 
         // Resume from the track after the last known one — the position within
@@ -2159,11 +2216,14 @@ export class MusicManager {
 
   /** Tear down a guild's player and leave its voice channel. */
   async destroyPlayer(guildId: string): Promise<void> {
-    // Free the prefetch buffer with the player; a guild that left should not
-    // keep tracks parked in memory waiting for a queue that will never drain.
-    this.#autoplay?.clear(guildId);
     const player = this.#players.get(guildId);
     if (player === undefined) return;
+
+    // Free the prefetch buffer with the player; a room that ended should not
+    // keep tracks parked in memory waiting for a queue that will never drain.
+    // Read from the player, because after the delete below there is nothing
+    // left to say which channel this was.
+    this.#autoplay?.clear(roomIdOf(guildId, player.voiceChannelId));
 
     this.#players.delete(guildId);
     // A resume nobody asked about does not survive the session it belongs to.

@@ -24,6 +24,7 @@ import type { QueuedTrack } from '../music/track.js';
 import type { AutoplayGenerator } from './autoplay-planner.js';
 import { trackKeyOf } from './identity.js';
 import { computeAutoplayMetrics } from './metrics.js';
+import type { RoomRef } from './room.js';
 import type { TrackSeed } from './recommender.js';
 import type { AutoplaySessionStore } from './session.js';
 
@@ -94,14 +95,15 @@ export class AutoplayEngine {
    * the background and its failure is logged, never thrown — a prefetch that
    * fails simply means the next `take` generates synchronously instead.
    */
-  prefetch(guildId: string, seeds: readonly TrackSeed[]): void {
+  prefetch(room: RoomRef, seeds: readonly TrackSeed[]): void {
+    const { roomId } = room;
     if (seeds.length === 0) return;
 
     // A buffer that still holds at least half its target and follows a track
     // in the CURRENT seed window is good enough — regenerating it would cost a
     // full Last.fm sweep plus Lavalink searches on every single track start,
     // for picks that were fine.
-    const existing = this.#buffers.get(guildId);
+    const existing = this.#buffers.get(roomId);
     if (
       existing !== undefined &&
       existing.tracks.length >= Math.ceil(this.#options.prefetchSize / 2) &&
@@ -112,12 +114,12 @@ export class AutoplayEngine {
       // instead of "drifting" out of a 4-track window while still perfectly
       // relevant. Staleness stays bounded by the TTL, whose clock is anchored
       // at generation and never reset.
-      this.#buffers.set(guildId, { ...existing, seedKey: seedKeyOf(seeds) });
+      this.#buffers.set(roomId, { ...existing, seedKey: seedKeyOf(seeds) });
       return;
     }
 
-    void this.#refill(guildId, seeds).catch((error: unknown) => {
-      logger.debug({ err: error, guildId }, 'Autoplay prefetch failed');
+    void this.#refill(room, seeds).catch((error: unknown) => {
+      logger.debug({ err: error, roomId }, 'Autoplay prefetch failed');
     });
   }
 
@@ -130,34 +132,35 @@ export class AutoplayEngine {
    * array rather than throwing, so the caller's own fallback can take over.
    */
   async take(
-    guildId: string,
+    room: RoomRef,
     count: number,
     seeds: readonly TrackSeed[],
   ): Promise<readonly QueuedTrack[]> {
-    const buffered = this.#drain(guildId, count, seeds);
+    const { roomId } = room;
+    const buffered = this.#drain(roomId, count, seeds);
     if (buffered.length > 0) {
       // Refill for next time while the caller is already playing these.
-      this.prefetch(guildId, seeds);
-      logger.debug({ guildId, served: buffered.length, from: 'buffer' }, 'Autoplay served');
+      this.prefetch(room, seeds);
+      logger.debug({ roomId, served: buffered.length, from: 'buffer' }, 'Autoplay served');
       return buffered;
     }
 
     // An in-flight generation is worth waiting for — it is already most of the
     // way through the work this call would otherwise redo from scratch.
-    const pending = this.#inFlight.get(guildId);
+    const pending = this.#inFlight.get(roomId);
     if (pending !== undefined) {
       await pending.catch(() => undefined);
-      const afterWait = this.#drain(guildId, count, seeds);
+      const afterWait = this.#drain(roomId, count, seeds);
       if (afterWait.length > 0) {
-        logger.debug({ guildId, served: afterWait.length, from: 'in-flight' }, 'Autoplay served');
+        logger.debug({ roomId, served: afterWait.length, from: 'in-flight' }, 'Autoplay served');
         return afterWait;
       }
     }
 
     try {
       let served: readonly QueuedTrack[] = [];
-      await this.#gated(guildId, async () => {
-        served = (await this.#generate(guildId, seeds, count, { background: false })).map(
+      await this.#gated(roomId, async () => {
+        served = (await this.#generate(room, seeds, count, { background: false })).map(
           (entry) => entry.track,
         );
       });
@@ -166,16 +169,16 @@ export class AutoplayEngine {
         // in flight, in which case OUR work never ran — but the refill's
         // buffer is sitting right there. Serve from it instead of falling
         // through to the mix path with a silent empty result.
-        const coalesced = this.#drain(guildId, count, seeds);
+        const coalesced = this.#drain(roomId, count, seeds);
         if (coalesced.length > 0) {
-          logger.debug({ guildId, served: coalesced.length, from: 'coalesced' }, 'Autoplay served');
+          logger.debug({ roomId, served: coalesced.length, from: 'coalesced' }, 'Autoplay served');
           return coalesced;
         }
       }
-      logger.debug({ guildId, served: served.length, from: 'synchronous' }, 'Autoplay served');
+      logger.debug({ roomId, served: served.length, from: 'synchronous' }, 'Autoplay served');
       return served;
     } catch (error) {
-      logger.warn({ err: error, guildId }, 'Autoplay generation failed');
+      logger.warn({ err: error, roomId }, 'Autoplay generation failed');
       return [];
     }
   }
@@ -187,13 +190,13 @@ export class AutoplayEngine {
    * again; they were never queued, and holding them would punish the next
    * session for picks nobody heard.
    */
-  clear(guildId: string): void {
-    const buffer = this.#buffers.get(guildId);
-    this.#buffers.delete(guildId);
+  clear(roomId: string): void {
+    const buffer = this.#buffers.get(roomId);
+    this.#buffers.delete(roomId);
     if (buffer !== undefined && buffer.tracks.length > 0) {
       void this.#session
         .release(
-          guildId,
+          roomId,
           buffer.tracks.map((entry) => entry.reservedKey),
         )
         .catch(() => undefined);
@@ -205,8 +208,8 @@ export class AutoplayEngine {
    * be served from a pick chosen a minute earlier. Reservations on the
    * evicted keys are released so nothing keeps holding them.
    */
-  evict(guildId: string, keys: ReadonlySet<string>): number {
-    const buffer = this.#buffers.get(guildId);
+  evict(roomId: string, keys: ReadonlySet<string>): number {
+    const buffer = this.#buffers.get(roomId);
     if (buffer === undefined || keys.size === 0) return 0;
     const evicted = buffer.tracks.filter(
       (entry) =>
@@ -214,19 +217,19 @@ export class AutoplayEngine {
     );
     if (evicted.length === 0) return 0;
     const remaining = buffer.tracks.filter((entry) => !evicted.includes(entry));
-    if (remaining.length === 0) this.#buffers.delete(guildId);
-    else this.#buffers.set(guildId, { ...buffer, tracks: remaining });
+    if (remaining.length === 0) this.#buffers.delete(roomId);
+    else this.#buffers.set(roomId, { ...buffer, tracks: remaining });
     void this.#session
       .release(
-        guildId,
+        roomId,
         evicted.map((entry) => entry.reservedKey),
       )
       .catch(() => undefined);
     return evicted.length;
   }
 
-  #drain(guildId: string, count: number, seeds: readonly TrackSeed[]): readonly QueuedTrack[] {
-    const buffer = this.#buffers.get(guildId);
+  #drain(roomId: string, count: number, seeds: readonly TrackSeed[]): readonly QueuedTrack[] {
+    const buffer = this.#buffers.get(roomId);
     if (buffer === undefined) return [];
 
     // Valid while its seed is anywhere in the current seed window — a buffer
@@ -236,46 +239,47 @@ export class AutoplayEngine {
     const stale =
       Date.now() - buffer.generatedAt > BUFFER_TTL_MS || !seedWindowOf(seeds).has(buffer.seedKey);
     if (stale) {
-      this.clear(guildId);
+      this.clear(roomId);
       return [];
     }
 
     const taken = buffer.tracks.splice(0, count);
-    if (buffer.tracks.length === 0) this.#buffers.delete(guildId);
+    if (buffer.tracks.length === 0) this.#buffers.delete(roomId);
     // Reservations on served tracks stay: the caller is about to queue them,
     // and the reservation TTL covers the gap until the queue sync sees them.
     return taken.map((entry) => entry.track);
   }
 
   /** Run `work` as THE generation pass for a guild; concurrent calls coalesce. */
-  async #gated(guildId: string, work: () => Promise<void>): Promise<void> {
-    const existing = this.#inFlight.get(guildId);
+  async #gated(roomId: string, work: () => Promise<void>): Promise<void> {
+    const existing = this.#inFlight.get(roomId);
     if (existing !== undefined) return existing;
 
     const gate = work().finally(() => {
-      this.#inFlight.delete(guildId);
+      this.#inFlight.delete(roomId);
     });
-    this.#inFlight.set(guildId, gate);
+    this.#inFlight.set(roomId, gate);
     return gate;
   }
 
-  async #refill(guildId: string, seeds: readonly TrackSeed[]): Promise<void> {
-    return this.#gated(guildId, async () => {
+  async #refill(room: RoomRef, seeds: readonly TrackSeed[]): Promise<void> {
+    const { roomId } = room;
+    return this.#gated(roomId, async () => {
       // A drifted buffer must go through a release so its reservations are
       // handed back — silently dropping it kept every discarded pick locked
       // out for the full reservation TTL, starving the pool's head. The
       // release is AWAITED (we are inside the per-guild gate): fired and
       // forgotten, the Redis DEL could land after the SET NX of the very next
       // generation pass and delete a live reservation.
-      const existing = this.#buffers.get(guildId);
+      const existing = this.#buffers.get(roomId);
       const survivors =
         existing !== undefined && seedWindowOf(seeds).has(existing.seedKey) ? existing.tracks : [];
       if (existing !== undefined && survivors.length === 0) {
-        this.#buffers.delete(guildId);
+        this.#buffers.delete(roomId);
         if (existing.tracks.length > 0) {
           await this.#session
             .release(
-              guildId,
+              roomId,
               existing.tracks.map((entry) => entry.reservedKey),
             )
             .catch(() => undefined);
@@ -287,9 +291,9 @@ export class AutoplayEngine {
       const needed = this.#options.prefetchSize - survivors.length;
       if (needed <= 0) return;
 
-      const entries = await this.#generate(guildId, seeds, needed, { background: true });
+      const entries = await this.#generate(room, seeds, needed, { background: true });
       if (survivors.length + entries.length > 0) {
-        this.#buffers.set(guildId, {
+        this.#buffers.set(roomId, {
           tracks: [...survivors, ...entries],
           // Anchored to the ORIGINAL generation when entries survive a merge:
           // a survivor's reservation (20 min from reserve) must always outlive
@@ -305,19 +309,20 @@ export class AutoplayEngine {
   }
 
   async #generate(
-    guildId: string,
+    room: RoomRef,
     seeds: readonly TrackSeed[],
     count: number,
     options: { readonly background: boolean },
   ): Promise<readonly BufferedTrack[]> {
+    const { roomId } = room;
     // The generator reads the session itself — exclusions, reservations and
     // the familiar/discovery rhythm all live there — and returns picks that
     // are already reserved under `reservedKey`.
-    const generated = await this.#generator.generate(guildId, seeds, count, options);
+    const generated = await this.#generator.generate(room, seeds, count, options);
 
     if (generated.length > 0) {
       void this.#session
-        .recordOutcome(guildId, 'recommended', generated.length)
+        .recordOutcome(roomId, 'recommended', generated.length)
         .catch(() => undefined);
     }
 
@@ -325,11 +330,11 @@ export class AutoplayEngine {
     // pass, so a regression shows up in the logs before it shows up in a
     // complaint.
     try {
-      const snapshot = await this.#session.snapshot(guildId);
+      const snapshot = await this.#session.snapshot(roomId);
       logger.debug(
         {
           event: 'AUTOPLAY_METRICS',
-          guildId,
+          roomId,
           ...computeAutoplayMetrics(snapshot.outcomes, snapshot.recentArtists),
         },
         'Autoplay quality metrics',

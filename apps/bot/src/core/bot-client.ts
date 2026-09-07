@@ -243,21 +243,18 @@ export class BotClient extends Client {
       ...(this.#redis && { redis: this.#redis }),
     });
     /**
-     * Only the primary wires autoplay for now.
+     * Every player wires its own autoplay.
      *
-     * `planner.setResolvers` and `orchestrator.setResolver` are single-slot
-     * setters on shared objects, so several managers calling `attachAutoplay`
-     * would leave whichever ran last owning every room's resolution — and
-     * `presentListeners` in particular would then report the audience of one
-     * arbitrary bot's channel for every room, personalising each room around
-     * the wrong people. That is silent and would be near-impossible to spot in
-     * logs. The router stage replaces these bound closures with a per-room
-     * lookup; until then a worker's manager simply has no autoplay, which is
-     * safe because it serves no rooms yet.
+     * The resolvers are single-slot setters, which would be a problem if the
+     * planner were shared — the last manager to attach would own every room's
+     * resolution, and `presentListeners` would report one arbitrary bot's
+     * audience for all of them. It is not shared: each client builds its own
+     * stack above, so each manager attaches to its own planner and resolves
+     * only for its own rooms. The ledger underneath is keyed by room, so two
+     * channels of one server keep separate histories, reservations and
+     * anti-repeat even though they run on different bots.
      */
-    if (this.identity.role === 'primary') {
-      this.music?.attachAutoplay(this.ai.autoplay, this.ai.orchestrator, this.ai.planner);
-    }
+    this.music?.attachAutoplay(this.ai.autoplay, this.ai.orchestrator, this.ai.planner);
   }
 
   /**
