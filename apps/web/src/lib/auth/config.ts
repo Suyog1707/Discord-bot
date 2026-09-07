@@ -21,6 +21,7 @@ import { discordAvatarUrl } from '@/lib/discord/cdn';
 import { getDb } from '@/lib/db';
 import { getEnv, isProduction } from '@/lib/env';
 import { getLogger } from '@/lib/logger';
+import { omitUndefined } from '@/lib/object';
 
 /** OAuth scopes: identity + email for the profile, guilds for the server list. */
 const DISCORD_SCOPES = ['identify', 'email', 'guilds'].join(' ');
@@ -81,7 +82,42 @@ export function buildAuthConfig(): NextAuthConfig {
       },
     },
     events: {
-      async signIn({ user }) {
+      async signIn({ user, account }) {
+        /**
+         * Re-persist the Discord tokens on *every* sign-in.
+         *
+         * Auth.js only calls the adapter's `linkAccount` when the account row
+         * does not exist yet: signing in again with an already-linked Discord
+         * account creates a fresh session but leaves the stored access and
+         * refresh tokens untouched (@auth/core `handle-login`, the
+         * `userByAccount` branch). Once Discord rejects the stored refresh
+         * token with `invalid_grant` — it was revoked, or a rotation was lost
+         * — nothing in the normal flow can ever replace it, so the dashboard
+         * stays locked out of the Discord API while the database session
+         * happily lives on for its full 30 days. Writing the freshly issued
+         * pair here is what makes signing in again an actual repair.
+         */
+        if (account?.provider === 'discord' && account.providerAccountId !== '') {
+          try {
+            await getDb().account.updateMany({
+              where: { provider: 'discord', providerAccountId: account.providerAccountId },
+              // A value Discord omitted must leave the stored one alone
+              // rather than nulling it, so drop the absent keys entirely.
+              data: omitUndefined({
+                access_token: account.access_token,
+                refresh_token: account.refresh_token,
+                expires_at: typeof account.expires_at === 'number' ? account.expires_at : undefined,
+                token_type: account.token_type,
+                scope: account.scope,
+              }),
+            });
+          } catch (error) {
+            // Never break sign-in over this; the dashboard detects a dead
+            // link on the next Discord call and sends the user back here.
+            logger.error({ err: error, userId: user.id }, 'Failed to persist Discord tokens');
+          }
+        }
+
         if (user.id === undefined) return;
         try {
           await getDb().user.update({

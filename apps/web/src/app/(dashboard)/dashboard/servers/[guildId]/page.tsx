@@ -6,7 +6,7 @@ import { AppLink } from '@/components/navigation/app-link';
 import { notFound, redirect } from 'next/navigation';
 import { revalidatePath } from 'next/cache';
 
-import { requireUserOrRedirect } from '@/lib/auth/session';
+import { requireUserOrRedirect, withDiscordLink } from '@/lib/auth/session';
 import { formNumber, formString } from '@/lib/forms';
 import { guildIconUrl } from '@/lib/discord/cdn';
 import { getServerDetail, updateGuildSettings } from '@/lib/services/guilds';
@@ -30,7 +30,9 @@ export default async function ServerDetailPage({
 
   let detail;
   try {
-    detail = await getServerDetail(user.id, guildId);
+    detail = await withDiscordLink(`/dashboard/servers/${guildId}`, () =>
+      getServerDetail(user.id, guildId),
+    );
   } catch (error) {
     // Not managed / bot absent → treat as a missing page rather than an error.
     if (isAppError(error) && (error.statusCode === 403 || error.statusCode === 404)) {

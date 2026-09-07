@@ -3,7 +3,7 @@ import type { Metadata } from 'next';
 import Image from 'next/image';
 import { AppLink } from '@/components/navigation/app-link';
 
-import { requireUserOrRedirect } from '@/lib/auth/session';
+import { requireUserOrRedirect, withDiscordLink } from '@/lib/auth/session';
 import { guildIconUrl } from '@/lib/discord/cdn';
 import { getEnv } from '@/lib/env';
 import { listServers } from '@/lib/services/guilds';
@@ -29,7 +29,7 @@ function inviteUrl(guildId: string): string {
 
 export default async function ServersPage() {
   const user = await requireUserOrRedirect('/dashboard/servers');
-  const servers = await listServers(user.id);
+  const servers = await withDiscordLink('/dashboard/servers', () => listServers(user.id));
 
   return (
     <div className="flex flex-col gap-6">

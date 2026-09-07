@@ -2,7 +2,7 @@ import { isAppError } from '@discord-music/shared';
 import type { Metadata } from 'next';
 import { AppLink } from '@/components/navigation/app-link';
 
-import { requireUserOrRedirect } from '@/lib/auth/session';
+import { requireUserOrRedirect, withDiscordLink } from '@/lib/auth/session';
 import { getGuildAnalytics } from '@/lib/services/analytics';
 import { listServers } from '@/lib/services/guilds';
 import { Badge } from '@/components/ui/badge';
@@ -20,7 +20,9 @@ export default async function AnalyticsPage({
   const user = await requireUserOrRedirect('/dashboard/analytics');
   const { guild: selectedGuildId } = await searchParams;
 
-  const servers = (await listServers(user.id)).filter((server) => server.botPresent);
+  const servers = (
+    await withDiscordLink('/dashboard/analytics', () => listServers(user.id))
+  ).filter((server) => server.botPresent);
   const selected = servers.find((server) => server.discordId === selectedGuildId) ?? servers[0];
 
   let analytics = null;

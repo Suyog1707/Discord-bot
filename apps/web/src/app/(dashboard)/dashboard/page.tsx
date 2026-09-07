@@ -1,7 +1,7 @@
 import type { Metadata } from 'next';
 import { AppLink } from '@/components/navigation/app-link';
 
-import { requireUserOrRedirect } from '@/lib/auth/session';
+import { requireUserOrRedirect, withDiscordLink } from '@/lib/auth/session';
 import { getProfile } from '@/lib/services/account';
 import { listServers } from '@/lib/services/guilds';
 import { Button } from '@/components/ui/button';
@@ -13,9 +13,13 @@ export const dynamic = 'force-dynamic';
 export default async function DashboardOverviewPage() {
   const user = await requireUserOrRedirect('/dashboard');
 
+  // A failed server list used to be swallowed into an empty array, which
+  // rendered as a confident "0 active servers" — indistinguishable from
+  // genuinely having none, and the reason a dead Discord link looked like
+  // missing data instead of an expired connection.
   const [profile, servers] = await Promise.all([
     getProfile(user.id),
-    listServers(user.id).catch(() => []),
+    withDiscordLink('/dashboard', () => listServers(user.id)),
   ]);
   const activeServers = servers.filter((server) => server.botPresent);
 

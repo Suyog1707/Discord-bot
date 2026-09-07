@@ -70,3 +70,29 @@ export async function requireUserOrRedirect(callbackUrl: string): Promise<Sessio
   }
   return user;
 }
+
+/**
+ * Run a loader that talks to Discord as the user, sending them back to
+ * re-consent if that link is dead.
+ *
+ * The dashboard has two independent sessions and they expire on different
+ * clocks: our database session lasts 30 days, while Discord's access token
+ * lasts a week and its refresh token can be revoked at any time. When the
+ * Discord side dies the visitor is still perfectly signed in *here*, so
+ * `requireUserOrRedirect` waves them through and the page then throws an
+ * `UnauthenticatedError` from the middle of the render — a 500 the user
+ * cannot do anything about, on a page that offers no way to reconnect.
+ *
+ * Reconnecting is the actual remedy, so route them to it. `reauth=1` is what
+ * stops /login bouncing an already-signed-in visitor straight back here.
+ */
+export async function withDiscordLink<T>(callbackUrl: string, load: () => Promise<T>): Promise<T> {
+  try {
+    return await load();
+  } catch (error) {
+    if (error instanceof UnauthenticatedError) {
+      redirect(`/login?reauth=1&callbackUrl=${encodeURIComponent(callbackUrl)}`);
+    }
+    throw error;
+  }
+}
