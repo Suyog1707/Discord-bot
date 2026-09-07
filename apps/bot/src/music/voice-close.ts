@@ -44,6 +44,16 @@ export interface ReconnectBudget {
   readonly attempts: number;
   /** Whether a rebuild is running right now. */
   readonly inFlight: boolean;
+  /**
+   * When the last rebuild came back healthy, or null if the last one failed
+   * (or none has finished yet).
+   *
+   * The budget exists to stop a runaway loop, and a rebuild that worked and
+   * then held is not a loop — it is the feature doing its job. Without this,
+   * three drops on a flaky network inside a minute spent the budget and tore
+   * down a session that was recovering perfectly well every time.
+   */
+  readonly recoveredAt: number | null;
 }
 
 export type ReconnectClaim =
@@ -65,16 +75,82 @@ export type ReconnectClaim =
 export function claimReconnect(
   current: ReconnectBudget | undefined,
   now: number,
-  limits: { readonly maxAttempts: number; readonly windowMs: number },
+  limits: {
+    readonly maxAttempts: number;
+    readonly windowMs: number;
+    /**
+     * How long a rebuilt session must survive before the drop that follows it
+     * counts as a new incident rather than another turn of the same loop.
+     */
+    readonly stabilityMs: number;
+  },
 ): ReconnectClaim {
-  if (current === undefined || now - current.startedAt > limits.windowMs) {
-    return { decision: 'claimed', next: { startedAt: now, attempts: 1, inFlight: true } };
-  }
+  const fresh: ReconnectClaim = {
+    decision: 'claimed',
+    next: { startedAt: now, attempts: 1, inFlight: true, recoveredAt: null },
+  };
+
+  if (current === undefined || now - current.startedAt > limits.windowMs) return fresh;
   if (current.inFlight) return { decision: 'busy' };
+
+  // The last rebuild worked and the session then ran for a while. Whatever
+  // just happened is a new fault, not evidence that rejoining is failing.
+  if (current.recoveredAt !== null && now - current.recoveredAt >= limits.stabilityMs) {
+    return fresh;
+  }
+
   if (current.attempts >= limits.maxAttempts) return { decision: 'exhausted' };
 
   return {
     decision: 'claimed',
-    next: { startedAt: current.startedAt, attempts: current.attempts + 1, inFlight: true },
+    next: {
+      startedAt: current.startedAt,
+      attempts: current.attempts + 1,
+      inFlight: true,
+      recoveredAt: current.recoveredAt,
+    },
   };
+}
+
+/**
+ * Hand the budget back when a rebuild finishes.
+ *
+ * A recovery is stamped rather than forgotten: deleting the entry outright
+ * would let a voice server that accepts every rejoin and then drops it
+ * immediately loop forever, because each pass would start from a clean
+ * budget. {@link claimReconnect} decides what the stamp is worth.
+ */
+export function releaseReconnect(
+  current: ReconnectBudget | undefined,
+  outcome: 'recovered' | 'failed',
+  now: number,
+): ReconnectBudget | undefined {
+  if (current === undefined) return undefined;
+  return {
+    ...current,
+    inFlight: false,
+    recoveredAt: outcome === 'recovered' ? now : null,
+  };
+}
+
+/**
+ * Guilds whose window has closed and whose budget can be dropped.
+ *
+ * Budgets were only ever written, so a long-lived process accumulated one
+ * entry per guild that had ever lost a voice socket. They are only meaningful
+ * inside their window, so anything older is dead weight — swept on the next
+ * claim rather than on a timer, because a map this small does not deserve one.
+ */
+export function expiredReconnects(
+  entries: Iterable<readonly [string, ReconnectBudget]>,
+  now: number,
+  windowMs: number,
+): readonly string[] {
+  const stale: string[] = [];
+  for (const [guildId, budget] of entries) {
+    // Never drop a rebuild that is still running: its `finally` needs the entry.
+    if (budget.inFlight) continue;
+    if (now - budget.startedAt > windowMs) stale.push(guildId);
+  }
+  return stale;
 }

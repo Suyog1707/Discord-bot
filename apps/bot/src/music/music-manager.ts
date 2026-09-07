@@ -49,6 +49,8 @@ import { SessionDjRegistry } from './session-dj.js';
 import {
   claimReconnect,
   decideVoiceClose,
+  expiredReconnects,
+  releaseReconnect,
   type ReconnectBudget,
   type ReconnectClaim,
 } from './voice-close.js';
@@ -113,6 +115,17 @@ const VOICE_RECONNECT_MAX_ATTEMPTS = 3;
  * reconnect loop is not.
  */
 const VOICE_RECONNECT_WINDOW_MS = 60_000;
+/**
+ * How long a rebuilt session must hold before the next drop is treated as a
+ * fresh incident rather than another turn of the same loop.
+ *
+ * A flaky network that drops the socket every few minutes recovers cleanly
+ * every time, and used to spend its whole budget doing so — three good
+ * reconnects inside a minute tore down a session that was working. A socket
+ * that dies again within seconds of coming back is the pathology the budget
+ * is actually for, and it still counts.
+ */
+const VOICE_RECONNECT_STABILITY_MS = 30_000;
 /** A reachability probe should answer immediately or not at all. */
 const PROBE_TIMEOUT_MS = 2_000;
 /**
@@ -2021,9 +2034,19 @@ export class MusicManager {
    * keep the bot rejoining forever.
    */
   #claimVoiceReconnect(guildId: string): ReconnectClaim['decision'] {
-    const claim = claimReconnect(this.#voiceReconnects.get(guildId), Date.now(), {
+    const now = Date.now();
+
+    // Budgets outlive their window and were never cleaned up, so a long-lived
+    // process kept one per guild that had ever dropped a socket. Sweeping on
+    // the claim keeps the map the size of the guilds actually reconnecting.
+    for (const stale of expiredReconnects(this.#voiceReconnects, now, VOICE_RECONNECT_WINDOW_MS)) {
+      this.#voiceReconnects.delete(stale);
+    }
+
+    const claim = claimReconnect(this.#voiceReconnects.get(guildId), now, {
       maxAttempts: VOICE_RECONNECT_MAX_ATTEMPTS,
       windowMs: VOICE_RECONNECT_WINDOW_MS,
+      stabilityMs: VOICE_RECONNECT_STABILITY_MS,
     });
     if (claim.decision === 'claimed') this.#voiceReconnects.set(guildId, claim.next);
     return claim.decision;
@@ -2087,6 +2110,7 @@ export class MusicManager {
       'Voice session died; rebuilding the connection',
     );
 
+    let recovered = false;
     try {
       // Teardown first: it is what clears the connection and the voice state
       // that would otherwise make the rejoin a no-op to Discord.
@@ -2115,6 +2139,7 @@ export class MusicManager {
         if (snapshot.positionMs > 0) await fresh.seekTo(snapshot.positionMs);
       }
 
+      recovered = true;
       logger.info(
         { guildId, code, tracks: snapshot.tracks.length, resumed: snapshot.wasPlaying },
         'Voice session rebuilt',
@@ -2122,8 +2147,13 @@ export class MusicManager {
     } catch (error) {
       logger.error({ err: error, guildId, code }, 'Voice reconnect failed');
     } finally {
-      const entry = this.#voiceReconnects.get(guildId);
-      if (entry !== undefined) this.#voiceReconnects.set(guildId, { ...entry, inFlight: false });
+      const next = releaseReconnect(
+        this.#voiceReconnects.get(guildId),
+        recovered ? 'recovered' : 'failed',
+        Date.now(),
+      );
+      if (next === undefined) this.#voiceReconnects.delete(guildId);
+      else this.#voiceReconnects.set(guildId, next);
     }
   }
 
