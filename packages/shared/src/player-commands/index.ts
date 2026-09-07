@@ -15,69 +15,72 @@ import { snowflakeSchema } from '../validation/index.js';
 /** Redis pub/sub channel for player commands. */
 export const PLAYER_COMMAND_CHANNEL = redisKey(REDIS_NAMESPACE.PLAYER, 'commands');
 
+/**
+ * Who and where every command is for.
+ *
+ * `voiceChannelId` is what keeps a server's rooms apart. A dashboard open on
+ * one channel must not be able to pause another, and since commands are
+ * broadcast on a single channel and filtered by the receiver, the room has to
+ * travel with the command — there is nothing else to tell them apart by.
+ */
+const target = {
+  guildId: snowflakeSchema,
+  voiceChannelId: snowflakeSchema,
+  issuedBy: snowflakeSchema,
+} as const;
+
 export const playerCommandSchema = z.discriminatedUnion('action', [
   z.object({
     action: z.literal('pause'),
-    guildId: snowflakeSchema,
-    issuedBy: snowflakeSchema,
+    ...target,
   }),
   z.object({
     action: z.literal('resume'),
-    guildId: snowflakeSchema,
-    issuedBy: snowflakeSchema,
+    ...target,
   }),
   z.object({
     action: z.literal('skip'),
-    guildId: snowflakeSchema,
-    issuedBy: snowflakeSchema,
+    ...target,
   }),
   z.object({
     action: z.literal('stop'),
-    guildId: snowflakeSchema,
-    issuedBy: snowflakeSchema,
+    ...target,
   }),
   z.object({
     action: z.literal('volume'),
-    guildId: snowflakeSchema,
-    issuedBy: snowflakeSchema,
+    ...target,
     volume: z.number().int().min(LIMITS.VOLUME_MIN).max(LIMITS.VOLUME_MAX),
   }),
   z.object({
     action: z.literal('shuffle'),
-    guildId: snowflakeSchema,
-    issuedBy: snowflakeSchema,
+    ...target,
   }),
   z.object({
     action: z.literal('previous'),
-    guildId: snowflakeSchema,
-    issuedBy: snowflakeSchema,
+    ...target,
   }),
   z.object({
     action: z.literal('jump'),
-    guildId: snowflakeSchema,
-    issuedBy: snowflakeSchema,
+    ...target,
     /** 1-based position within the upcoming tracks, as shown in queue views. */
     position: z.number().int().min(1).max(LIMITS.QUEUE_MAX_TRACKS),
   }),
   z.object({
     action: z.literal('remove'),
-    guildId: snowflakeSchema,
-    issuedBy: snowflakeSchema,
+    ...target,
     /** 1-based position within the upcoming tracks. */
     position: z.number().int().min(1).max(LIMITS.QUEUE_MAX_TRACKS),
   }),
   z.object({
     action: z.literal('move'),
-    guildId: snowflakeSchema,
-    issuedBy: snowflakeSchema,
+    ...target,
     /** 1-based positions within the upcoming tracks. */
     from: z.number().int().min(1).max(LIMITS.QUEUE_MAX_TRACKS),
     to: z.number().int().min(1).max(LIMITS.QUEUE_MAX_TRACKS),
   }),
   z.object({
     action: z.literal('loop'),
-    guildId: snowflakeSchema,
-    issuedBy: snowflakeSchema,
+    ...target,
     mode: z.enum(['off', 'track', 'queue']),
   }),
   z.object({
@@ -88,8 +91,7 @@ export const playerCommandSchema = z.discriminatedUnion('action', [
      * to recognise the same song when it comes back from another source.
      */
     action: z.literal('dislike'),
-    guildId: snowflakeSchema,
-    issuedBy: snowflakeSchema,
+    ...target,
     trackKey: z.string().min(1),
     /**
      * Rejecting what is playing right now should also stop it playing. Default
@@ -101,15 +103,13 @@ export const playerCommandSchema = z.discriminatedUnion('action', [
   z.object({
     /** Undo, from the preferences page. */
     action: z.literal('undislike'),
-    guildId: snowflakeSchema,
-    issuedBy: snowflakeSchema,
+    ...target,
     trackKey: z.string().min(1),
   }),
   z.object({
     /** Settings changed on the dashboard that a live player applies in place. */
     action: z.literal('sync-settings'),
-    guildId: snowflakeSchema,
-    issuedBy: snowflakeSchema,
+    ...target,
     stayConnected: z.boolean().optional(),
     autoplayEnabled: z.boolean().optional(),
   }),

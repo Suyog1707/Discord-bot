@@ -27,7 +27,12 @@ export const POST = authedRoute(
   'write',
   async ({ user, request }) => {
     const body = parseOrThrow(dislikeRemoveInputSchema, await readJsonBody(request));
-    const removed = await removeDislikesForUser(user, body.trackKeys, body.guildId);
+    const removed = await removeDislikesForUser(
+      user,
+      body.trackKeys,
+      body.guildId,
+      body.voiceChannelId,
+    );
     return apiSuccess({ removed });
   },
 );

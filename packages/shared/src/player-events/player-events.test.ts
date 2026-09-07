@@ -4,14 +4,27 @@ import {
   decodePlayerEvent,
   encodePlayerEvent,
   PLAYER_STATE_TTL_SECONDS,
+  playerRoomIndexKey,
   playerStateKey,
   type PlayerEvent,
 } from './index.js';
 
 describe('playerStateKey', () => {
-  it('namespaces the retained snapshot per guild', () => {
-    expect(playerStateKey('123')).toBe('dmp:player:state:123');
-    expect(playerStateKey('456')).not.toBe(playerStateKey('123'));
+  it('namespaces the retained snapshot per room', () => {
+    expect(playerStateKey('123', 'vc-1')).toBe('dmp:player:state:123:vc-1');
+  });
+
+  /**
+   * The property that makes last-write-wins safe: one bot owns one room, so
+   * one writer owns one key. Keyed by server, two rooms would overwrite each
+   * other and a disconnect in one would blank the others.
+   */
+  it('gives two rooms of one server different keys', () => {
+    expect(playerStateKey('123', 'vc-1')).not.toBe(playerStateKey('123', 'vc-2'));
+  });
+
+  it('indexes the rooms of one server under a single key', () => {
+    expect(playerRoomIndexKey('123')).toBe('dmp:player:rooms:123');
   });
 
   it('retains state long enough to outlive a listening session', () => {
@@ -24,6 +37,7 @@ describe('encode/decode round trip', () => {
     const event: PlayerEvent = {
       type: 'TRACK_START',
       guildId: '123',
+      voiceChannelId: 'vc-1',
       sentAt: 1_700_000_000_000,
       state: {
         current: {

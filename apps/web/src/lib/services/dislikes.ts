@@ -80,6 +80,8 @@ export type DislikePageQuery = z.input<typeof dislikePageQuerySchema>;
 export const dislikeRemoveInputSchema = z.object({
   trackKeys: z.array(z.string().min(1).max(600)).min(1).max(DISLIKES_PAGE_SIZE),
   guildId: snowflakeSchema.optional(),
+  /** With `guildId`, names the room to tell; both or neither. */
+  voiceChannelId: snowflakeSchema.optional(),
 });
 
 export type DislikeRemoveInputBody = z.input<typeof dislikeRemoveInputSchema>;
@@ -100,8 +102,11 @@ export interface DislikePageView {
  * bot itself would compute, so sending it back means the dashboard rejects the
  * recording the recommender knows rather than the upload's spelling of it.
  *
- * `guildId`/`skipIfPlaying` are transport, not data — they say "a player is
- * live over there, tell it too" and never reach the database row.
+ * `guildId`/`voiceChannelId`/`skipIfPlaying` are transport, not data — they
+ * say "a player is live over there, tell it too" and never reach the database
+ * row. Both ids together name one room: a server can be playing in several,
+ * and skipping the song in the room the listener is actually watching is the
+ * point.
  */
 export const dislikeInputSchema = z.object({
   title: nonEmptyString(300, 'Title'),
@@ -109,6 +114,7 @@ export const dislikeInputSchema = z.object({
   isrc: z.string().max(32).nullish(),
   trackKey: z.string().min(1).max(600).optional(),
   guildId: snowflakeSchema.optional(),
+  voiceChannelId: snowflakeSchema.optional(),
   skipIfPlaying: z.boolean().optional(),
 });
 
@@ -228,6 +234,7 @@ export async function addDislikeForUser(
 ): Promise<{ readonly added: boolean; readonly trackKey: string }> {
   const parsed = parseOrThrow(dislikeInputSchema, input);
   const guildId = opts?.guildId ?? parsed.guildId;
+  const { voiceChannelId } = parsed;
 
   const result = await addDislike(
     getDb(),
@@ -244,10 +251,14 @@ export async function addDislikeForUser(
     'dashboard',
   );
 
-  if (guildId !== undefined) {
+  // Both ids or neither: the live half of a dislike acts on one room, and
+  // without knowing which there is nothing to tell. The database row — which
+  // is the dislike — has already been written either way.
+  if (guildId !== undefined && voiceChannelId !== undefined) {
     await publishToPlayer({
       action: 'dislike',
       guildId,
+      voiceChannelId,
       issuedBy: user.discordId,
       trackKey: result.trackKey,
       skipIfPlaying: parsed.skipIfPlaying ?? true,
@@ -270,13 +281,15 @@ export async function removeDislikeForUser(
   user: { readonly discordId: string },
   trackKey: string,
   guildId?: string,
+  voiceChannelId?: string,
 ): Promise<boolean> {
   const removed = await removeDislike(getDb(), user.discordId, trackKey);
 
-  if (removed && guildId !== undefined) {
+  if (removed && guildId !== undefined && voiceChannelId !== undefined) {
     await publishToPlayer({
       action: 'undislike',
       guildId,
+      voiceChannelId,
       issuedBy: user.discordId,
       trackKey,
     });
@@ -304,14 +317,26 @@ export async function removeDislikesForUser(
   user: { readonly discordId: string },
   trackKeys: readonly string[],
   guildId?: string,
+  voiceChannelId?: string,
 ): Promise<number> {
   const keys = [...new Set(trackKeys)];
   const removed = await removeDislikes(getDb(), user.discordId, keys);
 
-  if (removed > 0 && guildId !== undefined && keys.length <= LIVE_COMMAND_MAX_KEYS) {
+  if (
+    removed > 0 &&
+    guildId !== undefined &&
+    voiceChannelId !== undefined &&
+    keys.length <= LIVE_COMMAND_MAX_KEYS
+  ) {
     await Promise.all(
       keys.map(async (trackKey) =>
-        publishToPlayer({ action: 'undislike', guildId, issuedBy: user.discordId, trackKey }),
+        publishToPlayer({
+          action: 'undislike',
+          guildId,
+          voiceChannelId,
+          issuedBy: user.discordId,
+          trackKey,
+        }),
       ),
     );
   }

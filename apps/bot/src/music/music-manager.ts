@@ -297,7 +297,8 @@ export class MusicManager {
   #autoplaySession: AutoplaySessionStore | undefined;
 
   readonly #publishEvent: ((payload: string) => void) | undefined;
-  readonly #retainEvent: ((guildId: string, payload: string | null) => void) | undefined;
+  readonly #retainEvent:
+    ((guildId: string, voiceChannelId: string, payload: string | null) => void) | undefined;
   readonly #controllers = new Map<string, ControllerMessage>();
   /** Insertion-ordered so the oldest entry is the one evicted at capacity. */
   /**
@@ -350,7 +351,11 @@ export class MusicManager {
      * gone and the retained state must be dropped. Absent when Redis is not
      * configured.
      */
-    readonly retainEvent?: (guildId: string, payload: string | null) => void;
+    readonly retainEvent?: (
+      guildId: string,
+      voiceChannelId: string,
+      payload: string | null,
+    ) => void;
   }) {
     this.#client = options.client;
     this.#store = options.store;
@@ -820,7 +825,7 @@ export class MusicManager {
         if (type === 'QUEUE_CLEAR') {
           this.#autoplay?.clear(roomIdOf(options.guildId, options.voiceChannelId));
         }
-        this.#emitEvent(options.guildId, type, state);
+        this.#emitEvent(options.guildId, options.voiceChannelId, type, state);
       },
     });
 
@@ -857,7 +862,12 @@ export class MusicManager {
       );
     }
 
-    this.#emitEvent(options.guildId, 'PLAYER_CONNECT', guildPlayer.snapshot());
+    this.#emitEvent(
+      options.guildId,
+      options.voiceChannelId,
+      'PLAYER_CONNECT',
+      guildPlayer.snapshot(),
+    );
 
     logger.info({ guildId: options.guildId, channelId: options.voiceChannelId }, 'Player created');
     return guildPlayer;
@@ -2072,14 +2082,28 @@ export class MusicManager {
     }
   }
 
-  #emitEvent(guildId: string, type: PlayerEventType, state: PlayerSnapshot | null): void {
+  #emitEvent(
+    guildId: string,
+    voiceChannelId: string,
+    type: PlayerEventType,
+    state: PlayerSnapshot | null,
+  ): void {
     // Encoded once and used twice: the live broadcast and the retained copy
     // must be byte-identical, and a second `Date.now()` would make them differ.
-    const payload = encodePlayerEvent({ type, guildId, sentAt: Date.now(), state });
+    const payload = encodePlayerEvent({
+      type,
+      guildId,
+      // On the envelope as well as in the state, so a subscriber can route
+      // without parsing — and so a disconnect, whose state is null, still says
+      // which room went quiet.
+      voiceChannelId,
+      sentAt: Date.now(),
+      state,
+    });
     this.#publishEvent?.(payload);
     // A null state means the player is gone, so the retained snapshot must go
     // with it rather than leave the dashboard greeting new tabs with a ghost.
-    this.#retainEvent?.(guildId, state === null ? null : payload);
+    this.#retainEvent?.(guildId, voiceChannelId, state === null ? null : payload);
     this.#controllers.get(guildId)?.onEvent(type, state);
   }
 

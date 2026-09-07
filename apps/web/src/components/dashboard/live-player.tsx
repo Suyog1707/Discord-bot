@@ -52,9 +52,16 @@ type Command =
 
 export function LivePlayer({
   guildId,
+  voiceChannelId,
   initial,
 }: {
   guildId: string;
+  /**
+   * The room this player follows. A server can be playing in several channels
+   * at once, and each gets its own stream and its own controls — without this
+   * they would all show, and command, whichever room spoke last.
+   */
+  voiceChannelId: string;
   initial: PlayerSnapshot | null;
 }) {
   const [state, setState] = useState<PlayerSnapshot | null>(initial);
@@ -69,7 +76,9 @@ export function LivePlayer({
 
   /* ------------------------------------------------------------ SSE intake */
   useEffect(() => {
-    const source = new EventSource(`/api/server/${guildId}/events`);
+    const source = new EventSource(
+      `/api/server/${guildId}/events?room=${encodeURIComponent(voiceChannelId)}`,
+    );
 
     source.onopen = () => {
       setLive(true);
@@ -93,7 +102,7 @@ export function LivePlayer({
     return () => {
       source.close();
     };
-  }, [guildId]);
+  }, [guildId, voiceChannelId]);
 
   /* --------------------------------------------------- local progress tick */
   useEffect(() => {
@@ -117,7 +126,8 @@ export function LivePlayer({
       fetch(`/api/player/${guildId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(command),
+        // The room travels with every command; the bot routes on it.
+        body: JSON.stringify({ ...command, voiceChannelId }),
       })
         .then(async (response) => {
           const body = (await response.json()) as ApiResponse<{ accepted: boolean }>;
@@ -127,7 +137,7 @@ export function LivePlayer({
           setError('Could not reach the server.');
         });
     },
-    [guildId],
+    [guildId, voiceChannelId],
   );
 
   /**
@@ -148,6 +158,7 @@ export function LivePlayer({
           author: current.author,
           trackKey: current.trackKey,
           guildId,
+          voiceChannelId,
           skipIfPlaying: true,
         }),
       })
@@ -159,7 +170,7 @@ export function LivePlayer({
           setError('Could not reach the server.');
         });
     },
-    [guildId],
+    [guildId, voiceChannelId],
   );
 
   if (state?.current == null) {

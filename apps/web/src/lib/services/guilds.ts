@@ -20,6 +20,9 @@ import { fetchManageableGuilds } from '@/lib/discord/api';
 import { omitUndefined } from '@/lib/object';
 import { getRedis } from '@/lib/redis';
 
+/** Rooms shown on one server page. Comfortably above the fleet's size. */
+const MAX_ROOMS = 10;
+
 export interface ServerListEntry {
   readonly discordId: string;
   readonly name: string;
@@ -83,15 +86,25 @@ export interface ServerDetail {
     | 'stayConnected'
     | 'autoplayEnabled'
   >;
-  readonly queue: {
-    readonly paused: boolean;
-    readonly volume: number;
-    readonly loopMode: string;
-    readonly currentIndex: number;
-    /** The voice channel this queue belongs to; each keeps its own. */
-    readonly voiceChannelId: string;
-    readonly tracks: readonly QueueTrackView[];
-  } | null;
+  /**
+   * Every room this server has a saved queue for, most recently active first.
+   *
+   * A server can play in several voice channels at once and each is its own
+   * session with its own queue, so this is a list rather than "the" queue. It
+   * was a single row picked by `updatedAt`, which showed one room and silently
+   * hid the rest.
+   */
+  readonly rooms: readonly ServerRoom[];
+}
+
+export interface ServerRoom {
+  readonly voiceChannelId: string;
+  readonly paused: boolean;
+  readonly volume: number;
+  readonly loopMode: string;
+  readonly currentIndex: number;
+  readonly updatedAt: Date;
+  readonly tracks: readonly QueueTrackView[];
 }
 
 /** Settings + persisted queue snapshot for the server page. */
@@ -102,18 +115,19 @@ export async function getServerDetail(
   const { guild, summary } = await requireManagedGuild(userId, discordGuildId);
   const db = getDb();
 
-  const [settings, queue] = await Promise.all([
+  const [settings, queues] = await Promise.all([
     db.guildSettings.upsert({
       where: { guildId: guild.id },
       update: {},
       create: { guildId: guild.id },
     }),
-    // A guild has one saved queue per voice channel now. The page shows the
-    // room the bot was most recently in, which is the one a live player would
-    // be serving; the others are waiting for somebody to start the bot there.
-    db.queue.findFirst({
+    // A guild has one saved queue per voice channel, and several can be live
+    // at once. Newest first, so the room somebody is most likely looking for
+    // leads the page.
+    db.queue.findMany({
       where: { guildId: guild.id },
       orderBy: { updatedAt: 'desc' },
+      take: MAX_ROOMS,
       include: { tracks: { orderBy: { position: 'asc' } } },
     }),
   ]);
@@ -132,26 +146,24 @@ export async function getServerDetail(
       stayConnected: settings.stayConnected,
       autoplayEnabled: settings.autoplayEnabled,
     },
-    queue:
-      queue === null
-        ? null
-        : {
-            paused: queue.paused,
-            volume: queue.volume,
-            loopMode: queue.loopMode.toLowerCase(),
-            currentIndex: queue.currentIndex,
-            voiceChannelId: queue.voiceChannelId,
-            tracks: queue.tracks.map((track) => ({
-              position: track.position,
-              title: track.title,
-              author: track.author,
-              durationMs: track.durationMs,
-              uri: track.uri,
-              artworkUrl: track.artworkUrl,
-              isStream: track.isStream,
-              sourceKey: track.sourceKey,
-            })),
-          },
+    rooms: queues.map((queue) => ({
+      voiceChannelId: queue.voiceChannelId,
+      paused: queue.paused,
+      volume: queue.volume,
+      loopMode: queue.loopMode.toLowerCase(),
+      currentIndex: queue.currentIndex,
+      updatedAt: queue.updatedAt,
+      tracks: queue.tracks.map((track) => ({
+        position: track.position,
+        title: track.title,
+        author: track.author,
+        durationMs: track.durationMs,
+        uri: track.uri,
+        artworkUrl: track.artworkUrl,
+        isStream: track.isStream,
+        sourceKey: track.sourceKey,
+      })),
+    })),
   };
 }
 

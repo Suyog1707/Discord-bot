@@ -9,7 +9,7 @@ import { revalidatePath } from 'next/cache';
 import { requireUserOrRedirect, withDiscordLink } from '@/lib/auth/session';
 import { formNumber, formString } from '@/lib/forms';
 import { guildIconUrl } from '@/lib/discord/cdn';
-import { getServerDetail, updateGuildSettings } from '@/lib/services/guilds';
+import { getServerDetail, updateGuildSettings, type ServerRoom } from '@/lib/services/guilds';
 import { LivePlayer } from '@/components/dashboard/live-player';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -43,12 +43,14 @@ export default async function ServerDetailPage({
 
   const icon = guildIconUrl({ id: detail.discordId, icon: detail.icon });
 
-  // Last persisted state seeds the live view; the SSE stream takes over from
-  // the first event. Position is unknown between persists, so it starts at 0.
-  const queueTracks = detail.queue?.tracks ?? [];
-  const currentIndex = detail.queue?.currentIndex ?? 0;
-  const currentTrack = queueTracks.find((track) => track.position === currentIndex) ?? null;
-  const toSnapshotTrack = (track: (typeof queueTracks)[number]) => ({
+  /**
+   * One seed per room.
+   *
+   * Last persisted state seeds each live view; that room's SSE stream takes
+   * over from its first event. Position is unknown between persists, so it
+   * starts at 0.
+   */
+  const toSnapshotTrack = (track: ServerRoom['tracks'][number]) => ({
     // The persisted view has no identifier/source; position + URI are enough
     // to seed the display until the first live snapshot replaces everything.
     identifier: `persisted-${String(track.position)}`,
@@ -64,23 +66,24 @@ export default async function ServerDetailPage({
     // before the first live snapshot arrives names the same song.
     trackKey: track.sourceKey ?? identityOf(track.author, track.title).key,
   });
-  const upcoming = queueTracks.filter((track) => track.position > currentIndex);
-  const initialSnapshot =
-    detail.queue === null || currentTrack === null
-      ? null
-      : {
-          current: toSnapshotTrack(currentTrack),
-          positionMs: 0,
-          paused: detail.queue.paused,
-          volume: detail.queue.volume,
-          loopMode: detail.queue.loopMode.toLowerCase() as 'off' | 'track' | 'queue',
-          autoplayEnabled: detail.settings.autoplayEnabled,
-          stayConnected: detail.settings.stayConnected,
-          activeFilter: null,
-          voiceChannelId: null,
-          upcoming: upcoming.slice(0, 100).map(toSnapshotTrack),
-          upcomingTotal: upcoming.length,
-        };
+  const seedFor = (room: ServerRoom) => {
+    const current = room.tracks.find((track) => track.position === room.currentIndex) ?? null;
+    if (current === null) return null;
+    const upcoming = room.tracks.filter((track) => track.position > room.currentIndex);
+    return {
+      current: toSnapshotTrack(current),
+      positionMs: 0,
+      paused: room.paused,
+      volume: room.volume,
+      loopMode: room.loopMode.toLowerCase() as 'off' | 'track' | 'queue',
+      autoplayEnabled: detail.settings.autoplayEnabled,
+      stayConnected: detail.settings.stayConnected,
+      activeFilter: null,
+      voiceChannelId: room.voiceChannelId,
+      upcoming: upcoming.slice(0, 100).map(toSnapshotTrack),
+      upcomingTotal: upcoming.length,
+    };
+  };
 
   async function saveSettings(formData: FormData) {
     'use server';
@@ -125,17 +128,36 @@ export default async function ServerDetailPage({
       </div>
 
       <div className="grid gap-6 lg:grid-cols-2">
-        <Card>
-          <CardHeader>
-            <CardTitle>Player</CardTitle>
-            <CardDescription>
-              Live queue and controls. Changes reach the bot within a moment.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-4">
-            <LivePlayer guildId={detail.discordId} initial={initialSnapshot} />
-          </CardContent>
-        </Card>
+        {detail.rooms.length === 0 ? (
+          <Card>
+            <CardHeader>
+              <CardTitle>Player</CardTitle>
+              <CardDescription>
+                Nothing is playing here yet. Start something with <code>/play</code> in a voice
+                channel.
+              </CardDescription>
+            </CardHeader>
+          </Card>
+        ) : (
+          detail.rooms.map((room) => (
+            <Card key={room.voiceChannelId}>
+              <CardHeader>
+                <CardTitle>Player</CardTitle>
+                <CardDescription>
+                  Voice channel <code>{room.voiceChannelId}</code>. Live queue and controls for this
+                  room only — other channels in this server have their own.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="flex flex-col gap-4">
+                <LivePlayer
+                  guildId={detail.discordId}
+                  voiceChannelId={room.voiceChannelId}
+                  initial={seedFor(room)}
+                />
+              </CardContent>
+            </Card>
+          ))
+        )}
 
         <Card>
           <CardHeader>

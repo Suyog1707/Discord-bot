@@ -85,6 +85,19 @@ export type PlayerSnapshot = z.infer<typeof playerSnapshotSchema>;
 export const playerEventSchema = z.object({
   type: z.enum(PLAYER_EVENT_TYPES),
   guildId: z.string(),
+  /**
+   * Which room the event is about.
+   *
+   * A server can play in several voice channels at once, each with its own
+   * queue and its own dashboard. Without this, a listener filtering by guild
+   * receives every room's events and cannot tell them apart — one room's
+   * "track started" would redraw another room's player.
+   *
+   * The snapshot below carries the same id; this one is on the envelope so a
+   * subscriber can route without parsing the state, and so a disconnect event
+   * — whose state is null — still says which room went quiet.
+   */
+  voiceChannelId: z.string(),
   sentAt: z.number().int(),
   state: playerSnapshotSchema.nullable(),
 });
@@ -106,16 +119,33 @@ export function decodePlayerEvent(raw: string): PlayerEvent | null {
 }
 
 /**
- * Redis key holding the latest full snapshot for one guild.
+ * Redis key holding the latest full snapshot for one room.
  *
  * Because every published event is a **complete** state snapshot rather than a
  * diff, retaining only the most recent one is all a late-joining dashboard
  * needs: the value under this key is, by construction, exactly what the client
  * would have converged to had it been listening the whole time. There is no
  * log to replay and no ordering to reconcile — the newest write wins.
+ *
+ * Keyed by room, not by server. One bot owns one room, so there is still
+ * exactly one writer per key — the property that makes last-write-wins safe.
+ * Keyed by server it would have several, and worse: a disconnect in one room
+ * deletes the key, which would blank every other room for any dashboard that
+ * connected afterwards.
  */
-export function playerStateKey(guildId: string): string {
-  return redisKey(REDIS_NAMESPACE.PLAYER, 'state', guildId);
+export function playerStateKey(guildId: string, voiceChannelId: string): string {
+  return redisKey(REDIS_NAMESPACE.PLAYER, 'state', guildId, voiceChannelId);
+}
+
+/**
+ * Redis set naming the rooms a server currently has playing.
+ *
+ * The dashboard needs to enumerate rooms before it knows their ids, and
+ * scanning Redis for keys is not something to do on a page load. The bot adds
+ * a room on connect and removes it on disconnect.
+ */
+export function playerRoomIndexKey(guildId: string): string {
+  return redisKey(REDIS_NAMESPACE.PLAYER, 'rooms', guildId);
 }
 
 /**

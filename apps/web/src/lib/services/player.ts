@@ -19,7 +19,11 @@ import { requireManagedGuild } from '@/lib/authz';
 import { getLogger } from '@/lib/logger';
 import { getRedis } from '@/lib/redis';
 
-/** Client-facing input: guildId comes from the URL, issuedBy from the session. */
+/**
+ * Client-facing input: guildId comes from the URL, issuedBy from the session,
+ * and `voiceChannelId` names which of the server's rooms the command is for —
+ * a dashboard open on one channel must not be able to touch another.
+ */
 export const playerActionSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('pause') }),
   z.object({ action: z.literal('resume') }),
@@ -46,6 +50,7 @@ export async function sendPlayerCommand(
   userId: string,
   userDiscordId: string,
   discordGuildId: string,
+  voiceChannelId: string,
   input: unknown,
 ): Promise<PlayerCommand['action']> {
   await requireManagedGuild(userId, discordGuildId);
@@ -64,6 +69,7 @@ export async function sendPlayerCommand(
   const command = parseOrThrow(playerCommandSchema, {
     ...action,
     guildId: discordGuildId,
+    voiceChannelId,
     issuedBy: userDiscordId,
   });
 
@@ -73,7 +79,7 @@ export async function sendPlayerCommand(
   }
 
   getLogger('player').info(
-    { guildId: discordGuildId, action: command.action, issuedBy: userDiscordId },
+    { guildId: discordGuildId, voiceChannelId, action: command.action, issuedBy: userDiscordId },
     'Player command published',
   );
 

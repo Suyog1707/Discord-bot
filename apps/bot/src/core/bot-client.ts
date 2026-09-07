@@ -13,6 +13,7 @@ import {
   ConfigurationError,
   PLAYER_EVENT_CHANNEL,
   PLAYER_STATE_TTL_SECONDS,
+  playerRoomIndexKey,
   playerStateKey,
 } from '@discord-music/shared';
 import {
@@ -211,20 +212,33 @@ export class BotClient extends Client {
             publishEvent: (payload) => {
               this.#redis?.publish(PLAYER_EVENT_CHANNEL, payload).catch(() => 0);
             },
-            // The same payload, retained so a dashboard that connects between
-            // events still opens on the real state instead of an empty player.
-            // Every event is a full snapshot, so this is a plain last-write-
-            // wins SET with no ordering concerns: an out-of-order overwrite is
-            // impossible from one process, and a stale value is corrected by
-            // the very next event.
-            retainEvent: (guildId, payload) => {
-              if (this.#redis === undefined) return;
-              const key = playerStateKey(guildId);
+            /**
+             * The same payload, retained so a dashboard that connects between
+             * events still opens on the real state instead of an empty player.
+             * Every event is a full snapshot, so this is a plain last-write-
+             * wins SET with no ordering concerns: one bot owns one room, so
+             * one writer owns one key, and a stale value is corrected by the
+             * very next event.
+             *
+             * The room index beside it is how the dashboard enumerates a
+             * server's rooms without scanning Redis for keys.
+             */
+            retainEvent: (guildId, voiceChannelId, payload) => {
+              const redis = this.#redis;
+              if (redis === undefined) return;
+              const key = playerStateKey(guildId, voiceChannelId);
+              const index = playerRoomIndexKey(guildId);
               if (payload === null) {
-                this.#redis.del(key).catch(() => 0);
+                redis.del(key).catch(() => 0);
+                redis.srem(index, voiceChannelId).catch(() => 0);
                 return;
               }
-              this.#redis.set(key, payload, 'EX', PLAYER_STATE_TTL_SECONDS).catch(() => 0);
+              redis.set(key, payload, 'EX', PLAYER_STATE_TTL_SECONDS).catch(() => 0);
+              redis.sadd(index, voiceChannelId).catch(() => 0);
+              // The index must not outlive the snapshots it points at; a room
+              // whose bot died without a disconnect would otherwise haunt the
+              // dashboard forever.
+              redis.expire(index, PLAYER_STATE_TTL_SECONDS).catch(() => 0);
             },
           });
 

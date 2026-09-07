@@ -17,6 +17,7 @@ import {
   PLAYER_EVENT_CHANNEL,
   playerStateKey,
   UpstreamError,
+  ValidationError,
   type PlayerEvent,
 } from '@discord-music/shared';
 import { createRedisClient } from '@discord-music/shared/redis';
@@ -43,6 +44,19 @@ export const GET = withErrorHandling(
     const { guildId } = await context.params;
     await requireManagedGuild(user.id, guildId);
 
+    /**
+     * Which room this stream is for.
+     *
+     * A server can be playing in several voice channels at once and each gets
+     * its own dashboard, so a stream that relayed the whole guild would have
+     * one room's events redrawing another's player. A query parameter rather
+     * than a path segment, so the authorization above is untouched.
+     */
+    const room = request.nextUrl.searchParams.get('room');
+    if (room === null || room === '') {
+      throw new ValidationError('room is required — a live stream follows one voice channel.');
+    }
+
     const redisUrl = getEnv().REDIS_URL;
     if (redisUrl === undefined) {
       throw new UpstreamError(
@@ -50,7 +64,7 @@ export const GET = withErrorHandling(
       );
     }
 
-    const logger = getLogger('sse').child({ guildId, userId: user.id });
+    const logger = getLogger('sse').child({ guildId, room, userId: user.id });
     const subscriber = createRedisClient({ url: redisUrl, logger });
     const encoder = new TextEncoder();
 
@@ -92,7 +106,11 @@ export const GET = withErrorHandling(
         subscriber.on('message', (channel: string, raw: string) => {
           if (channel !== PLAYER_EVENT_CHANNEL) return;
           const event = decodePlayerEvent(raw);
-          if (event !== null && event.guildId === guildId) send(event);
+          // Both ids must match: this stream follows one room, and the
+          // channel carries every room of every server.
+          if (event !== null && event.guildId === guildId && event.voiceChannelId === room) {
+            send(event);
+          }
         });
 
         const heartbeat = setInterval(() => {
@@ -110,7 +128,7 @@ export const GET = withErrorHandling(
         request.signal.addEventListener('abort', close);
 
         // Opening snapshot, deliberately read *after* subscribing: the bot
-        // retains the latest full state under a per-guild key, and reading it
+        // retains the latest full state under a per-room key, and reading it
         // second means an event landing in the gap is merely delivered twice.
         // Full-state events make that duplication harmless — a missed event is
         // the only real failure, and subscribe-first rules it out. A read over
@@ -118,8 +136,8 @@ export const GET = withErrorHandling(
         // commands), so this uses the shared command client. Reconnects get a
         // fresh snapshot by construction, with no extra resume protocol.
         try {
-          const raw = (await getRedis()?.get(playerStateKey(guildId))) ?? null;
-          const initial = initialPlayerEvent(raw, guildId);
+          const raw = (await getRedis()?.get(playerStateKey(guildId, room))) ?? null;
+          const initial = initialPlayerEvent(raw, guildId, room);
           if (initial !== null) send(initial);
         } catch (error) {
           // A missing snapshot is not worth dropping a working stream over:

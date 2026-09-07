@@ -133,6 +133,8 @@ const {
 const USER = { discordId: '123456789012345678', username: 'listener' };
 const OTHER = { discordId: '222222222222222222' };
 const GUILD_ID = '987654321098765432';
+/** The live half of a dislike acts on one room, so both ids travel together. */
+const VOICE_ID = '876543210987654321';
 
 /** Seed `total` rows for a listener, oldest first, one minute apart. */
 function seed(discordId: string, total: number, prefix = 'row'): void {
@@ -190,6 +192,7 @@ describe('addDislikeForUser', () => {
       title: 'Song',
       author: 'Artist',
       guildId: GUILD_ID,
+      voiceChannelId: VOICE_ID,
       skipIfPlaying: true,
     });
 
@@ -197,6 +200,7 @@ describe('addDislikeForUser', () => {
     expect(publishedCommand()).toEqual({
       action: 'dislike',
       guildId: GUILD_ID,
+      voiceChannelId: VOICE_ID,
       issuedBy: USER.discordId,
       trackKey: 'artist::song',
       skipIfPlaying: true,
@@ -212,7 +216,12 @@ describe('addDislikeForUser', () => {
     redis = undefined;
 
     await expect(
-      addDislikeForUser(USER, { title: 'Song', author: 'Artist', guildId: GUILD_ID }),
+      addDislikeForUser(USER, {
+        title: 'Song',
+        author: 'Artist',
+        guildId: GUILD_ID,
+        voiceChannelId: VOICE_ID,
+      }),
     ).resolves.toEqual({ added: true, trackKey: 'artist::song' });
   });
 
@@ -220,7 +229,12 @@ describe('addDislikeForUser', () => {
     publish.mockRejectedValue(new Error('no bot listening'));
 
     await expect(
-      addDislikeForUser(USER, { title: 'Song', author: 'Artist', guildId: GUILD_ID }),
+      addDislikeForUser(USER, {
+        title: 'Song',
+        author: 'Artist',
+        guildId: GUILD_ID,
+        voiceChannelId: VOICE_ID,
+      }),
     ).resolves.toEqual({ added: true, trackKey: 'artist::song' });
     expect(addDislike).toHaveBeenCalledOnce();
   });
@@ -235,12 +249,15 @@ describe('addDislikeForUser', () => {
 
 describe('removeDislikeForUser', () => {
   it('removes the row and tells the named guild to forget it', async () => {
-    await expect(removeDislikeForUser(USER, 'artist::song', GUILD_ID)).resolves.toBe(true);
+    await expect(removeDislikeForUser(USER, 'artist::song', GUILD_ID, VOICE_ID)).resolves.toBe(
+      true,
+    );
 
     expect(removeDislike).toHaveBeenCalledWith(db, USER.discordId, 'artist::song');
     expect(publishedCommand()).toEqual({
       action: 'undislike',
       guildId: GUILD_ID,
+      voiceChannelId: VOICE_ID,
       issuedBy: USER.discordId,
       trackKey: 'artist::song',
     });
@@ -249,7 +266,9 @@ describe('removeDislikeForUser', () => {
   it('publishes nothing when the key was not this listener’s to remove', async () => {
     removeDislike.mockResolvedValue(false);
 
-    await expect(removeDislikeForUser(USER, 'artist::song', GUILD_ID)).resolves.toBe(false);
+    await expect(removeDislikeForUser(USER, 'artist::song', GUILD_ID, VOICE_ID)).resolves.toBe(
+      false,
+    );
     expect(publish).not.toHaveBeenCalled();
   });
 });
@@ -399,7 +418,7 @@ describe('removeDislikesForUser', () => {
   });
 
   it('does not query at all for an empty selection', async () => {
-    await expect(removeDislikesForUser(USER, [], GUILD_ID)).resolves.toBe(0);
+    await expect(removeDislikesForUser(USER, [], GUILD_ID, VOICE_ID)).resolves.toBe(0);
 
     expect(deleteMany).not.toHaveBeenCalled();
     expect(publish).not.toHaveBeenCalled();
@@ -409,7 +428,7 @@ describe('removeDislikesForUser', () => {
     seed(USER.discordId, 3);
 
     await expect(
-      removeDislikesForUser(USER, ['artist::song-0', 'artist::song-1'], GUILD_ID),
+      removeDislikesForUser(USER, ['artist::song-0', 'artist::song-1'], GUILD_ID, VOICE_ID),
     ).resolves.toBe(2);
 
     expect(publish).toHaveBeenCalledTimes(2);
@@ -418,12 +437,14 @@ describe('removeDislikesForUser', () => {
       {
         action: 'undislike',
         guildId: GUILD_ID,
+        voiceChannelId: VOICE_ID,
         issuedBy: USER.discordId,
         trackKey: 'artist::song-0',
       },
       {
         action: 'undislike',
         guildId: GUILD_ID,
+        voiceChannelId: VOICE_ID,
         issuedBy: USER.discordId,
         trackKey: 'artist::song-1',
       },
@@ -434,7 +455,7 @@ describe('removeDislikesForUser', () => {
     seed(USER.discordId, 50);
     const keys = Array.from({ length: 50 }, (_, index) => `artist::song-${String(index)}`);
 
-    await expect(removeDislikesForUser(USER, keys, GUILD_ID)).resolves.toBe(50);
+    await expect(removeDislikesForUser(USER, keys, GUILD_ID, VOICE_ID)).resolves.toBe(50);
 
     expect(publish).not.toHaveBeenCalled();
   });
@@ -442,7 +463,9 @@ describe('removeDislikesForUser', () => {
   it('publishes nothing when none of the keys were this listener’s', async () => {
     seed(OTHER.discordId, 2, 'other');
 
-    await expect(removeDislikesForUser(USER, ['artist::song-0'], GUILD_ID)).resolves.toBe(0);
+    await expect(removeDislikesForUser(USER, ['artist::song-0'], GUILD_ID, VOICE_ID)).resolves.toBe(
+      0,
+    );
     expect(publish).not.toHaveBeenCalled();
   });
 });

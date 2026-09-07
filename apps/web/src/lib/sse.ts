@@ -19,10 +19,18 @@ import { decodePlayerEvent, type PlayerEvent } from '@discord-music/shared';
  *
  * On `null` the dashboard simply keeps whatever the page render gave it.
  */
-export function initialPlayerEvent(raw: string | null, guildId: string): PlayerEvent | null {
+export function initialPlayerEvent(
+  raw: string | null,
+  guildId: string,
+  voiceChannelId: string,
+): PlayerEvent | null {
   if (raw === null) return null;
 
   const event = decodePlayerEvent(raw);
+  if (event === null) return null;
 
-  return event?.guildId === guildId ? event : null;
+  // Both must match. The key already encodes the room, so a mismatch means
+  // something is badly wrong; checking anyway keeps one room's state from
+  // ever reaching another room's stream.
+  return event.guildId === guildId && event.voiceChannelId === voiceChannelId ? event : null;
 }

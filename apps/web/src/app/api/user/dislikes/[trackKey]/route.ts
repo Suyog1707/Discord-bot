@@ -16,8 +16,11 @@ export const DELETE = authedRoute<{ trackKey: string }>(
   'DELETE /api/user/dislikes/:trackKey',
   'write',
   async ({ user, request, params }) => {
+    // Both name the room to tell; absent, the row is still removed and the
+    // planner picks it up on its next pass.
     const guildId = request.nextUrl.searchParams.get('guildId') ?? undefined;
-    const removed = await removeDislikeForUser(user, params.trackKey, guildId);
+    const voiceChannelId = request.nextUrl.searchParams.get('voiceChannelId') ?? undefined;
+    const removed = await removeDislikeForUser(user, params.trackKey, guildId, voiceChannelId);
     return apiSuccess({ removed });
   },
 );

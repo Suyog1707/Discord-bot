@@ -54,31 +54,22 @@ export class PlayerCommandSubscriber {
   }
 
   async #apply(command: PlayerCommand): Promise<void> {
-    /**
-     * Which room the dashboard meant.
-     *
-     * Commands do not carry a voice channel yet, so a guild with one room is
-     * unambiguous and a guild with several cannot be served safely — applying
-     * to an arbitrary one would let a dashboard open on room A pause room B.
-     * Refusing is the honest answer until the protocol carries the room.
-     */
-    const rooms = this.#router.roomsIn(command.guildId);
-    if (rooms.length > 1) {
-      logger.warn(
-        { guildId: command.guildId, action: command.action, rooms: rooms.length },
-        'Dashboard command for a guild playing in several channels; ignored until commands name a room',
-      );
-      return;
-    }
-    const room = rooms[0];
+    // Commands name the room they are for, which is what stops a dashboard
+    // open on one channel reaching into another.
+    const room = this.#router.roomFor(command.guildId, command.voiceChannelId);
     if (room === undefined) {
-      logger.debug({ command }, 'Command for guild without an active player; ignored');
+      logger.debug({ command }, 'Command for a room with no active player; ignored');
       return;
     }
     const player = room.player;
 
     logger.info(
-      { guildId: command.guildId, action: command.action, issuedBy: command.issuedBy },
+      {
+        guildId: command.guildId,
+        voiceChannelId: command.voiceChannelId,
+        action: command.action,
+        issuedBy: command.issuedBy,
+      },
       'Applying dashboard command',
     );
 
