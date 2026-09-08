@@ -105,16 +105,11 @@ export class PlayerRouter {
    * dislike, reading its DJ registry — must go to *that bot's* manager. Asking
    * the primary would silently operate on a different room, or on nothing.
    */
-  roomFor(
-    guildId: string,
-    voiceChannelId: string,
-  ):
-    | { readonly botId: string; readonly player: GuildPlayer; readonly music: MusicManager }
-    | undefined {
+  roomFor(guildId: string, voiceChannelId: string): RoomPlayer | undefined {
     for (const bot of this.#bots) {
       const player = bot.music.getPlayer(guildId);
       if (player?.voiceChannelId === voiceChannelId) {
-        return { botId: bot.botId, player, music: bot.music };
+        return { botId: bot.botId, voiceChannelId, player, music: bot.music };
       }
     }
     return undefined;

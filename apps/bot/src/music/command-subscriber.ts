@@ -8,13 +8,13 @@
  */
 import {
   decodePlayerCommand,
-  identityOf,
   PLAYER_COMMAND_CHANNEL,
   type PlayerCommand,
 } from '@discord-music/shared';
 import { closeRedis, createRedisClient, type Redis } from '@discord-music/shared/redis';
 
 import { getLogger } from '../lib/logger.js';
+import { applyIntent } from './apply-intent.js';
 import type { PlayerRouter } from './player-router.js';
 
 const logger = getLogger('player-commands');
@@ -61,7 +61,6 @@ export class PlayerCommandSubscriber {
       logger.debug({ command }, 'Command for a room with no active player; ignored');
       return;
     }
-    const player = room.player;
 
     logger.info(
       {
@@ -73,79 +72,38 @@ export class PlayerCommandSubscriber {
       'Applying dashboard command',
     );
 
-    switch (command.action) {
-      case 'pause':
-        await player.pause();
-        return;
-      case 'resume':
-        await player.resume();
-        return;
-      case 'skip':
-        await player.skip();
-        return;
-      case 'stop':
-        await player.stop();
-        return;
-      case 'volume':
-        await player.setVolume(command.volume);
-        return;
-      case 'shuffle':
-        player.shuffle();
-        return;
-      case 'previous':
-        await player.previous();
-        return;
-      case 'jump':
-        await player.jumpTo(player.queue.currentIndex + command.position);
-        return;
-      case 'remove':
-        player.removeUpcoming(command.position - 1);
-        return;
-      case 'move':
-        player.moveUpcoming(command.from - 1, command.to - 1);
-        return;
-      case 'loop':
-        player.setLoopMode(command.mode);
-        return;
-      case 'dislike': {
-        // The database row is the listener's own; the LIVE effect touches a
-        // room. Only somebody in this session — its owner or a requester —
-        // gets to pull a song out of everyone's queue and skip it. Anyone
-        // else's dislike still shapes their own recommendations next time.
-        if (!room.music.isSessionListener(command.guildId, command.issuedBy)) {
-          logger.info(
-            { guildId: command.guildId, issuedBy: command.issuedBy },
-            'Dislike from someone outside the session; stored only',
-          );
-          return;
-        }
-        // The dashboard sends the canonical key; a queued track may be keyed
-        // either by the candidate it was chosen as (`sourceKey`) or by the
-        // upload's own spelling, so both have to be compared before deciding
-        // that the song being rejected is the one in the speakers. When it
-        // is, the track itself is handed over so BOTH of its spellings join
-        // the session's exclusion, exactly as a Discord dislike would.
-        const current = player.queue.current;
-        const playing =
-          current !== null &&
-          (current.sourceKey === command.trackKey ||
-            identityOf(current.author, current.title).key === command.trackKey)
-            ? current
-            : null;
-        room.music.applyDislike(command.guildId, playing ?? { trackKey: command.trackKey });
-        if (command.skipIfPlaying && playing !== null) await player.skip();
-        return;
+    /**
+     * `sync-settings` is the dashboard's own shape — two optional booleans in
+     * one message — and has no single-action equivalent, so it is unpacked
+     * into the intents that do.
+     */
+    if (command.action === 'sync-settings') {
+      if (command.stayConnected !== undefined) {
+        await applyIntent(room, {
+          action: 'stay-connected',
+          guildId: command.guildId,
+          voiceChannelId: command.voiceChannelId,
+          issuedBy: command.issuedBy,
+          enabled: command.stayConnected,
+        });
       }
-      case 'undislike':
-        if (!room.music.isSessionListener(command.guildId, command.issuedBy)) return;
-        room.music.forgetDislike(command.guildId, command.trackKey);
-        return;
-      case 'sync-settings':
-        if (command.stayConnected !== undefined) player.setStayConnected(command.stayConnected);
-        if (command.autoplayEnabled !== undefined) {
-          player.setAutoplayEnabled(command.autoplayEnabled);
-        }
-        return;
+      if (command.autoplayEnabled !== undefined) {
+        await applyIntent(room, {
+          action: 'autoplay',
+          guildId: command.guildId,
+          voiceChannelId: command.voiceChannelId,
+          issuedBy: command.issuedBy,
+          enabled: command.autoplayEnabled,
+        });
+      }
+      return;
+    }
+
+    // Every other dashboard command IS an intent, so it is applied through the
+    // one implementation the HTTP surface and local commands also use.
+    const result = await applyIntent(room, command);
+    if (result.kind === 'error') {
+      logger.warn({ command, reason: result.message }, 'Dashboard command was refused');
     }
   }
 }

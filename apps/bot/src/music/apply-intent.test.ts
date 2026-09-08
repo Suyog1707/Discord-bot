@@ -1,0 +1,265 @@
+/* eslint-disable @typescript-eslint/unbound-method -- these are spies being
+   asserted on, never detached and called. */
+/**
+ * One intent, applied to the room that owns it.
+ *
+ * This is the single place a serialised request becomes a call on a live
+ * player, and it is what lets a command reach a room in another container
+ * without any of the things that cannot cross a wire — the live queue, the
+ * closure-taking methods, the object-identity comparisons — ever leaving the
+ * process they work in.
+ */
+import { describe, expect, it, vi } from 'vitest';
+
+import { applyIntent } from './apply-intent.js';
+import { decodeIntent, roomIntentSchema } from './intent.js';
+import type { RoomPlayer } from './player-router.js';
+
+const GUILD = '111111111111111111';
+const VOICE = '222222222222222222';
+const USER = '333333333333333333';
+
+function track(title: string, overrides: Record<string, unknown> = {}) {
+  return {
+    title,
+    author: 'Artist',
+    identifier: `id-${title}`,
+    uri: null,
+    sourceKey: undefined,
+    ...overrides,
+  };
+}
+
+function fakeRoom(overrides: Record<string, unknown> = {}): RoomPlayer & {
+  calls: Record<string, unknown[]>;
+} {
+  const calls: Record<string, unknown[]> = {};
+  const record =
+    (name: string, result?: unknown) =>
+    (...args: unknown[]) => {
+      calls[name] = args;
+      return result;
+    };
+
+  const player = {
+    voiceChannelId: VOICE,
+    queue: { current: track('Playing'), currentIndex: 2, upcoming: [track('A'), track('B')] },
+    pause: vi.fn(record('pause')),
+    resume: vi.fn(record('resume')),
+    skip: vi.fn(() => Promise.resolve(track('Skipped'))),
+    stop: vi.fn(record('stop')),
+    previous: vi.fn(() => Promise.resolve(track('Previous'))),
+    restart: vi.fn(() => Promise.resolve(track('Restarted'))),
+    shuffle: vi.fn(record('shuffle')),
+    setVolume: vi.fn(record('setVolume')),
+    seekTo: vi.fn(record('seekTo')),
+    setLoopMode: vi.fn(record('setLoopMode')),
+    jumpTo: vi.fn(() => Promise.resolve(track('Jumped'))),
+    removeUpcoming: vi.fn(() => track('Removed')),
+    moveUpcoming: vi.fn(() => track('Moved')),
+    swapUpcoming: vi.fn(() => true),
+    clearUpcoming: vi.fn(() => 7),
+    setListener: vi.fn(record('setListener')),
+    setStayConnected: vi.fn(record('setStayConnected')),
+    setAutoplayEnabled: vi.fn(record('setAutoplayEnabled')),
+    snapshot: vi.fn(() => ({ paused: false })),
+    ...overrides,
+  };
+
+  const music = {
+    isSessionListener: vi.fn(() => true),
+    applyDislike: vi.fn(() => ({ evicted: 0 })),
+    forgetDislike: vi.fn(),
+    sessionDj: { host: vi.fn(() => USER), djIds: vi.fn(() => ['444444444444444444']) },
+  };
+
+  return { botId: 'main', voiceChannelId: VOICE, player, music, calls } as never;
+}
+
+/**
+ * Derived through the schema rather than written as literals: snowflake fields
+ * are branded, so a hand-written string is not assignable to an intent.
+ */
+const parsed = roomIntentSchema.parse({
+  action: 'pause',
+  guildId: GUILD,
+  voiceChannelId: VOICE,
+  issuedBy: USER,
+});
+const base = {
+  guildId: parsed.guildId,
+  voiceChannelId: parsed.voiceChannelId,
+  issuedBy: parsed.issuedBy,
+} as const;
+
+describe('intent schema', () => {
+  it('accepts a well-formed intent', () => {
+    expect(decodeIntent({ action: 'skip', ...base })).toEqual({ action: 'skip', ...base });
+  });
+
+  it('rejects an unknown action', () => {
+    expect(decodeIntent({ action: 'self-destruct', ...base })).toBeNull();
+  });
+
+  /** Every intent names its room; without that one room could reach another. */
+  it('rejects an intent with no room', () => {
+    expect(decodeIntent({ action: 'skip', guildId: GUILD, issuedBy: USER })).toBeNull();
+  });
+
+  it('rejects an out-of-range queue position', () => {
+    expect(decodeIntent({ action: 'remove', ...base, position: 0 })).toBeNull();
+  });
+
+  it('defaults a dislike to skipping what is playing', () => {
+    const intent = decodeIntent({ action: 'dislike', ...base, trackKey: 'artist::song' });
+    expect(intent).toMatchObject({ skipIfPlaying: true });
+  });
+
+  it('covers every action in the union', () => {
+    // A guard against adding a schema variant and forgetting to handle it.
+    const actions = roomIntentSchema.options.map((option) => option.shape.action.value);
+    expect(new Set(actions).size).toBe(actions.length);
+    expect(actions).toContain('authority');
+    expect(actions).toContain('snapshot');
+  });
+});
+
+describe('applyIntent', () => {
+  it('pauses and resumes', async () => {
+    const room = fakeRoom();
+
+    expect(await applyIntent(room, { action: 'pause', ...base })).toEqual({ kind: 'ok' });
+    expect(await applyIntent(room, { action: 'resume', ...base })).toEqual({ kind: 'ok' });
+  });
+
+  it('returns the track a skip removed, summarised rather than whole', async () => {
+    const result = await applyIntent(fakeRoom(), { action: 'skip', ...base });
+
+    expect(result).toEqual({
+      kind: 'track',
+      track: { title: 'Skipped', author: 'Artist', identifier: 'id-Skipped', uri: null },
+    });
+  });
+
+  /** Positions are 1-based against the upcoming list, as every queue view shows. */
+  it('jumps relative to the current cursor', async () => {
+    const room = fakeRoom();
+
+    await applyIntent(room, { action: 'jump', ...base, position: 3 });
+
+    expect(room.player.jumpTo).toHaveBeenCalledWith(5);
+  });
+
+  it('converts a 1-based removal to a 0-based index', async () => {
+    const room = fakeRoom();
+
+    await applyIntent(room, { action: 'remove', ...base, position: 1 });
+
+    expect(room.player.removeUpcoming).toHaveBeenCalledWith(0);
+  });
+
+  it('reports how many tracks a clear removed', async () => {
+    expect(await applyIntent(fakeRoom(), { action: 'clear', ...base })).toEqual({
+      kind: 'count',
+      count: 7,
+    });
+  });
+
+  it('reports a swap that could not be made as an error, not a success', async () => {
+    const room = fakeRoom({ swapUpcoming: vi.fn(() => false) });
+
+    expect(await applyIntent(room, { action: 'swap', ...base, a: 1, b: 9 })).toMatchObject({
+      kind: 'error',
+    });
+  });
+
+  describe('dislike', () => {
+    /**
+     * The comparison is by KEY, not by object identity. The caller may be in
+     * another process and cannot hand over the same object.
+     */
+    it('recognises the playing track by its canonical key', async () => {
+      const room = fakeRoom({
+        queue: {
+          current: track('Kesariya', { author: 'Arijit Singh' }),
+          currentIndex: 0,
+          upcoming: [],
+        },
+      });
+
+      const result = await applyIntent(room, {
+        action: 'dislike',
+        ...base,
+        trackKey: 'arijit singh::kesariya',
+        skipIfPlaying: true,
+      });
+
+      expect(result).toMatchObject({ kind: 'track' });
+      expect(room.player.skip).toHaveBeenCalled();
+    });
+
+    it('recognises it by the key it was picked as', async () => {
+      const room = fakeRoom({
+        queue: {
+          current: track('Some Upload', { sourceKey: 'artist::song' }),
+          currentIndex: 0,
+          upcoming: [],
+        },
+      });
+
+      await applyIntent(room, {
+        action: 'dislike',
+        ...base,
+        trackKey: 'artist::song',
+        skipIfPlaying: true,
+      });
+
+      expect(room.player.skip).toHaveBeenCalled();
+    });
+
+    it('stores but does not skip for someone outside the session', async () => {
+      const room = fakeRoom();
+      room.music.isSessionListener = vi.fn(() => false);
+
+      await applyIntent(room, {
+        action: 'dislike',
+        ...base,
+        trackKey: 'artist::song',
+        skipIfPlaying: true,
+      });
+
+      expect(room.player.skip).not.toHaveBeenCalled();
+      expect(room.music.applyDislike).not.toHaveBeenCalled();
+    });
+
+    it('does not skip a song that is not the one playing', async () => {
+      const room = fakeRoom();
+
+      await applyIntent(room, {
+        action: 'dislike',
+        ...base,
+        trackKey: 'somebody::else',
+        skipIfPlaying: true,
+      });
+
+      expect(room.player.skip).not.toHaveBeenCalled();
+      expect(room.music.applyDislike).toHaveBeenCalled();
+    });
+  });
+
+  /** Exactly the three values the DJ guard needs, all scalars. */
+  it('answers the authority read with the room DJ state', async () => {
+    expect(await applyIntent(fakeRoom(), { action: 'authority', ...base })).toEqual({
+      kind: 'authority',
+      botVoiceChannelId: VOICE,
+      hostId: USER,
+      sessionDjIds: ['444444444444444444'],
+    });
+  });
+
+  it('answers a snapshot read', async () => {
+    expect(await applyIntent(fakeRoom(), { action: 'snapshot', ...base })).toMatchObject({
+      kind: 'snapshot',
+    });
+  });
+});

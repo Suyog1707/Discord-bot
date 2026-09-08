@@ -17,6 +17,8 @@ import { pingDatabase } from '@discord-music/database';
 
 import type { BotClient } from '../core/bot-client.js';
 import { getLogger } from '../lib/logger.js';
+import { applyIntent } from '../music/apply-intent.js';
+import { decodeIntent } from '../music/intent.js';
 
 import { resolveBotHealth, type BotDependencyReport, type DependencyStatus } from './health.js';
 
@@ -24,6 +26,22 @@ const logger = getLogger('internal-server');
 
 /** A probe that hangs must not hold the healthcheck open. */
 const PROBE_TIMEOUT_MS = 2_000;
+
+/** Generous for a control message; a body larger than this is not one. */
+const MAX_BODY_BYTES = 64 * 1024;
+
+async function readJson(request: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of request) {
+    const buffer = chunk as Buffer;
+    size += buffer.length;
+    if (size > MAX_BODY_BYTES) throw new Error('Request body too large');
+    chunks.push(buffer);
+  }
+  if (size === 0) return undefined;
+  return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
+}
 
 export interface InternalServer {
   readonly port: number;
@@ -107,6 +125,37 @@ export function createInternalServer(client: BotClient, port: number): InternalS
       // is cold, and when you want to ask one container what it thinks.
       const rooms = client.router?.ownRooms() ?? [];
       send(response, 200, { bot: client.identity.label, rooms });
+      return;
+    }
+
+    if (path === '/intent' && request.method === 'POST') {
+      const intent = decodeIntent(await readJson(request));
+      if (intent === null) {
+        send(response, 400, { error: 'Malformed intent' });
+        return;
+      }
+
+      // The owner is asked directly, so a room this container does not serve
+      // is a routing mistake by the caller rather than something to guess at.
+      const room = client.router?.roomFor(intent.guildId, intent.voiceChannelId);
+      if (room === undefined) {
+        send(response, 409, {
+          kind: 'error',
+          message: 'This container does not serve that room.',
+        });
+        return;
+      }
+
+      logger.info(
+        {
+          action: intent.action,
+          guildId: intent.guildId,
+          voiceChannelId: intent.voiceChannelId,
+          issuedBy: intent.issuedBy,
+        },
+        'Applying intent',
+      );
+      send(response, 200, await applyIntent(room, intent));
       return;
     }
 
