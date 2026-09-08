@@ -15,7 +15,14 @@ import { botInviteUrl, ValidationError } from '@discord-music/shared';
 import { getLogger } from '../lib/logger.js';
 
 import { applyIntent } from './apply-intent.js';
-import { allocateBot, type FleetMember } from './bot-allocation.js';
+import { allocateBot, type BotAllocation } from './bot-allocation.js';
+import {
+  buildFleet,
+  nextUninvited,
+  type BotPresence,
+  type FleetView,
+  type RosterEntry,
+} from './fleet.js';
 import type { GuildPlayer } from './guild-player.js';
 import type { IntentResult, RoomIntent } from './intent.js';
 import type { JoinOptions, MusicManager, RoomState } from './music-manager.js';
@@ -49,44 +56,81 @@ export interface RoomPlayer {
   readonly music: MusicManager;
 }
 
-export function roomIdOf(guildId: string, voiceChannelId: string): string {
-  return `${guildId}:${voiceChannelId}`;
+/**
+ * A room and the container holding it.
+ *
+ * `local` is present only when that container is this one. Everything else a
+ * caller wants to do with the room travels as an intent, which runs where the
+ * queue is — so the same call site serves both cases without knowing which it
+ * got.
+ */
+export interface RoomHandle {
+  readonly botId: string;
+  readonly guildId: string;
+  readonly voiceChannelId: string;
+  readonly local: RoomPlayer | undefined;
+}
+
+/** Where the roster and a guild's invitations come from. */
+export interface FleetSource {
+  /** Every identity this deployment has started, in the order to hand out. */
+  listBots(): Promise<readonly RosterEntry[]>;
+  /** Application ids of the players one guild has added. */
+  botsInGuild(guildId: string): Promise<ReadonlySet<string>>;
+}
+
+export interface PlayerRouterOptions {
+  readonly peers?: PeerDirectory;
+  readonly fleet?: FleetSource;
+  /**
+   * How long a room must have been empty before another channel may take its
+   * bot. From env, so it can be tuned without a rebuild.
+   */
+  readonly reclaimGraceMs?: number;
 }
 
 export class PlayerRouter {
   readonly #bots: readonly RouterBot[];
   /**
-   * Rooms promised but not yet joined, as `roomId → botId`.
+   * Rooms promised but not yet joined, as `botId → voiceChannelId`.
    *
    * Taken *synchronously* before the join begins and released when it finishes
    * or fails. Joining involves a voice handshake and a settle delay, and
    * without this two `/play`s a few milliseconds apart would both see the same
    * bot idle and both take it — the second silently stealing the first's
    * connection.
+   *
+   * Local to this process, which is enough because the primary is the only
+   * container that allocates. A distributed lock would buy nothing and cost a
+   * round trip on the path of every `/play`.
    */
   readonly #claims = new Map<string, string>();
 
   /**
-   * How many player applications exist in total, invited or not. Lets the
-   * "everything is busy" message tell a server it can add another player
-   * apart from one that has already added them all.
+   * In-flight allocations, one promise per guild.
+   *
+   * The queue that makes the claim above meaningful now that deciding involves
+   * reads — see {@link PlayerRouter.claimBot}.
    */
-  readonly #fleetSize: number;
+  readonly #allocating = new Map<string, Promise<void>>();
 
   /**
-   * How to reach the containers this process is not. Absent while every bot
-   * still shares one process, in which case every room is local by definition.
+   * How to reach the containers this process is not. Absent in development,
+   * where one process is the whole deployment and every room is local by
+   * definition.
    */
   readonly #peers: PeerDirectory | undefined;
 
-  constructor(bots: readonly RouterBot[], peers?: PeerDirectory) {
-    this.#bots = bots;
-    this.#fleetSize = bots.length;
-    this.#peers = peers;
-  }
+  /** Who else exists, and which of them this server has. */
+  readonly #fleet: FleetSource | undefined;
 
-  get size(): number {
-    return this.#fleetSize;
+  readonly #reclaimGraceMs: number;
+
+  constructor(bots: readonly RouterBot[], options: PlayerRouterOptions = {}) {
+    this.#bots = bots;
+    this.#peers = options.peers;
+    this.#fleet = options.fleet;
+    this.#reclaimGraceMs = options.reclaimGraceMs ?? RECLAIM_GRACE_MS;
   }
 
   /** Every manager, for wiring that must reach all of them. */
@@ -208,69 +252,237 @@ export class PlayerRouter {
    * The one place a room is allocated. Everything that wants to start music
    * goes through here so the claim, the reclaim and the "no bots left" message
    * exist in exactly one implementation.
+   *
+   * Returns a player only when the room turns out to be local. Callers that
+   * can cope with a room somewhere else should use {@link openRoom} and send
+   * the rest of what they wanted to do as an intent.
    */
   async joinRoom(options: JoinOptions): Promise<GuildPlayer> {
-    const roomId = roomIdOf(options.guildId, options.voiceChannelId);
-    const allocation = allocateBot({
-      voiceChannelId: options.voiceChannelId,
-      fleet: this.#fleetState(options.guildId),
-      now: Date.now(),
-      reclaimGraceMs: RECLAIM_GRACE_MS,
-      hasUninvitedPlayers: this.#hasUninvitedPlayers(options.guildId),
+    const handle = await this.openRoom(options);
+    if (handle.local === undefined) {
+      // Reached only by a caller that has not been taught the remote path.
+      // Better a clear refusal than a player object that is quietly the wrong
+      // bot's.
+      throw new ValidationError(
+        `That channel is being served by **${handle.botId}**, which this bot cannot reach.`,
+      );
+    }
+    return handle.local.player;
+  }
+
+  /**
+   * Put a bot in a room and say where it ended up.
+   *
+   * The result is deliberately not a player: the room may be held by another
+   * container, and the honest answer there is an address, not an object. What
+   * the caller wanted to do next travels as an intent instead — one round
+   * trip, run where the queue actually lives.
+   */
+  async openRoom(options: JoinOptions): Promise<RoomHandle> {
+    const existing = this.roomFor(options.guildId, options.voiceChannelId);
+    if (existing !== undefined) {
+      // Already ours. `getOrCreatePlayer` is still called so a join that only
+      // updates the text channel or the listener behaves as it always has.
+      return {
+        botId: existing.botId,
+        guildId: options.guildId,
+        voiceChannelId: options.voiceChannelId,
+        local: { ...existing, player: await existing.music.getOrCreatePlayer(options) },
+      };
+    }
+
+    const owner = await this.#peers?.ownerOf(options.guildId, options.voiceChannelId);
+    if (owner !== undefined && owner.botId !== this.#peers?.selfBotId) {
+      // Somebody else is already in that channel; joining is a no-op and the
+      // caller's real work is an intent for them.
+      return {
+        botId: owner.botId,
+        guildId: options.guildId,
+        voiceChannelId: options.voiceChannelId,
+        local: undefined,
+      };
+    }
+
+    return this.#allocateRoom(options);
+  }
+
+  /**
+   * Take a room with this container's own bot, allocation already decided.
+   *
+   * What `POST /join` calls. The primary has picked this player, so there is
+   * nothing left to choose — but the refusal below still matters: one token
+   * holds one voice connection per server, so a player already in another
+   * channel of this guild must say so rather than abandon that channel.
+   */
+  async joinLocal(
+    options: JoinOptions,
+  ): Promise<
+    { readonly kind: 'joined' } | { readonly kind: 'busy'; readonly voiceChannelId: string }
+  > {
+    const [bot] = this.#bots;
+    if (bot === undefined) throw new ValidationError('This player has no audio server.');
+
+    const player = bot.music.getPlayer(options.guildId);
+    if (player !== undefined && player.voiceChannelId !== options.voiceChannelId) {
+      return { kind: 'busy', voiceChannelId: player.voiceChannelId };
+    }
+
+    await bot.music.getOrCreatePlayer(options);
+    return { kind: 'joined' };
+  }
+
+  /**
+   * Pick a bot for a room and reserve it, one guild at a time.
+   *
+   * Deciding now needs three reads — the roster, the guild's invitations and
+   * the presence entries — so it can no longer happen between two synchronous
+   * statements. Two `/play`s a few milliseconds apart would otherwise both see
+   * the same player idle and both take it, the second silently stealing the
+   * first's connection.
+   *
+   * So allocations for one guild are made in turn: each waits for the previous
+   * to finish reserving before it starts reading. The reservation is what the
+   * next one sees, and it is released as soon as the join finishes — the join
+   * itself, which is a voice handshake and a settle delay, happens outside the
+   * queue and does not hold anybody up.
+   *
+   * Per guild, not global: two servers starting music at the same moment are
+   * not competing for anything, and making them wait for each other would be a
+   * cost with nothing bought.
+   */
+  async #claimBot(
+    options: JoinOptions,
+  ): Promise<{ readonly allocation: BotAllocation; readonly view: FleetView }> {
+    const previous = this.#allocating.get(options.guildId);
+    let release!: () => void;
+    const mine = new Promise<void>((resolve) => {
+      release = resolve;
     });
+    this.#allocating.set(options.guildId, mine);
 
-    if (allocation.kind === 'invite') {
-      // Name the player and hand over the link. "All busy, sorry" is a dead
-      // end; "all busy, here is the one-click fix" is not, and this is the one
-      // moment the multi-bot design becomes visible to anybody.
-      const next = this.nextUninvited(options.guildId);
-      throw new ValidationError(
-        next === undefined
-          ? 'Every player is busy in another channel right now. Try again shortly.'
-          : `Every player is busy in another channel. Add **${next.botId}** to this server and ` +
-              `it can play here too:\n${botInviteUrl({
-                clientId: next.clientId,
-                guildId: options.guildId,
-                // A player registers no slash commands.
-                withCommands: false,
-              })}`,
-      );
-    }
-    if (allocation.kind === 'full') {
-      const busy = this.roomsIn(options.guildId)
-        .map((room) => `<#${room.voiceChannelId}>`)
-        .join(', ');
-      throw new ValidationError(
-        busy === ''
-          ? 'No player is available right now. Try again shortly.'
-          : `Every player is already busy — currently in ${busy}. Wait for one to finish, ` +
-              'or join one of those channels.',
-      );
+    try {
+      await previous;
+    } catch {
+      // A failed allocation is the caller's problem, not the next one's.
     }
 
-    const bot = this.#bots.find((candidate) => candidate.botId === allocation.botId);
-    if (bot === undefined) {
-      throw new ValidationError('No player is available right now. Try again shortly.');
-    }
+    try {
+      const view = await this.#fleetView(options.guildId);
+      const allocation = allocateBot({
+        voiceChannelId: options.voiceChannelId,
+        fleet: view.members,
+        now: Date.now(),
+        reclaimGraceMs: this.#reclaimGraceMs,
+        hasUninvitedPlayers: this.#nextUninvited(view) !== undefined,
+      });
 
-    // Claim before the first await, or a second request racing this one would
-    // see the same bot idle and take it too.
-    this.#claims.set(roomId, bot.botId);
+      if (allocation.kind === 'invite') {
+        // Name the player and hand over the link. "All busy, sorry" is a dead
+        // end; "all busy, here is the one-click fix" is not, and this is the one
+        // moment the multi-bot design becomes visible to anybody.
+        const next = this.#nextUninvited(view);
+        throw new ValidationError(
+          next === undefined
+            ? 'Every player is busy in another channel right now. Try again shortly.'
+            : `Every player is busy in another channel. Add **${next.botId}** to this server and ` +
+                `it can play here too:\n${botInviteUrl({
+                  clientId: next.clientId,
+                  guildId: options.guildId,
+                  // A player registers no slash commands.
+                  withCommands: false,
+                })}`,
+        );
+      }
+      if (allocation.kind === 'full') {
+        const busy = view.members
+          .filter((member) => member.serving !== null)
+          .map((member) => `<#${String(member.serving?.voiceChannelId)}>`)
+          .join(', ');
+        throw new ValidationError(
+          busy === ''
+            ? 'No player is available right now. Try again shortly.'
+            : `Every player is already busy — currently in ${busy}. Wait for one to finish, ` +
+                'or join one of those channels.',
+        );
+      }
+
+      this.#claims.set(allocation.botId, options.voiceChannelId);
+      return { allocation, view };
+    } finally {
+      release();
+      // Only if nobody has queued behind this one; otherwise theirs is current.
+      if (this.#allocating.get(options.guildId) === mine) {
+        this.#allocating.delete(options.guildId);
+      }
+    }
+  }
+
+  /** Choose a bot for a room nobody is serving, and put it there. */
+  async #allocateRoom(options: JoinOptions): Promise<RoomHandle> {
+    const { allocation, view } = await this.#claimBot(options);
+
     try {
       if (allocation.kind === 'reclaim') {
         logger.info(
           {
             guildId: options.guildId,
-            botId: bot.botId,
+            botId: allocation.botId,
             from: allocation.from,
             to: options.voiceChannelId,
           },
           'Reclaiming a player from an empty channel',
         );
       }
-      return await bot.music.getOrCreatePlayer(options);
+
+      const local = this.#bots.find((candidate) => candidate.botId === allocation.botId);
+      if (local !== undefined) {
+        const player = await local.music.getOrCreatePlayer(options);
+        return {
+          botId: local.botId,
+          guildId: options.guildId,
+          voiceChannelId: options.voiceChannelId,
+          local: {
+            botId: local.botId,
+            voiceChannelId: options.voiceChannelId,
+            player,
+            music: local.music,
+          },
+        };
+      }
+
+      const baseUrl = view.addresses.get(allocation.botId);
+      const peers = this.#peers;
+      if (baseUrl === undefined || peers === undefined) {
+        throw new ValidationError('No player is available right now. Try again shortly.');
+      }
+
+      const outcome = await peers.sendJoin(baseUrl, options);
+      if (outcome.kind === 'error') throw new ValidationError(outcome.message);
+      if (outcome.kind === 'busy') {
+        // The picture was a moment out of date. Say so plainly rather than
+        // retrying into the same race.
+        throw new ValidationError(
+          `**${allocation.botId}** has just been taken for <#${outcome.voiceChannelId}>. ` +
+            'Try again in a moment.',
+        );
+      }
+
+      logger.info(
+        {
+          guildId: options.guildId,
+          voiceChannelId: options.voiceChannelId,
+          botId: allocation.botId,
+        },
+        'Room handed to another container',
+      );
+      return {
+        botId: allocation.botId,
+        guildId: options.guildId,
+        voiceChannelId: options.voiceChannelId,
+        local: undefined,
+      };
     } finally {
-      this.#claims.delete(roomId);
+      this.#claims.delete(allocation.botId);
     }
   }
 
@@ -285,12 +497,64 @@ export class PlayerRouter {
     }
   }
 
-  /** What each bot is doing in this guild, in fleet order. */
-  #fleetState(guildId: string): readonly FleetMember[] {
-    return this.#bots.map((bot) => {
-      const player = bot.music.getPlayer(guildId);
-      const claimedRoom = [...this.#claims.entries()].find(([, botId]) => botId === bot.botId)?.[0];
+  /**
+   * The fleet as it stands, for this guild.
+   *
+   * Assembled from the roster, the guild's invitations and the presence
+   * entries in Redis — see `fleet.ts` for why each part comes from where it
+   * does. With no fleet source (development, one process) this container is
+   * the whole fleet, which is the shape it has always had.
+   */
+  async #fleetView(guildId: string): Promise<FleetView> {
+    const fleet = this.#fleet;
+    const peers = this.#peers;
+    if (fleet === undefined || peers === undefined) return this.#localFleetView(guildId);
 
+    const [roster, invited, presence] = await Promise.all([
+      fleet.listBots(),
+      fleet.botsInGuild(guildId),
+      peers.liveBots(),
+    ]);
+    // A roster that has not caught up with this container yet would leave it
+    // out of its own allocation, so it stands in for itself.
+    if (roster.length === 0) return this.#localFleetView(guildId);
+
+    return buildFleet({
+      roster,
+      invited,
+      presence: this.#withOwnRooms(presence),
+      claims: this.#claims,
+      guildId,
+    });
+  }
+
+  /**
+   * Replace this container's own presence entry with what it actually holds.
+   *
+   * Its copy in Redis is a snapshot from the last heartbeat or room change and
+   * can be a moment out of date — which is fine for a sibling reading it, and
+   * not fine here: a container that has just taken a room would otherwise offer
+   * itself that room again. Nobody knows this container's state better than it
+   * does, so for itself the live answer wins.
+   */
+  #withOwnRooms(presence: readonly BotPresence[]): readonly BotPresence[] {
+    const own = new Set(this.#bots.map((bot) => bot.botId));
+    return [
+      ...presence.filter((entry) => !own.has(entry.botId)),
+      ...this.#bots.map((bot) => ({
+        botId: bot.botId,
+        clientId: bot.clientId,
+        role: presence.find((entry) => entry.botId === bot.botId)?.role ?? 'primary',
+        baseUrl: presence.find((entry) => entry.botId === bot.botId)?.baseUrl ?? '',
+        rooms: bot.music.rooms,
+      })),
+    ];
+  }
+
+  /** This container, seen as the whole fleet. */
+  #localFleetView(guildId: string): FleetView {
+    const members = this.#bots.map((bot) => {
+      const player = bot.music.getPlayer(guildId);
       return {
         botId: bot.botId,
         inGuild: bot.isInGuild(guildId),
@@ -303,18 +567,27 @@ export class PlayerRouter {
                 stayConnected: player.stayConnected,
                 emptySince: player.emptySince,
               },
-        claimedFor: claimedRoom === undefined ? null : (claimedRoom.split(':')[1] ?? null),
+        claimedFor: this.#claims.get(bot.botId) ?? null,
       };
     });
-  }
 
-  /** Whether the guild could add a player it has not invited yet. */
-  #hasUninvitedPlayers(guildId: string): boolean {
-    return this.nextUninvited(guildId) !== undefined;
+    return {
+      members,
+      addresses: new Map(),
+      clientIds: new Map(this.#bots.map((bot) => [bot.botId, bot.clientId])),
+    };
   }
 
   /** The next player this guild has not added, in fleet order. */
-  nextUninvited(guildId: string): RouterBot | undefined {
-    return this.#bots.find((bot) => !bot.isInGuild(guildId));
+  #nextUninvited(view: FleetView): RosterEntry | undefined {
+    const roster = [...view.clientIds].map(([botId, clientId]) => ({ botId, clientId }));
+    const invited = new Set(
+      view.members
+        .filter((member) => member.inGuild)
+        .map((member) => {
+          return view.clientIds.get(member.botId) ?? member.botId;
+        }),
+    );
+    return nextUninvited(roster, invited);
   }
 }

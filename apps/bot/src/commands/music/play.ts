@@ -10,7 +10,7 @@ import {
   searchSpotifySuggestions,
   type SpotifySearchKind,
 } from '../../music/spotify-resolver.js';
-import { formatTrackDuration, trackLink } from '../../music/track.js';
+import { formatTrackDuration, trackLink, type QueuedTrack } from '../../music/track.js';
 import { requireMusic, requireRouter, requireVoiceContext } from '../../music/voice-context.js';
 
 /** Discord caps choice names and values at 100 characters. */
@@ -208,7 +208,7 @@ export default defineCommand({
       },
       source,
     );
-    const joining = router.joinRoom({
+    const joining = router.openRoom({
       guildId: context.guildId,
       voiceChannelId: context.voiceChannelId,
       textChannelId: interaction.channelId,
@@ -226,9 +226,10 @@ export default defineCommand({
       // must not leave the bot parked in a channel it entered for this command.
       if (!alreadyConnected) {
         void joining
-          .then(async (joined) => {
-            if (!joined.isPlaying && joined.queue.tracks.length === 0) {
-              await music.destroyPlayer(context.guildId);
+          .then(async (room) => {
+            const player = room.local?.player;
+            if (player !== undefined && !player.isPlaying && player.queue.tracks.length === 0) {
+              await room.local?.music.destroyPlayer(context.guildId);
             }
           })
           .catch(() => undefined);
@@ -236,23 +237,45 @@ export default defineCommand({
       throw error;
     }
 
-    const player = await joining;
+    const room = await joining;
 
-    const { startedPlayback } = await player.enqueue(result.tracks, { next: insertNext });
+    /**
+     * Queue the tracks wherever the room turned out to be.
+     *
+     * Resolution above is bot-agnostic — it asks Lavalink, not Discord — so it
+     * runs here whichever container ends up playing, and only the finished
+     * tracks cross the wire. One round trip, not one per track.
+     */
+    const queue = async (tracks: readonly QueuedTrack[], next: boolean) =>
+      router.runIntent({
+        action: 'enqueue',
+        guildId: context.guildId,
+        voiceChannelId: context.voiceChannelId,
+        issuedBy: interaction.user.id,
+        tracks,
+        next,
+      });
+
+    const queued = await queue(result.tracks, insertNext);
+    if (queued.kind === 'error') {
+      await interaction.editReply({ content: queued.message });
+      return;
+    }
+    if (queued.kind !== 'enqueued') return;
 
     if (result.background !== undefined) {
       // Each resolved batch is queued as it lands, so the queue keeps growing
       // while the first tracks play instead of arriving all at the end.
       void result.background
         .run(async (tracks) => {
-          await player.enqueue(tracks);
+          await queue(tracks, false);
         })
         .then(async (completed) => {
-          const queued = result.tracks.length + completed.resolvedTrackCount;
+          const total = result.tracks.length + completed.resolvedTrackCount;
           const failed = completed.failedTrackCount;
           await interaction.followUp({
             content:
-              `Spotify playlist loading complete: queued ${String(queued)} of ` +
+              `Spotify playlist loading complete: queued ${String(total)} of ` +
               `${String(result.tracks.length + completed.sourceTrackCount)} tracks.` +
               (failed === 0 ? '' : ` ${String(failed)} could not be resolved.`),
             flags: MessageFlags.Ephemeral,
@@ -270,7 +293,7 @@ export default defineCommand({
 
     if (result.playlistName !== null) {
       embed
-        .setAuthor({ name: startedPlayback ? 'Now playing playlist' : 'Queued playlist' })
+        .setAuthor({ name: queued.startedPlayback ? 'Now playing playlist' : 'Queued playlist' })
         .setDescription(
           `**${result.playlistName}** — ` +
             (result.background === undefined
@@ -295,13 +318,13 @@ export default defineCommand({
       }
     } else {
       embed
-        .setAuthor({ name: startedPlayback ? 'Now playing' : 'Added to queue' })
+        .setAuthor({ name: queued.startedPlayback ? 'Now playing' : 'Added to queue' })
         .setDescription(`${trackLink(first)} — ${first.author}`)
         .addFields({ name: 'Duration', value: formatTrackDuration(first), inline: true });
-      if (!startedPlayback) {
+      if (!queued.startedPlayback) {
         embed.addFields({
           name: 'Position',
-          value: insertNext ? 'Up next' : `#${String(player.queue.upcoming.length)}`,
+          value: insertNext ? 'Up next' : `#${String(queued.upcomingCount)}`,
           inline: true,
         });
       }
@@ -311,7 +334,7 @@ export default defineCommand({
     // Entering a channel brings back the queue it was left with. Said out
     // loud, because a request that lands behind eleven songs nobody just
     // asked for reads as a bug otherwise.
-    const resumed = music.takeResumeNotice(context.guildId);
+    const resumed = queued.resumed;
     if (resumed !== null) {
       embed.addFields({
         name: 'Picked up where this channel left off',
@@ -320,6 +343,10 @@ export default defineCommand({
           `saved in <#${resumed.voiceChannelId}>. Use \`/stop\` to clear it.`,
       });
     }
+
+    // Which bot answered matters when a server has several: the controls are on
+    // that bot's message, in that channel, and nowhere else.
+    if (room.local === undefined) embed.setFooter({ text: `Playing through ${room.botId}.` });
 
     await interaction.editReply({ embeds: [embed] });
   },

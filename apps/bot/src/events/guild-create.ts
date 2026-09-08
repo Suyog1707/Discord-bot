@@ -18,7 +18,7 @@ export default defineEvent({
     /**
      * `Guild.isActive` means "this server has the bot", and the dashboard gates
      * all access on it. Only the primary may write it: a player bot joining is
-     * not what makes a server set up, and a worker joining a server the primary
+     * not what makes a server set up, and a player joining a server the primary
      * is absent from would open the dashboard for a bot that cannot take a
      * command.
      */

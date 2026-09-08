@@ -1,3 +1,5 @@
+/* eslint-disable @typescript-eslint/unbound-method -- these are spies being
+   asserted on, never detached and called. */
 /**
  * Routing a guild's several rooms to the bots serving them.
  *
@@ -8,7 +10,9 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 
-import { PlayerRouter, roomIdOf, type RouterBot } from './player-router.js';
+import type { BotPresence } from './fleet.js';
+import type { PeerDirectory } from './peers.js';
+import { PlayerRouter, type RouterBot } from './player-router.js';
 
 const GUILD = 'guild-1';
 
@@ -46,6 +50,20 @@ function fakeBot(
     isInGuild: () => options.inGuild ?? true,
     music: {
       getPlayer: () => player,
+      get rooms() {
+        return player === undefined
+          ? []
+          : [
+              {
+                guildId: GUILD,
+                voiceChannelId: player.voiceChannelId,
+                isPlaying: true,
+                hasListeners: player.hasListeners,
+                stayConnected: player.stayConnected,
+                emptySince: player.emptySince,
+              },
+            ];
+      },
       destroyPlayer: destroyed,
       getOrCreatePlayer: async (join: { voiceChannelId: string }) => {
         await options.joinGate;
@@ -66,12 +84,6 @@ const join = (voiceChannelId: string) => ({
   voiceChannelId,
   textChannelId: 'text',
   shardId: 0,
-});
-
-describe('roomIdOf', () => {
-  it('pairs the guild with the channel', () => {
-    expect(roomIdOf('g', 'c')).toBe('g:c');
-  });
 });
 
 describe('playerFor', () => {
@@ -180,22 +192,6 @@ describe('joinRoom', () => {
   });
 });
 
-describe('nextUninvited', () => {
-  it('names the first player the guild has not added', () => {
-    const router = new PlayerRouter([
-      fakeBot('a'),
-      fakeBot('b', { inGuild: false }),
-      fakeBot('c', { inGuild: false }),
-    ]);
-
-    expect(router.nextUninvited(GUILD)?.botId).toBe('b');
-  });
-
-  it('names nobody when the guild has them all', () => {
-    expect(new PlayerRouter([fakeBot('a')]).nextUninvited(GUILD)).toBeUndefined();
-  });
-});
-
 describe('leaveRoom', () => {
   /** Tearing one room down must not touch the others. */
   it('destroys only the room asked for', async () => {
@@ -215,5 +211,124 @@ describe('leaveRoom', () => {
     await new PlayerRouter([a]).leaveRoom(GUILD, 'room-z');
 
     expect(a.destroyed).not.toHaveBeenCalled();
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Rooms in other containers                                                   */
+/*                                                                             */
+/* The split's whole point: a command arriving at one bot may be about a room  */
+/* another one is holding. What matters is that the router never pretends a    */
+/* remote room is local, and never joins a channel somebody is already in.     */
+/* -------------------------------------------------------------------------- */
+
+function fakePeers(options: {
+  owner?: { botId: string; baseUrl: string };
+  live?: readonly BotPresence[];
+  join?: ReturnType<typeof vi.fn>;
+}): PeerDirectory & { sendJoin: ReturnType<typeof vi.fn> } {
+  const sendJoin = options.join ?? vi.fn(() => Promise.resolve({ kind: 'joined' }));
+  return {
+    selfBotId: 'main',
+    ownerOf: () => Promise.resolve(options.owner),
+    liveBots: () => Promise.resolve(options.live ?? []),
+    sendJoin,
+    sendIntent: vi.fn(),
+    announce: vi.fn(),
+    announceSelf: vi.fn(),
+    release: vi.fn(),
+    withdrawSelf: vi.fn(),
+  } as never;
+}
+
+function presence(botId: string, rooms: BotPresence['rooms'] = []): BotPresence {
+  return {
+    botId,
+    clientId: `app-${botId}`,
+    role: botId === 'main' ? 'primary' : 'player',
+    baseUrl: `http://bot-${botId}:8080`,
+    rooms,
+  };
+}
+
+const fleetOf = (...botIds: readonly string[]) => ({
+  listBots: () => Promise.resolve(botIds.map((botId) => ({ botId, clientId: `app-${botId}` }))),
+  botsInGuild: () => Promise.resolve(new Set(botIds.map((botId) => `app-${botId}`))),
+});
+
+describe('openRoom', () => {
+  it('reports a room another container holds without joining it', async () => {
+    const local = fakeBot('main');
+    const peers = fakePeers({ owner: { botId: 'player-2', baseUrl: 'http://bot-player-2:8080' } });
+    const router = new PlayerRouter([local], { peers, fleet: fleetOf('main', 'player-2') });
+
+    const handle = await router.openRoom(join('room-a'));
+
+    expect(handle).toMatchObject({ botId: 'player-2', local: undefined });
+    // Nobody was asked to join: somebody is already in that channel.
+    expect(peers.sendJoin).not.toHaveBeenCalled();
+  });
+
+  it('hands the room to a free container when this one is busy', async () => {
+    const local = fakeBot('main', { player: { voiceChannelId: 'room-a' } });
+    const peers = fakePeers({ live: [presence('main'), presence('player-2')] });
+    const router = new PlayerRouter([local], { peers, fleet: fleetOf('main', 'player-2') });
+
+    const handle = await router.openRoom(join('room-b'));
+
+    expect(peers.sendJoin).toHaveBeenCalledWith(
+      'http://bot-player-2:8080',
+      expect.objectContaining({ voiceChannelId: 'room-b' }),
+    );
+    expect(handle).toMatchObject({ botId: 'player-2', local: undefined });
+  });
+
+  it('refuses when the chosen container turns out to be busy after all', async () => {
+    // The picture was a moment out of date. Better a plain "try again" than a
+    // retry into the same race.
+    const peers = fakePeers({
+      live: [presence('main'), presence('player-2')],
+      join: vi.fn(() => Promise.resolve({ kind: 'busy', voiceChannelId: 'room-z' })),
+    });
+    const router = new PlayerRouter([fakeBot('main', { player: { voiceChannelId: 'room-a' } })], {
+      peers,
+      fleet: fleetOf('main', 'player-2'),
+    });
+
+    await expect(router.openRoom(join('room-b'))).rejects.toThrow(/just been taken/iu);
+  });
+
+  it('keeps the room here when this container is the one allocated', async () => {
+    const peers = fakePeers({ live: [presence('main'), presence('player-2')] });
+    const router = new PlayerRouter([fakeBot('main')], {
+      peers,
+      fleet: fleetOf('main', 'player-2'),
+    });
+
+    const handle = await router.openRoom(join('room-a'));
+
+    expect(handle.local?.player.voiceChannelId).toBe('room-a');
+    expect(peers.sendJoin).not.toHaveBeenCalled();
+  });
+});
+
+describe('joinLocal', () => {
+  it('takes the room it is told to take', async () => {
+    const router = new PlayerRouter([fakeBot('player-2')]);
+
+    await expect(router.joinLocal(join('room-a'))).resolves.toEqual({ kind: 'joined' });
+  });
+
+  it('refuses a second channel in the same server', async () => {
+    // One token holds one voice connection per guild, so this is a refusal
+    // rather than a move — abandoning the first channel would be worse.
+    const router = new PlayerRouter([
+      fakeBot('player-2', { player: { voiceChannelId: 'room-a' } }),
+    ]);
+
+    await expect(router.joinLocal(join('room-b'))).resolves.toEqual({
+      kind: 'busy',
+      voiceChannelId: 'room-a',
+    });
   });
 });

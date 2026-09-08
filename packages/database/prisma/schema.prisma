@@ -178,7 +178,7 @@ model PlayerBot {
   clientId   String    @unique
   /// Short name shown to admins, e.g. "main" or "player-2".
   label      String
-  /// "primary" (has the slash commands) or "worker" (headless player).
+  /// "primary" (has the slash commands) or "player" (headless).
   role       String
   lastSeenAt DateTime? @db.Timestamptz(3)
   createdAt  DateTime  @default(now()) @db.Timestamptz(3)

@@ -165,6 +165,38 @@ export function playerRoomIndexKey(guildId: string): string {
 }
 
 /**
+ * One live container, and how to reach it.
+ *
+ * The room keys above answer "who is in this channel?", which is only ever
+ * about rooms that already exist. Allocating a NEW room asks a different
+ * question — "which players are running right now, and where?" — and no
+ * amount of room state can answer it, because a player sitting idle owns no
+ * rooms at all.
+ *
+ * Written by each container on a short interval and expiring on its own, so
+ * presence is a fact about the last minute rather than a flag somebody has to
+ * remember to clear. A container that is killed disappears from here without
+ * anybody's cooperation, which is exactly what a crash gives you.
+ */
+export function playerBotKey(botId: string): string {
+  return redisKey(REDIS_NAMESPACE.PLAYER, 'bot', botId);
+}
+
+/** The set of bot ids to look those up by; membership outlives the entries. */
+export function playerBotIndexKey(): string {
+  return redisKey(REDIS_NAMESPACE.PLAYER, 'bots');
+}
+
+/**
+ * How long a container's presence entry outlives its last heartbeat.
+ *
+ * Several heartbeats' worth, so one slow write or a brief Redis hiccup does
+ * not make a healthy player vanish from allocation — but short enough that a
+ * container killed mid-song is not offered a new room for long.
+ */
+export const PLAYER_BOT_TTL_SECONDS = 90;
+
+/**
  * Expiry for the retained snapshot.
  *
  * Disconnects delete the key outright, so this TTL is not the normal cleanup

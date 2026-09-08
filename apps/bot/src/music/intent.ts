@@ -20,6 +20,7 @@
 import { LIMITS, z } from '@discord-music/shared';
 import type { PlayerSnapshot } from '@discord-music/shared';
 
+import type { ResumeNotice } from './music-manager.js';
 import type { QueuedTrack } from './track.js';
 
 /**
@@ -63,6 +64,33 @@ export const roomIntentSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('move'), ...target, from: position, to: position }),
   z.object({ action: z.literal('swap'), ...target, a: position, b: position }),
   z.object({ action: z.literal('clear'), ...target }),
+
+  /**
+   * Add tracks to a room's queue.
+   *
+   * The only intent that carries a payload of any size, and the reason `/play`
+   * works across containers at all: the primary resolves the query against its
+   * own Lavalink node — resolution is bot-agnostic — and sends the finished
+   * tracks to whichever container is in the channel. A `QueuedTrack` is plain
+   * data by construction, because the same shape is what gets persisted to
+   * `queue_tracks`, so it crosses a wire unchanged.
+   */
+  z.object({
+    action: z.literal('enqueue'),
+    ...target,
+    tracks: z.array(z.custom<QueuedTrack>()).min(1).max(LIMITS.QUEUE_MAX_TRACKS).readonly(),
+    next: z.boolean().default(false),
+  }),
+
+  /**
+   * Take over a room and resume whatever it was left with.
+   *
+   * `/join`'s whole body, as one intent. Splitting it into its parts —
+   * "who is the host", "is anything playing", "start from the cursor" — would
+   * be four round trips to answer one question, and the answer could change
+   * between them.
+   */
+  z.object({ action: z.literal('join-session'), ...target }),
 
   /* --------------------------------------------------------------- session */
   z.object({ action: z.literal('set-listener'), ...target, listenerId: id.nullable() }),
@@ -126,6 +154,29 @@ export type IntentResult =
   /** An action that acted on some number of tracks — clear, shuffle. */
   | { readonly kind: 'count'; readonly count: number }
   | { readonly kind: 'snapshot'; readonly snapshot: PlayerSnapshot }
+  /** What `enqueue` did, in the terms `/play` renders. */
+  | {
+      readonly kind: 'enqueued';
+      /** Whether these tracks started the music rather than joining a queue. */
+      readonly startedPlayback: boolean;
+      /** How many tracks are waiting after this, for the "Position" field. */
+      readonly upcomingCount: number;
+      readonly resumed: ResumeNotice | null;
+    }
+  /** What `join-session` found, in the terms `/join` renders. */
+  | {
+      readonly kind: 'joined';
+      /**
+       * `resumed` — playback picked up from the saved cursor.
+       * `already-playing` — somebody's session is live; it was left alone.
+       * `empty` — the bot is in the channel with nothing to play.
+       */
+      readonly outcome: 'resumed' | 'already-playing' | 'empty';
+      /** The track playback resumed from, when it did. */
+      readonly current: TrackSummary | null;
+      readonly upcomingCount: number;
+      readonly resumed: ResumeNotice | null;
+    }
   | {
       readonly kind: 'authority';
       readonly botVoiceChannelId: string;

@@ -13,14 +13,38 @@
  * Every lookup and every call is bounded and fails soft. A sibling that is
  * slow or gone must degrade one command, never block the music.
  */
-import { playerRoomOwnerKey } from '@discord-music/shared';
+import {
+  PLAYER_BOT_TTL_SECONDS,
+  playerBotIndexKey,
+  playerBotKey,
+  playerRoomOwnerKey,
+} from '@discord-music/shared';
 import type { Redis } from '@discord-music/shared/redis';
 
 import { getLogger } from '../lib/logger.js';
 
+import type { BotPresence } from './fleet.js';
 import type { IntentResult, RoomIntent } from './intent.js';
+import type { JoinOptions } from './music-manager.js';
 
 const logger = getLogger('peers');
+
+function parsePresence(payload: string): BotPresence | undefined {
+  try {
+    const parsed = JSON.parse(payload) as Partial<BotPresence>;
+    if (typeof parsed.botId !== 'string' || typeof parsed.baseUrl !== 'string') return undefined;
+    if (typeof parsed.clientId !== 'string') return undefined;
+    return {
+      botId: parsed.botId,
+      clientId: parsed.clientId,
+      role: parsed.role === 'player' ? 'player' : 'primary',
+      baseUrl: parsed.baseUrl,
+      rooms: Array.isArray(parsed.rooms) ? parsed.rooms : [],
+    };
+  } catch {
+    return undefined;
+  }
+}
 
 /** Who owns a room, and where to reach them. */
 export interface RoomOwner {
@@ -39,6 +63,17 @@ export interface PeerDirectoryOptions {
   readonly ttlSeconds: number;
 }
 
+/** What a container answers when asked to take a room. */
+export type JoinOutcome =
+  | { readonly kind: 'joined' }
+  /**
+   * The player is already in a different channel of this guild. One token
+   * holds one voice connection per server, so this is a refusal, not a move —
+   * the allocator's picture was a moment out of date and it should look again.
+   */
+  | { readonly kind: 'busy'; readonly voiceChannelId: string }
+  | { readonly kind: 'error'; readonly message: string };
+
 export class PeerDirectory {
   readonly #redis: Redis | undefined;
   readonly #selfBotId: string;
@@ -54,6 +89,95 @@ export class PeerDirectory {
 
   get selfBotId(): string {
     return this.#selfBotId;
+  }
+
+  /**
+   * Publish this container's own presence, and refresh it.
+   *
+   * Written repeatedly rather than once at startup: the entry expires, so
+   * being in the directory means "answered within the last minute" rather than
+   * "started at some point". Nothing has to clean up after a container that
+   * dies, which is the only kind of cleanup that survives a crash.
+   */
+  async announceSelf(presence: BotPresence): Promise<void> {
+    const redis = this.#redis;
+    if (redis === undefined) return;
+    await Promise.all([
+      redis
+        .set(playerBotKey(presence.botId), JSON.stringify(presence), 'EX', PLAYER_BOT_TTL_SECONDS)
+        .catch(() => undefined),
+      // The index outlives the entries on purpose: it is the only way to find
+      // them again, and a member whose entry has expired is simply skipped.
+      redis.sadd(playerBotIndexKey(), presence.botId).catch(() => undefined),
+    ]);
+  }
+
+  /** Leave the directory deliberately, rather than by timing out. */
+  async withdrawSelf(botId: string): Promise<void> {
+    if (this.#redis === undefined) return;
+    await this.#redis.del(playerBotKey(botId)).catch(() => undefined);
+  }
+
+  /**
+   * Every container that has checked in recently.
+   *
+   * Members whose entry has expired are dropped from the index as they are
+   * found, so a player that is retired rather than restarted stops being asked
+   * about instead of being asked about forever.
+   */
+  async liveBots(): Promise<readonly BotPresence[]> {
+    const redis = this.#redis;
+    if (redis === undefined) return [];
+    try {
+      const ids = await redis.smembers(playerBotIndexKey());
+      if (ids.length === 0) return [];
+
+      const raw = await redis.mget(...ids.map((id) => playerBotKey(id)));
+      const live: BotPresence[] = [];
+      const gone: string[] = [];
+
+      ids.forEach((id, index) => {
+        const payload = raw[index];
+        if (payload == null) {
+          gone.push(id);
+          return;
+        }
+        const parsed = parsePresence(payload);
+        if (parsed === undefined) gone.push(id);
+        else live.push(parsed);
+      });
+
+      if (gone.length > 0) redis.srem(playerBotIndexKey(), ...gone).catch(() => 0);
+      return live;
+    } catch (error) {
+      logger.debug({ err: error }, 'Fleet presence lookup failed');
+      return [];
+    }
+  }
+
+  /**
+   * Ask a container to take a room.
+   *
+   * Separate from `sendIntent` because it is the one call about a room that
+   * does not exist yet: every intent is applied to a player that is already
+   * there, and this is what puts one there.
+   */
+  async sendJoin(baseUrl: string, options: JoinOptions): Promise<JoinOutcome> {
+    try {
+      const response = await fetch(`${baseUrl}/join`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(options),
+        signal: AbortSignal.timeout(this.#timeoutMs),
+      });
+      return (await response.json()) as JoinOutcome;
+    } catch (error) {
+      logger.warn({ err: error, baseUrl }, 'Peer did not answer a join');
+      return {
+        kind: 'error',
+        message: 'That player is not responding right now. Try again shortly.',
+      };
+    }
   }
 
   /** Claim a room, so siblings can route to this container for it. */

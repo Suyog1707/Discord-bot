@@ -79,7 +79,7 @@ const PLAYER_INTENTS = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceSt
  * Discord allows one voice connection per guild per *token*, so playing in
  * several channels of one server at once means running as several
  * applications. The primary is the one users interact with: it owns the slash
- * commands and the dashboard command channel. A worker is a headless player
+ * commands and the dashboard command channel. A player is headless
  * the primary hands a channel to.
  */
 export interface BotIdentity {
@@ -165,6 +165,8 @@ export class BotClient extends Client {
 
   #redis: Redis | undefined;
   #commandSubscriber: PlayerCommandSubscriber | undefined;
+  /** Keeps this container's presence entry from expiring. */
+  #heartbeat: NodeJS.Timeout | undefined;
   #shuttingDown = false;
 
   constructor(identity?: BotIdentity) {
@@ -310,7 +312,7 @@ export class BotClient extends Client {
       ? join(moduleDirectory, '..', 'events')
       : join(moduleDirectory, 'events');
 
-    // A worker registers no slash commands with Discord, so loading them would
+    // A player registers no slash commands with Discord, so loading them would
     // only build a registry nothing can ever reach. It still needs the event
     // handlers — voice state changes are how its own player learns the room
     // emptied.
@@ -322,12 +324,20 @@ export class BotClient extends Client {
 
     await this.#verifyDependencies();
     await this.#connect();
-    // Only the primary listens for dashboard commands. Every bot subscribing
-    // would mean N handlers racing one instruction, and it would break the
-    // publisher's subscriber-count check for whether the bot is online at all.
-    if (this.identity.role === 'primary') {
-      await this.#startCommandSubscriber();
-    }
+    /**
+     * Every container listens for dashboard commands, and acts only on the
+     * rooms it owns.
+     *
+     * This used to be the primary's job alone, back when it could reach every
+     * player through an in-memory registry. It cannot now, and routing each
+     * command through it would add a hop to reach a container that is already
+     * subscribed to the same channel. The filter that makes this safe is the
+     * one the subscriber has always had: a command names its room, and a
+     * container with no player for that room ignores it — so exactly one of
+     * them acts.
+     */
+    await this.#startCommandSubscriber();
+    this.#startPresenceHeartbeat();
 
     this.logger.info(
       { durationMs: Date.now() - startedAt, player: this.identity.label },
@@ -343,6 +353,49 @@ export class BotClient extends Client {
     void peers
       .announce(guildId, voiceChannelId, { botId: this.identity.label, baseUrl })
       .catch(() => undefined);
+    // The room set just changed, so the presence entry allocation reads is now
+    // out of date. Republishing here is what keeps the gap between a room being
+    // taken and the allocator knowing about it down to one Redis write.
+    this.#announceSelf();
+  }
+
+  /**
+   * Publish what this container is and what it is holding.
+   *
+   * The allocator cannot see a running player any other way: a bot sitting idle
+   * owns no rooms, so no amount of room state proves it exists. Written on a
+   * short interval *and* whenever the rooms change, so the picture is both
+   * current and self-repairing.
+   */
+  #announceSelf(): void {
+    const peers = this.peers;
+    const baseUrl = this.peerBaseUrl;
+    if (peers === undefined || baseUrl === undefined) return;
+
+    void peers
+      .announceSelf({
+        botId: this.identity.label,
+        clientId: this.identity.clientId,
+        role: this.identity.role,
+        baseUrl,
+        rooms: this.music?.rooms ?? [],
+      })
+      .catch(() => undefined);
+  }
+
+  /**
+   * Keep the presence entry alive.
+   *
+   * The entry expires on its own, so a container that is killed leaves the
+   * fleet without anybody's cooperation — the only kind of cleanup that
+   * survives a crash. `unref` so the timer never holds up a shutdown.
+   */
+  #startPresenceHeartbeat(): void {
+    this.#announceSelf();
+    this.#heartbeat = setInterval(() => {
+      this.#announceSelf();
+    }, getEnv().BOT_HEARTBEAT_MS);
+    this.#heartbeat.unref();
   }
 
   /**
@@ -494,6 +547,11 @@ export class BotClient extends Client {
     this.#shuttingDown = true;
 
     this.logger.info({ reason }, 'Shutting down');
+
+    if (this.#heartbeat !== undefined) clearInterval(this.#heartbeat);
+    // Leave the fleet deliberately rather than by timing out, so a restart is
+    // not offered rooms for the minute its old entry would otherwise linger.
+    await this.peers?.withdrawSelf(this.identity.label).catch(() => undefined);
 
     // Players first: they persist their queues and leave voice cleanly while
     // the gateway connection still exists.

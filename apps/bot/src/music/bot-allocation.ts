@@ -47,6 +47,9 @@ export interface FleetMember {
   readonly claimedFor: string | null;
 }
 
+/** An allocation that named a bot — the outcomes that lead to a join. */
+export type BotAllocation = Extract<Allocation, { readonly botId: string }>;
+
 export type Allocation =
   /** Already on this room — reuse it. */
   | { readonly kind: 'existing'; readonly botId: string }

@@ -222,6 +222,24 @@ export const botEnvSchema = requireInProduction(
       BOT_UNHEALTHY_EXIT_AFTER_MS: z.coerce.number().int().min(0).max(3_600_000).default(120_000),
       /** How often that check runs. */
       BOT_HEALTH_CHECK_MS: z.coerce.number().int().min(1_000).max(600_000).default(15_000),
+      /**
+       * How often a container republishes its presence entry.
+       *
+       * Presence is what tells the allocator which players are running and
+       * where to reach them. The entry expires on its own, so this is also
+       * what keeps a live player in the fleet — comfortably more often than
+       * the expiry, so one missed write costs nothing.
+       */
+      BOT_HEARTBEAT_MS: z.coerce.number().int().min(1_000).max(300_000).default(20_000),
+      /**
+       * How long a room must sit empty before another channel may take its
+       * player.
+       *
+       * Long enough to survive everyone moving between channels together,
+       * short enough that a genuinely abandoned room is not held for a
+       * noticeable time.
+       */
+      ROOM_RECLAIM_GRACE_MS: z.coerce.number().int().min(0).max(3_600_000).default(60_000),
       /** Lavalink — optional in development, required in production. */
       LAVALINK_HOST: optional(z.string().min(1)),
       LAVALINK_PORT: port.default(2333),

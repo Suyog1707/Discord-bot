@@ -19,6 +19,7 @@ import type { BotClient } from '../core/bot-client.js';
 import { getLogger } from '../lib/logger.js';
 import { applyIntent } from '../music/apply-intent.js';
 import { decodeIntent } from '../music/intent.js';
+import { decodeJoinRequest } from '../music/join-request.js';
 
 import { resolveBotHealth, type BotDependencyReport, type DependencyStatus } from './health.js';
 
@@ -125,6 +126,31 @@ export function createInternalServer(client: BotClient, port: number): InternalS
       // is cold, and when you want to ask one container what it thinks.
       const rooms = client.router?.ownRooms() ?? [];
       send(response, 200, { bot: client.identity.label, rooms });
+      return;
+    }
+
+    if (path === '/join' && request.method === 'POST') {
+      // The only call about a room that does not exist yet: every intent acts
+      // on a player that is already there, and this is what puts one there.
+      // Allocation has already happened on the primary, so there is nothing
+      // left to choose — only to do it, or to say why it cannot.
+      const options = decodeJoinRequest(await readJson(request));
+      if (options === null) {
+        send(response, 400, { kind: 'error', message: 'Malformed join request' });
+        return;
+      }
+
+      const router = client.router;
+      if (router === undefined) {
+        send(response, 503, { kind: 'error', message: 'This player has no audio server.' });
+        return;
+      }
+
+      logger.info(
+        { guildId: options.guildId, voiceChannelId: options.voiceChannelId },
+        'Taking a room on request',
+      );
+      send(response, 200, await router.joinLocal(options));
       return;
     }
 

@@ -2,23 +2,8 @@
 import { EmbedBuilder } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
-import type { GuildPlayer } from '../../music/guild-player.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
-import { decideJoin } from '../../music/join-decision.js';
 import { requireRouter, requireVoiceContext } from '../../music/voice-context.js';
-
-/** The three facts `decideJoin` needs, read off a live player. */
-function stateOf(player: GuildPlayer): {
-  readonly isPlaying: boolean;
-  readonly hasCurrentTrack: boolean;
-  readonly currentIndex: number;
-} {
-  return {
-    isPlaying: player.isPlaying,
-    hasCurrentTrack: player.queue.current !== null,
-    currentIndex: player.queue.currentIndex,
-  };
-}
 
 export default defineCommand({
   data: new SlashCommandBuilder()
@@ -38,44 +23,40 @@ export default defineCommand({
     const router = requireRouter(client);
     const context = requireVoiceContext(interaction);
 
-    // Already here and playing: this is somebody's live session, so say so
-    // rather than rejoining and taking it over.
-    const existing = router.playerFor(context.guildId, context.voiceChannelId);
-    if (existing !== undefined && decideJoin(stateOf(existing)).kind === 'already-playing') {
-      await interaction.editReply({
-        content: `Already playing in <#${context.voiceChannelId}>.`,
-      });
-      return;
-    }
-
     // Joining restores whatever this channel was left with — that has always
-    // happened, it was simply unreachable without naming a song.
-    const player = await router.joinRoom({
+    // happened, it was simply unreachable without naming a song. The room may
+    // belong to another container, so everything after the join travels as one
+    // intent rather than as a handful of reads.
+    const room = await router.openRoom({
       guildId: context.guildId,
       voiceChannelId: context.voiceChannelId,
       textChannelId: interaction.channelId,
       shardId: interaction.guild?.shardId ?? 0,
     });
 
-    const room = router.roomFor(context.guildId, context.voiceChannelId);
-    const resumed = room?.music.takeResumeNotice(context.guildId) ?? null;
+    const result = await router.runIntent({
+      action: 'join-session',
+      guildId: context.guildId,
+      voiceChannelId: context.voiceChannelId,
+      issuedBy: interaction.user.id,
+    });
 
-    /**
-     * Whoever summons the bot runs the session.
-     *
-     * A restored queue remembers the listener it belonged to, but that person
-     * may well have gone home — their taste should not quietly drive a room
-     * they are not in. `setListener` moves autoplay to the caller and, through
-     * `onListenerChange`, makes them host; `setHost` is first-writer-wins, so
-     * naming them directly also covers the case where they *are* the restored
-     * listener and `setListener` therefore has nothing to change.
-     */
-    player.setListener(interaction.user.id);
-    room?.music.sessionDj.setHost(context.guildId, interaction.user.id);
+    if (result.kind === 'error') {
+      await interaction.editReply({ content: result.message });
+      return;
+    }
+    if (result.kind !== 'joined') return;
 
-    const decision = decideJoin(stateOf(player));
-    const current = player.queue.current;
-    if (decision.kind !== 'resume' || current === null) {
+    // Already here and playing: this is somebody's live session, so say so
+    // rather than taking it over.
+    if (result.outcome === 'already-playing') {
+      await interaction.editReply({
+        content: `Already playing in <#${context.voiceChannelId}>.`,
+      });
+      return;
+    }
+
+    if (result.outcome === 'empty' || result.current === null) {
       await interaction.editReply({
         content:
           `👋 Joined <#${context.voiceChannelId}>. Nothing is queued here — ` +
@@ -84,35 +65,37 @@ export default defineCommand({
       return;
     }
 
-    // The queue comes back on join; playback does not. Only `/play` ever
-    // started it, as a side effect of enqueuing the track it was given.
-    await player.jumpTo(decision.fromIndex);
-
     const embed = new EmbedBuilder()
       .setColor(0x5865f2)
       .setTitle('▶️ Resumed')
-      .setDescription(`**${current.title}**\n${current.author}`)
+      .setDescription(`**${result.current.title}**\n${result.current.author}`)
       .addFields({
         name: 'Channel',
         value: `<#${context.voiceChannelId}>`,
         inline: true,
       });
 
-    const upcoming = player.queue.upcoming.length;
-    if (upcoming > 0) {
+    if (result.upcomingCount > 0) {
       embed.addFields({
         name: 'Up next',
-        value: `${String(upcoming)} track${upcoming === 1 ? '' : 's'}`,
+        value: `${String(result.upcomingCount)} track${result.upcomingCount === 1 ? '' : 's'}`,
         inline: true,
       });
     }
-    if (resumed !== null) {
-      embed.setFooter({
-        text: `Picked up ${String(resumed.trackCount)} track${
-          resumed.trackCount === 1 ? '' : 's'
+    // One footer, built from whichever of these applies — a second setFooter
+    // would silently replace the first.
+    const notes: string[] = [];
+    if (result.resumed !== null) {
+      notes.push(
+        `Picked up ${String(result.resumed.trackCount)} track${
+          result.resumed.trackCount === 1 ? '' : 's'
         } this channel was left with.`,
-      });
+      );
     }
+    // Which bot answered matters when a server has several: the controls are on
+    // that bot's message, in that channel, and nowhere else.
+    if (room.local === undefined) notes.push(`Playing through ${room.botId}.`);
+    if (notes.length > 0) embed.setFooter({ text: notes.join(' ') });
 
     await interaction.editReply({ embeds: [embed] });
   },

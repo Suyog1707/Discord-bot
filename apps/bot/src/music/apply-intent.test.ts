@@ -70,6 +70,8 @@ function fakeRoom(overrides: Record<string, unknown> = {}): RoomPlayer & {
     setStayConnected: vi.fn(record('setStayConnected')),
     setAutoplayEnabled: vi.fn(record('setAutoplayEnabled')),
     snapshot: vi.fn(() => ({ paused: false })),
+    isPlaying: false,
+    enqueue: vi.fn(() => Promise.resolve({ position: 3, startedPlayback: true })),
     ...overrides,
   };
 
@@ -77,7 +79,12 @@ function fakeRoom(overrides: Record<string, unknown> = {}): RoomPlayer & {
     isSessionListener: vi.fn(() => true),
     applyDislike: vi.fn(() => ({ evicted: 0 })),
     forgetDislike: vi.fn(),
-    sessionDj: { host: vi.fn(() => USER), djIds: vi.fn(() => ['444444444444444444']) },
+    sessionDj: {
+      host: vi.fn(() => USER),
+      djIds: vi.fn(() => ['444444444444444444']),
+      setHost: vi.fn(),
+    },
+    takeResumeNotice: vi.fn(() => null),
   };
 
   return { botId: 'main', voiceChannelId: VOICE, player, music, calls } as never;
@@ -306,5 +313,76 @@ describe('applyIntent', () => {
     expect(await applyIntent(fakeRoom(), { action: 'snapshot', ...base })).toMatchObject({
       kind: 'snapshot',
     });
+  });
+});
+
+describe('enqueue', () => {
+  it('returns everything the reply needs, so nothing has to be read back', () => {
+    // The point of the intent: one round trip. Asking for the position and the
+    // resume notice separately would be two more, racing the music itself.
+    const room = fakeRoom();
+    return expect(
+      applyIntent(room, {
+        action: 'enqueue',
+        ...base,
+        tracks: [track('New')] as never,
+        next: false,
+      }),
+    ).resolves.toEqual({
+      kind: 'enqueued',
+      startedPlayback: true,
+      upcomingCount: 2,
+      resumed: null,
+    });
+  });
+
+  it('passes the "up next" flag through', async () => {
+    const room = fakeRoom();
+    await applyIntent(room, {
+      action: 'enqueue',
+      ...base,
+      tracks: [track('New')] as never,
+      next: true,
+    });
+
+    expect(room.player.enqueue).toHaveBeenCalledWith([track('New')], { next: true });
+  });
+});
+
+describe('join-session', () => {
+  it('resumes from the saved cursor', async () => {
+    const room = fakeRoom();
+    const result = await applyIntent(room, { action: 'join-session', ...base });
+
+    // The queue has always come back on join; starting it is what `/join` adds.
+    expect(room.player.jumpTo).toHaveBeenCalledWith(2);
+    expect(result).toMatchObject({ kind: 'joined', outcome: 'resumed' });
+  });
+
+  it('makes the caller the host, whoever the queue remembered', async () => {
+    const room = fakeRoom();
+    await applyIntent(room, { action: 'join-session', ...base });
+
+    expect(room.player.setListener).toHaveBeenCalledWith(USER);
+    expect(room.music.sessionDj.setHost).toHaveBeenCalledWith(GUILD, USER);
+  });
+
+  it('leaves a live session alone', async () => {
+    // Somebody is already listening here. Taking the host seat and pointing
+    // autoplay at whoever typed the command would hijack their session.
+    const room = fakeRoom({ isPlaying: true });
+    const result = await applyIntent(room, { action: 'join-session', ...base });
+
+    expect(result).toMatchObject({ kind: 'joined', outcome: 'already-playing' });
+    expect(room.player.setListener).not.toHaveBeenCalled();
+    expect(room.player.jumpTo).not.toHaveBeenCalled();
+  });
+
+  it('joining an empty channel is not an error', async () => {
+    const room = fakeRoom({ queue: { current: null, currentIndex: 0, upcoming: [] } });
+    const result = await applyIntent(room, { action: 'join-session', ...base });
+
+    expect(result).toMatchObject({ kind: 'joined', outcome: 'empty' });
+    expect(room.player.jumpTo).not.toHaveBeenCalled();
   });
 });

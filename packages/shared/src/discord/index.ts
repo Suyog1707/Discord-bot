@@ -12,7 +12,7 @@
  * Permissions a player needs.
  *
  * Connect, Speak, Send Messages, Embed Links, Read Message History, View
- * Channels. A worker uses only the voice half, but asking for one set keeps
+ * Channels. A player uses only the voice half, but asking for one set keeps
  * the invites identical and lets any player be promoted to primary later
  * without a re-invite.
  */

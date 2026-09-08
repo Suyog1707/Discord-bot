@@ -41,18 +41,15 @@ const client = new BotClient({
 });
 
 /**
- * One router over every player, shared by all of them.
+ * The router knows one bot directly — this one.
  *
- * It spans the fleet, so no single client can build it — and every client
- * needs it, because a command arriving at the primary may be about a room a
- * worker is serving. Clients whose Lavalink is unconfigured have no manager
- * and simply do not appear as players.
- */
-/**
- * The router still exists, and still knows one bot — this one.
+ * Everything else it needs is looked up: who else exists comes from the roster
+ * in Postgres, what they are doing comes from their presence entries in Redis,
+ * and reaching them is an HTTP call. So the shape a caller sees is the same
+ * whether a room is in this process or three containers away.
  *
- * Its remote arm is what reaches the others, so the shape it sees locally is
- * the same whether a room is here or somewhere else.
+ * A client whose Lavalink is unconfigured has no manager and simply does not
+ * appear as a player.
  */
 const routerBots: readonly RouterBot[] =
   client.music === undefined
@@ -68,9 +65,14 @@ const routerBots: readonly RouterBot[] =
 /**
  * How this container finds and calls the others.
  *
- * Built even while the whole fleet still shares one process: every room is
- * local then, so the remote arm simply never fires — which means the split
- * later changes where rooms live, not how they are reached.
+ * Also how it makes itself findable: the presence entry it publishes is the
+ * only evidence an idle player exists at all, since a bot holding no rooms
+ * leaves no trace in the room state.
+ *
+ * `BOT_PEER_HOST` matters more than it looks. A container's own hostname is an
+ * opaque id, so without it siblings would be told to call
+ * `http://e14fca1f44ee:8080`; compose sets it to the service name, which is
+ * what Docker actually resolves.
  */
 const peerHost = env.BOT_PEER_HOST ?? hostname();
 const peers = new PeerDirectory({
@@ -80,7 +82,11 @@ const peers = new PeerDirectory({
   ttlSeconds: PLAYER_STATE_TTL_SECONDS,
 });
 
-const router = new PlayerRouter(routerBots, peers);
+const router = new PlayerRouter(routerBots, {
+  peers,
+  fleet: client.services.guilds,
+  reclaimGraceMs: env.ROOM_RECLAIM_GRACE_MS,
+});
 client.router = router;
 client.peers = peers;
 client.peerBaseUrl = `http://${peerHost}:${String(env.BOT_INTERNAL_PORT)}`;
@@ -178,12 +184,6 @@ process.on('uncaughtException', (error) => {
 try {
   await client.start();
   /**
-   * Started after the gateway, so a healthcheck never sees a bot that is
-   * listening but not yet connected. Not fatal yet — nothing depends on it
-   * until siblings start calling each other, and refusing to run a working
-   * bot over a port clash would be the worse trade today.
-   */
-  /**
    * Quit if the gateway stays gone.
    *
    * Docker restarts a crash, not a stall — without this a wedged container
@@ -208,6 +208,15 @@ try {
     void shutdown('gateway-lost', 1);
   }, env.BOT_HEALTH_CHECK_MS).unref();
 
+  /**
+   * Started after the gateway, so a healthcheck never sees a bot that is
+   * listening but not yet connected.
+   *
+   * Not fatal, though it now costs more than it used to: without it Docker
+   * cannot tell whether this container is well, and siblings cannot hand it a
+   * room. The bot it is already playing for is worth more than the rooms it
+   * will not be offered, so it keeps running and says so loudly.
+   */
   await internal.start().catch((error: unknown) => {
     logger.error(
       { err: error, port: env.BOT_INTERNAL_PORT },

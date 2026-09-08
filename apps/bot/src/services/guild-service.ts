@@ -25,11 +25,26 @@ const logger = getLogger('guild-service');
  */
 const SETTINGS_CACHE_TTL_MS = 15_000;
 
+/**
+ * How long the fleet roster and per-guild presence are cached.
+ *
+ * Both change only when an application is added to the deployment or a bot is
+ * invited to a server — rare events, and both write paths invalidate what they
+ * touch. Short anyway, so a stale answer costs one allocation rather than a
+ * session.
+ */
+const ROSTER_CACHE_TTL_MS = 60_000;
+
 export class GuildService {
   readonly #prisma: PrismaClient;
   readonly #settingsCache = new Map<string, { value: GuildSettings; expiresAt: number }>();
   /** In-flight reads, so concurrent callers share one query instead of racing. */
   readonly #settingsInFlight = new Map<string, Promise<GuildSettings>>();
+
+  #rosterCache:
+    { value: readonly { botId: string; clientId: string }[]; expiresAt: number } | undefined;
+
+  readonly #presenceCache = new Map<string, { value: ReadonlySet<string>; expiresAt: number }>();
 
   constructor(prisma: PrismaClient) {
     this.#prisma = prisma;
@@ -140,7 +155,7 @@ export class GuildService {
         where: { discordId: discordGuildId },
         select: { id: true },
       });
-      // A worker can be in a server the primary has never seen; there is no
+      // A player can be in a server the primary has never seen; there is no
       // guild row to hang presence off yet, and the primary's own join will
       // create one.
       if (guild === null) return;
@@ -158,12 +173,74 @@ export class GuildService {
           ...(present ? { joinedAt: now } : { leftAt: now }),
         },
       });
+      // Allocation reads this to decide whether a server can be offered
+      // another player; a cached "no" outliving the invite is the one stale
+      // answer worth spending a map delete to avoid.
+      this.#presenceCache.delete(discordGuildId);
     } catch (error) {
       logger.warn(
         { err: error, guildId: discordGuildId, botClientId, present },
         'Player presence write failed',
       );
     }
+  }
+
+  /**
+   * Every identity this deployment has ever started, oldest first.
+   *
+   * Oldest first is the order players are handed out in, and it is stable: the
+   * primary registered before any player did, and player-2 before player-3, so
+   * a server that has added two bots has added the same two as everybody else.
+   *
+   * Cached briefly. It is read on the path of every `/play` that has to
+   * allocate, and the answer changes only when a new application is added to
+   * the deployment.
+   */
+  async listBots(): Promise<readonly { botId: string; clientId: string }[]> {
+    const cached = this.#rosterCache;
+    if (cached !== undefined && cached.expiresAt > Date.now()) return cached.value;
+
+    try {
+      const rows = await this.#prisma.playerBot.findMany({
+        orderBy: { createdAt: 'asc' },
+        select: { label: true, clientId: true },
+      });
+      const value = rows.map((row) => ({ botId: row.label, clientId: row.clientId }));
+      this.#rosterCache = { value, expiresAt: Date.now() + ROSTER_CACHE_TTL_MS };
+      return value;
+    } catch (error) {
+      logger.warn({ err: error }, 'Player roster read failed');
+      // The caller's own identity is added by the router, so an empty roster
+      // degrades to single-room behaviour rather than to no music at all.
+      return cached?.value ?? [];
+    }
+  }
+
+  /** Application ids of the players a server has actually added. */
+  async botsInGuild(discordGuildId: string): Promise<ReadonlySet<string>> {
+    const cached = this.#presenceCache.get(discordGuildId);
+    if (cached !== undefined && cached.expiresAt > Date.now()) return cached.value;
+
+    try {
+      const rows = await this.#prisma.guildBot.findMany({
+        where: { guild: { discordId: discordGuildId }, present: true },
+        select: { botClientId: true },
+      });
+      const value = new Set(rows.map((row) => row.botClientId));
+      this.#presenceCache.set(discordGuildId, {
+        value,
+        expiresAt: Date.now() + ROSTER_CACHE_TTL_MS,
+      });
+      return value;
+    } catch (error) {
+      logger.warn({ err: error, guildId: discordGuildId }, 'Player presence read failed');
+      return cached?.value ?? new Set();
+    }
+  }
+
+  /** Drop the cached presence for one guild — a bot just joined or left it. */
+  invalidateBotsInGuild(discordGuildId: string): void {
+    this.#presenceCache.delete(discordGuildId);
   }
 
   /**
@@ -201,6 +278,7 @@ export class GuildService {
         data: { present: false, leftAt: now },
       });
 
+      this.#presenceCache.clear();
       logger.info(
         { botClientId, present: guilds.length, cleared: gone.count },
         'Player presence reconciled',
