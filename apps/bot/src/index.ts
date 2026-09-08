@@ -6,12 +6,15 @@
  *   2. Construct and start the client (env is validated on first import).
  *   3. Shut down cleanly on SIGINT/SIGTERM so Docker and systemd restarts are graceful.
  */
+import { hostname } from 'node:os';
+
 import { getPrismaClient } from '@discord-music/database';
-import { isAppError } from '@discord-music/shared';
+import { isAppError, PLAYER_STATE_TTL_SECONDS } from '@discord-music/shared';
 import { RestError } from 'shoukaku';
 
 import { getEnv } from './config/env.js';
 import { BotClient } from './core/bot-client.js';
+import { PeerDirectory } from './music/peers.js';
 import { PlayerRouter, type RouterBot } from './music/player-router.js';
 import { createInternalServer } from './server/index.js';
 import { logger } from './lib/logger.js';
@@ -61,8 +64,27 @@ const routerBots: readonly RouterBot[] = fleet.flatMap((client) => {
     },
   ];
 });
-const router = new PlayerRouter(routerBots);
-for (const client of fleet) client.router = router;
+/**
+ * How this container finds and calls the others.
+ *
+ * Built even while the whole fleet still shares one process: every room is
+ * local then, so the remote arm simply never fires — which means the split
+ * later changes where rooms live, not how they are reached.
+ */
+const peerHost = env.BOT_PEER_HOST ?? hostname();
+const peers = new PeerDirectory({
+  redis: primary.redis,
+  selfBotId: primary.identity.label,
+  timeoutMs: env.BOT_PEER_TIMEOUT_MS,
+  ttlSeconds: PLAYER_STATE_TTL_SECONDS,
+});
+
+const router = new PlayerRouter(routerBots, peers);
+for (const client of fleet) {
+  client.router = router;
+  client.peers = peers;
+  client.peerBaseUrl = `http://${peerHost}:${String(env.BOT_INTERNAL_PORT)}`;
+}
 
 /**
  * One server per process, not per client.

@@ -14,9 +14,12 @@ import { botInviteUrl, ValidationError } from '@discord-music/shared';
 
 import { getLogger } from '../lib/logger.js';
 
+import { applyIntent } from './apply-intent.js';
 import { allocateBot, type FleetMember } from './bot-allocation.js';
 import type { GuildPlayer } from './guild-player.js';
+import type { IntentResult, RoomIntent } from './intent.js';
 import type { JoinOptions, MusicManager, RoomState } from './music-manager.js';
+import type { PeerDirectory } from './peers.js';
 
 const logger = getLogger('player-router');
 
@@ -70,9 +73,16 @@ export class PlayerRouter {
    */
   readonly #fleetSize: number;
 
-  constructor(bots: readonly RouterBot[]) {
+  /**
+   * How to reach the containers this process is not. Absent while every bot
+   * still shares one process, in which case every room is local by definition.
+   */
+  readonly #peers: PeerDirectory | undefined;
+
+  constructor(bots: readonly RouterBot[], peers?: PeerDirectory) {
     this.#bots = bots;
     this.#fleetSize = bots.length;
+    this.#peers = peers;
   }
 
   get size(): number {
@@ -142,6 +152,54 @@ export class PlayerRouter {
       }
     }
     return rooms;
+  }
+
+  /**
+   * Run an intent against a room, wherever it lives.
+   *
+   * The only thing a caller needs to know is the room. Whether that means a
+   * method call on a player in this process or an HTTP request to a sibling is
+   * this method's business — and the local path is the same code the sibling
+   * would run, so there is one implementation, not two.
+   */
+  async runIntent(intent: RoomIntent): Promise<IntentResult> {
+    const local = this.roomFor(intent.guildId, intent.voiceChannelId);
+    if (local !== undefined) return applyIntent(local, intent);
+
+    const owner = await this.#peers?.ownerOf(intent.guildId, intent.voiceChannelId);
+    if (owner === undefined || owner.botId === this.#peers?.selfBotId) {
+      // Nobody owns it, or the only claim is a stale one of our own — either
+      // way there is no player here to act on.
+      return { kind: 'error', message: 'Nothing is playing in that channel.' };
+    }
+    return this.#peers?.sendIntent(owner, intent) ?? { kind: 'error', message: 'No player.' };
+  }
+
+  /**
+   * The room's DJ state, for the command guard.
+   *
+   * Three scalars, and `decideDjAuthority` is already pure — so this is the
+   * whole of what the guard needs from a room another container owns.
+   */
+  async authorityFor(
+    guildId: string,
+    voiceChannelId: string,
+    issuedBy: string,
+  ): Promise<
+    | {
+        readonly botVoiceChannelId: string;
+        readonly hostId: string | null;
+        readonly sessionDjIds: readonly string[];
+      }
+    | undefined
+  > {
+    const result = await this.runIntent({
+      action: 'authority',
+      guildId,
+      voiceChannelId,
+      issuedBy,
+    });
+    return result.kind === 'authority' ? result : undefined;
   }
 
   /**

@@ -31,6 +31,7 @@ import { getLogger, logger, type Logger } from '../lib/logger.js';
 import { PlayerCommandSubscriber } from '../music/command-subscriber.js';
 import { MusicManager } from '../music/music-manager.js';
 import type { PlayerRouter } from '../music/player-router.js';
+import type { PeerDirectory } from '../music/peers.js';
 import { QueueStore } from '../music/queue-store.js';
 import { DislikesService } from '../services/dislikes-service.js';
 import { FavoritesService } from '../services/favorites-service.js';
@@ -132,6 +133,19 @@ export class BotClient extends Client {
   router: PlayerRouter | undefined;
 
   /**
+   * How siblings reach this container, and how it finds them. Assigned with
+   * the router, since both span the fleet.
+   */
+  peers: PeerDirectory | undefined;
+
+  /**
+   * The address siblings reach this container on, e.g.
+   * `http://dmp-bot-player-2:8080`. Undefined while every bot shares one
+   * process, where there is nobody to reach.
+   */
+  peerBaseUrl: string | undefined;
+
+  /**
    * Intent parsing, taste and recommendations. Always present — with nothing
    * configured its services are simply disabled, so callers never branch.
    */
@@ -231,10 +245,18 @@ export class BotClient extends Client {
               if (payload === null) {
                 redis.del(key).catch(() => 0);
                 redis.srem(index, voiceChannelId).catch(() => 0);
+                // Let the room go before anything else can be told to send
+                // commands into a container that is no longer in it.
+                void this.peers?.release(guildId, voiceChannelId).catch(() => undefined);
                 return;
               }
               redis.set(key, payload, 'EX', PLAYER_STATE_TTL_SECONDS).catch(() => 0);
               redis.sadd(index, voiceChannelId).catch(() => 0);
+              // Claim the room, so a sibling holding a command for it knows
+              // where to send it. Written on every event rather than only on
+              // connect, which doubles as the heartbeat that keeps the claim
+              // from expiring under a long-running session.
+              this.#announceRoom(guildId, voiceChannelId);
               // The index must not outlive the snapshots it points at; a room
               // whose bot died without a disconnect would otherwise haunt the
               // dashboard forever.
@@ -311,6 +333,16 @@ export class BotClient extends Client {
       { durationMs: Date.now() - startedAt, player: this.identity.label },
       'Bot startup complete',
     );
+  }
+
+  /** Advertise that this container serves a room, if it can be reached at all. */
+  #announceRoom(guildId: string, voiceChannelId: string): void {
+    const peers = this.peers;
+    const baseUrl = this.peerBaseUrl;
+    if (peers === undefined || baseUrl === undefined) return;
+    void peers
+      .announce(guildId, voiceChannelId, { botId: this.identity.label, baseUrl })
+      .catch(() => undefined);
   }
 
   /**

@@ -4,7 +4,8 @@ import { LIMITS, parseOrThrow, volumeSchema } from '@discord-music/shared';
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import {
-  requireActivePlayer,
+  intentTarget,
+  runRoomIntent,
   requireRouter,
   requireVoiceContext,
 } from '../../music/voice-context.js';
@@ -29,13 +30,17 @@ export default defineCommand({
   async execute({ interaction }) {
     const client = interaction.client as BotClient;
     const router = requireRouter(client);
-    const player = requireActivePlayer(router, requireVoiceContext(interaction));
+    const context = requireVoiceContext(interaction);
 
     const percent = parseOrThrow(volumeSchema, interaction.options.getInteger('percent', true));
-    await player.setVolume(percent);
 
-    await interaction.editReply({
-      content: `🔊 Volume set to **${String(percent)}%**.`,
+    const result = await runRoomIntent(router, interaction, {
+      action: 'volume',
+      volume: percent,
+      ...intentTarget(context, interaction.user.id),
     });
+    if (result === null) return;
+
+    await interaction.editReply({ content: `🔊 Volume set to **${String(percent)}%**.` });
   },
 });

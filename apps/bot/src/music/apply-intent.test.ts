@@ -26,6 +26,8 @@ function track(title: string, overrides: Record<string, unknown> = {}) {
     identifier: `id-${title}`,
     uri: null,
     sourceKey: undefined,
+    durationMs: 180_000,
+    isStream: false,
     ...overrides,
   };
 }
@@ -43,9 +45,14 @@ function fakeRoom(overrides: Record<string, unknown> = {}): RoomPlayer & {
 
   const player = {
     voiceChannelId: VOICE,
+    paused: false,
     queue: { current: track('Playing'), currentIndex: 2, upcoming: [track('A'), track('B')] },
-    pause: vi.fn(record('pause')),
-    resume: vi.fn(record('resume')),
+    pause: vi.fn(() => {
+      player.paused = true;
+    }),
+    resume: vi.fn(() => {
+      player.paused = false;
+    }),
     skip: vi.fn(() => Promise.resolve(track('Skipped'))),
     stop: vi.fn(record('stop')),
     previous: vi.fn(() => Promise.resolve(track('Previous'))),
@@ -76,21 +83,7 @@ function fakeRoom(overrides: Record<string, unknown> = {}): RoomPlayer & {
   return { botId: 'main', voiceChannelId: VOICE, player, music, calls } as never;
 }
 
-/**
- * Derived through the schema rather than written as literals: snowflake fields
- * are branded, so a hand-written string is not assignable to an intent.
- */
-const parsed = roomIntentSchema.parse({
-  action: 'pause',
-  guildId: GUILD,
-  voiceChannelId: VOICE,
-  issuedBy: USER,
-});
-const base = {
-  guildId: parsed.guildId,
-  voiceChannelId: parsed.voiceChannelId,
-  issuedBy: parsed.issuedBy,
-} as const;
+const base = { guildId: GUILD, voiceChannelId: VOICE, issuedBy: USER } as const;
 
 describe('intent schema', () => {
   it('accepts a well-formed intent', () => {
@@ -130,6 +123,58 @@ describe('applyIntent', () => {
 
     expect(await applyIntent(room, { action: 'pause', ...base })).toEqual({ kind: 'ok' });
     expect(await applyIntent(room, { action: 'resume', ...base })).toEqual({ kind: 'ok' });
+  });
+
+  /**
+   * The state check lives here rather than in the command: whether playback is
+   * already paused is a fact about the room, and asking for it separately
+   * would cost a second round trip to learn what the owner already knows.
+   */
+  it('refuses to pause what is already paused', async () => {
+    const room = fakeRoom();
+    await applyIntent(room, { action: 'pause', ...base });
+
+    expect(await applyIntent(room, { action: 'pause', ...base })).toMatchObject({
+      kind: 'error',
+    });
+  });
+
+  it('refuses to resume what is not paused', async () => {
+    expect(await applyIntent(fakeRoom(), { action: 'resume', ...base })).toMatchObject({
+      kind: 'error',
+    });
+  });
+
+  it('reports the end of the queue rather than a silent no-op', async () => {
+    const room = fakeRoom({ previous: vi.fn(() => Promise.resolve(null)) });
+
+    expect(await applyIntent(room, { action: 'previous', ...base })).toMatchObject({
+      kind: 'error',
+    });
+  });
+
+  it('refuses to seek a live stream', async () => {
+    const room = fakeRoom({
+      queue: { current: track('Live', { isStream: true }), currentIndex: 0, upcoming: [] },
+    });
+
+    expect(await applyIntent(room, { action: 'seek', ...base, positionMs: 1_000 })).toMatchObject({
+      kind: 'error',
+    });
+  });
+
+  it('refuses to seek past the end of a track', async () => {
+    const room = fakeRoom({
+      queue: {
+        current: track('Short', { durationMs: 1_000, isStream: false }),
+        currentIndex: 0,
+        upcoming: [],
+      },
+    });
+
+    expect(await applyIntent(room, { action: 'seek', ...base, positionMs: 999_000 })).toMatchObject(
+      { kind: 'error' },
+    );
   });
 
   it('returns the track a skip removed, summarised rather than whole', async () => {

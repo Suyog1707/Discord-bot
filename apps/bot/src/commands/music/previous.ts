@@ -1,10 +1,9 @@
 /** `/previous` — go back to the previously played track. */
-import { ValidationError } from '@discord-music/shared';
-
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import {
-  requireActivePlayer,
+  intentTarget,
+  runRoomIntent,
   requireRouter,
   requireVoiceContext,
 } from '../../music/voice-context.js';
@@ -21,15 +20,15 @@ export default defineCommand({
   async execute({ interaction }) {
     const client = interaction.client as BotClient;
     const router = requireRouter(client);
-    const player = requireActivePlayer(router, requireVoiceContext(interaction));
+    const context = requireVoiceContext(interaction);
 
-    const track = await player.previous();
-    if (track === null) {
-      throw new ValidationError('There is no earlier track — this is the start of the queue.');
-    }
-
-    await interaction.editReply({
-      content: `⏮️ Back to **${track.title}**.`,
+    const result = await runRoomIntent(router, interaction, {
+      action: 'previous',
+      ...intentTarget(context, interaction.user.id),
     });
+    if (result === null) return;
+
+    const title = result.kind === 'track' ? (result.track?.title ?? 'the previous track') : '';
+    await interaction.editReply({ content: `⏮️ Back to **${title}**.` });
   },
 });

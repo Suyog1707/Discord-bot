@@ -1,10 +1,9 @@
 /** `/shuffle` — shuffle the upcoming tracks. */
-import { ValidationError } from '@discord-music/shared';
-
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import {
-  requireActivePlayer,
+  intentTarget,
+  runRoomIntent,
   requireRouter,
   requireVoiceContext,
 } from '../../music/voice-context.js';
@@ -19,15 +18,20 @@ export default defineCommand({
   async execute({ interaction }) {
     const client = interaction.client as BotClient;
     const router = requireRouter(client);
-    const player = requireActivePlayer(router, requireVoiceContext(interaction));
+    const context = requireVoiceContext(interaction);
 
-    if (player.queue.upcoming.length < 2) {
-      throw new ValidationError('Not enough upcoming tracks to shuffle.');
-    }
+    const result = await runRoomIntent(router, interaction, {
+      action: 'shuffle',
+      ...intentTarget(context, interaction.user.id),
+    });
+    if (result === null) return;
 
-    player.shuffle();
+    const count = result.kind === 'count' ? result.count : 0;
     await interaction.editReply({
-      content: `🔀 Shuffled **${String(player.queue.upcoming.length)}** tracks.`,
+      content:
+        count < 2
+          ? 'Nothing to shuffle — the queue has fewer than two upcoming tracks.'
+          : `🔀 Shuffled **${String(count)}** upcoming tracks.`,
     });
   },
 });

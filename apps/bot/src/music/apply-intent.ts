@@ -16,6 +16,7 @@ import { identityOf } from '@discord-music/shared';
 import { getLogger } from '../lib/logger.js';
 
 import { summarise, type IntentResult, type RoomIntent } from './intent.js';
+import { formatTrackDuration } from './track.js';
 import type { RoomPlayer } from './player-router.js';
 
 const logger = getLogger('intent');
@@ -25,10 +26,18 @@ export async function applyIntent(room: RoomPlayer, intent: RoomIntent): Promise
 
   switch (intent.action) {
     /* ------------------------------------------------------------ transport */
+    /**
+     * The checks that used to sit in the command live here now.
+     * Whether playback is already paused is a fact about the room, and the
+     * room is what this function has — asking for it separately would cost a
+     * second round trip to learn something the owner already knows.
+     */
     case 'pause':
+      if (player.paused) return { kind: 'error', message: 'Already paused — use `/resume`.' };
       await player.pause();
       return { kind: 'ok' };
     case 'resume':
+      if (!player.paused) return { kind: 'error', message: 'Playback is not paused.' };
       await player.resume();
       return { kind: 'ok' };
     case 'skip':
@@ -36,10 +45,18 @@ export async function applyIntent(room: RoomPlayer, intent: RoomIntent): Promise
     case 'stop':
       await player.stop();
       return { kind: 'ok' };
-    case 'previous':
-      return { kind: 'track', track: summarise(await player.previous()) };
-    case 'restart':
-      return { kind: 'track', track: summarise(await player.restart()) };
+    case 'previous': {
+      const track = await player.previous();
+      return track === null
+        ? { kind: 'error', message: 'There is no earlier track — this is the start of the queue.' }
+        : { kind: 'track', track: summarise(track) };
+    }
+    case 'restart': {
+      const track = await player.restart();
+      return track === null
+        ? { kind: 'error', message: 'Nothing is playing.' }
+        : { kind: 'track', track: summarise(track) };
+    }
     case 'shuffle': {
       const count = player.queue.upcoming.length;
       player.shuffle();
@@ -48,9 +65,21 @@ export async function applyIntent(room: RoomPlayer, intent: RoomIntent): Promise
     case 'volume':
       await player.setVolume(intent.volume);
       return { kind: 'ok' };
-    case 'seek':
+    case 'seek': {
+      const current = player.queue.current;
+      if (current === null) return { kind: 'error', message: 'Nothing is playing.' };
+      if (current.isStream) {
+        return { kind: 'error', message: 'Live streams cannot be seeked.' };
+      }
+      if (intent.positionMs > current.durationMs) {
+        return {
+          kind: 'error',
+          message: `That is past the end — the track is ${formatTrackDuration(current)} long.`,
+        };
+      }
       await player.seekTo(intent.positionMs);
-      return { kind: 'ok' };
+      return { kind: 'track', track: summarise(current) };
+    }
     case 'loop':
       player.setLoopMode(intent.mode);
       return { kind: 'ok' };
@@ -63,13 +92,23 @@ export async function applyIntent(room: RoomPlayer, intent: RoomIntent): Promise
         kind: 'track',
         track: summarise(await player.jumpTo(player.queue.currentIndex + intent.position)),
       };
-    case 'remove':
-      return { kind: 'track', track: summarise(player.removeUpcoming(intent.position - 1)) };
-    case 'move':
-      return {
-        kind: 'track',
-        track: summarise(player.moveUpcoming(intent.from - 1, intent.to - 1)),
-      };
+    case 'remove': {
+      const removed = player.removeUpcoming(intent.position - 1);
+      return removed === null
+        ? {
+            kind: 'error',
+            message:
+              `Nothing at position ${String(intent.position)} — the queue has ` +
+              `${String(player.queue.upcoming.length)} upcoming track(s).`,
+          }
+        : { kind: 'track', track: summarise(removed) };
+    }
+    case 'move': {
+      const moved = player.moveUpcoming(intent.from - 1, intent.to - 1);
+      return moved === null
+        ? { kind: 'error', message: 'Those positions are not both in the queue.' }
+        : { kind: 'track', track: summarise(moved) };
+    }
     case 'swap':
       return player.swapUpcoming(intent.a - 1, intent.b - 1)
         ? { kind: 'ok' }

@@ -11,6 +11,7 @@ import type { BotClient } from '../core/bot-client.js';
 import { checkDjAuthority } from '../core/guards.js';
 import type { GuildPlayer } from './guild-player.js';
 import type { MusicManager } from './music-manager.js';
+import type { IntentResult, RoomIntent } from './intent.js';
 import type { PlayerRouter } from './player-router.js';
 import { trackOrigin, type QueuedTrack } from './track.js';
 
@@ -143,6 +144,36 @@ export function requireActiveRoom(
     throw new ValidationError('Nothing is playing. Start something with `/play`.');
   }
   return { player, music: room.music };
+}
+
+/** The three fields every intent carries, from a context the command already has. */
+export function intentTarget(
+  context: VoiceContext,
+  issuedBy: string,
+): { readonly guildId: string; readonly voiceChannelId: string; readonly issuedBy: string } {
+  return { guildId: context.guildId, voiceChannelId: context.voiceChannelId, issuedBy };
+}
+
+/**
+ * Run an intent against the caller's room and turn a failure into a message.
+ *
+ * Commands care about two things: did it work, and what do I say. Where the
+ * room actually lives — this process or a sibling container — is the router's
+ * business, and an unreachable player reads as an ordinary refusal rather than
+ * as a crash.
+ *
+ * @returns the result, or null once the failure has been replied to.
+ */
+export async function runRoomIntent(
+  router: PlayerRouter,
+  interaction: ChatInputCommandInteraction,
+  intent: RoomIntent,
+): Promise<IntentResult | null> {
+  const result = await router.runIntent(intent);
+  if (result.kind !== 'error') return result;
+
+  await interaction.editReply({ content: result.message });
+  return null;
 }
 
 /**

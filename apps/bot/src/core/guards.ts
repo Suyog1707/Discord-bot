@@ -133,7 +133,26 @@ export async function checkDjAuthority(
   const guildId = interaction.guildId;
   if (guildId === null) return ALLOWED;
 
-  const settings = await client.services.guilds.getSettingsWithin(guildId, DJ_SETTINGS_BUDGET_MS);
+  const member = interaction.member as GuildMember | null;
+  const memberVoiceChannelId = member?.voice.channelId ?? null;
+
+  /**
+   * Both reads at once, not one after the other.
+   *
+   * The room's DJ state may now live in another container, so this is a
+   * network hop on the path of every gated command. Run in series with the
+   * settings read it would double the worst case; run together the guard costs
+   * whichever is slower, and both fail open.
+   */
+  const [settings, authority] = await Promise.all([
+    client.services.guilds.getSettingsWithin(guildId, DJ_SETTINGS_BUDGET_MS),
+    memberVoiceChannelId === null
+      ? Promise.resolve(undefined)
+      : client.router
+          ?.authorityFor(guildId, memberVoiceChannelId, interaction.user.id)
+          .catch(() => undefined),
+  ]);
+
   if (settings === null) {
     logger.warn(
       { guildId, budgetMs: DJ_SETTINGS_BUDGET_MS },
@@ -142,29 +161,29 @@ export async function checkDjAuthority(
     return ALLOWED;
   }
 
-  const member = interaction.member as GuildMember | null;
   if (member === null) return denied('Could not verify your permissions. Try again.');
 
   /**
-   * The room the member is standing in, not "the guild's player" — with
-   * several channels playing at once there is no such thing, and asking the
-   * primary would judge this member against a different room's host and DJs.
+   * Read against the room the member is standing in, not "the guild's player"
+   * — with several channels playing at once there is no such thing, and asking
+   * any other room would judge this member against a different host and a
+   * different set of DJs.
+   *
+   * An unanswered read looks exactly like an empty room, which
+   * `decideDjAuthority` already handles by falling back to the standing DJ
+   * configuration. Deliberately not the more permissive escape the settings
+   * timeout takes: a silent peer should not hand out control of a session it
+   * could not tell us anything about.
    */
-  const memberVoiceChannelId = member.voice.channelId;
-  const room =
-    memberVoiceChannelId === null
-      ? undefined
-      : client.router?.roomFor(guildId, memberVoiceChannelId);
-  const botVoiceChannelId = room?.player.voiceChannelId ?? null;
-  const registry = room?.music.sessionDj;
+  const botVoiceChannelId = authority?.botVoiceChannelId ?? null;
 
   const verdict = decideDjAuthority({
     memberId: member.id,
     memberVoiceChannelId,
     botVoiceChannelId,
     hasManageGuild: member.permissions.has(PermissionsBitField.Flags.ManageGuild),
-    hostId: registry?.host(guildId) ?? null,
-    sessionDjIds: registry?.djIds(guildId) ?? [],
+    hostId: authority?.hostId ?? null,
+    sessionDjIds: authority?.sessionDjIds ?? [],
     memberRoleIds: [...member.roles.cache.keys()],
     djRoleId: settings.djRoleId,
     djUserIds: settings.djUserIds,
@@ -175,7 +194,7 @@ export async function checkDjAuthority(
     return denied('Join the voice channel the bot is playing in to control playback.');
   }
 
-  const host = registry?.host(guildId) ?? null;
+  const host = authority?.hostId ?? null;
   if (host !== null) {
     return denied(
       `Only <@${host}> and the DJs they picked can do that. Ask them for DJ with \`/dj add\`, or queue a song with \`/play\`.`,

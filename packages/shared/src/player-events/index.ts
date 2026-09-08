@@ -144,6 +144,22 @@ export function playerStateKey(guildId: string, voiceChannelId: string): string 
  * scanning Redis for keys is not something to do on a page load. The bot adds
  * a room on connect and removes it on disconnect.
  */
+/**
+ * Redis key naming which bot serves one room, and how to reach it.
+ *
+ * The room snapshots say what is playing; this says *who* is playing it. Once
+ * each bot has its own container, a command about a room may arrive at a
+ * container that does not own it, and this is how it finds the one that does
+ * without asking every sibling in turn.
+ *
+ * Written by the owner when it takes a room and removed when it lets go, with
+ * the same TTL as the snapshot so a container that died without saying goodbye
+ * cannot be addressed forever.
+ */
+export function playerRoomOwnerKey(guildId: string, voiceChannelId: string): string {
+  return redisKey(REDIS_NAMESPACE.PLAYER, 'owner', guildId, voiceChannelId);
+}
+
 export function playerRoomIndexKey(guildId: string): string {
   return redisKey(REDIS_NAMESPACE.PLAYER, 'rooms', guildId);
 }

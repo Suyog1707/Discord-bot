@@ -17,17 +17,22 @@
  * (`playerCommandSchema`) and must not gain the ability to send internal
  * intents just because they happen to share a transport.
  */
-import { LIMITS, snowflakeSchema, z } from '@discord-music/shared';
+import { LIMITS, z } from '@discord-music/shared';
 import type { PlayerSnapshot } from '@discord-music/shared';
 
 import type { QueuedTrack } from './track.js';
 
-/** Every intent names the room it acts on, and who asked. */
-const target = {
-  guildId: snowflakeSchema,
-  voiceChannelId: snowflakeSchema,
-  issuedBy: snowflakeSchema,
-} as const;
+/**
+ * Every intent names the room it acts on, and who asked.
+ *
+ * Plain strings rather than the branded snowflake schema the dashboard uses.
+ * These ids come straight off Discord objects the caller already holds, so the
+ * regex would guard against nothing a missing room does not already catch —
+ * and branding an internal contract makes every call site fight the compiler
+ * over values it got from discord.js in the first place.
+ */
+const id = z.string().min(1).max(32);
+const target = { guildId: id, voiceChannelId: id, issuedBy: id } as const;
 
 const position = z.number().int().min(1).max(LIMITS.QUEUE_MAX_TRACKS);
 
@@ -60,11 +65,7 @@ export const roomIntentSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('clear'), ...target }),
 
   /* --------------------------------------------------------------- session */
-  z.object({
-    action: z.literal('set-listener'),
-    ...target,
-    listenerId: snowflakeSchema.nullable(),
-  }),
+  z.object({ action: z.literal('set-listener'), ...target, listenerId: id.nullable() }),
   z.object({ action: z.literal('stay-connected'), ...target, enabled: z.boolean() }),
   z.object({ action: z.literal('autoplay'), ...target, enabled: z.boolean() }),
 

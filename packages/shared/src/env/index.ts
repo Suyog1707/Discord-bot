@@ -220,6 +220,22 @@ export const botEnvSchema = requireInProduction(
        * use the same number — they are reached by service name, not by port.
        */
       BOT_INTERNAL_PORT: port.default(8080),
+      /**
+       * Hostname siblings should use to reach this container.
+       *
+       * Defaults to the container's own hostname, which Docker resolves on the
+       * compose network. Set it only when that is not the name others know it
+       * by.
+       */
+      BOT_PEER_HOST: optional(z.string().min(1)),
+      /**
+       * How long a sibling has to answer before the caller gives up on it.
+       *
+       * On the path of every command about a room another container owns, so
+       * it has to be short: a slow player should cost one reply, never the
+       * whole interaction.
+       */
+      BOT_PEER_TIMEOUT_MS: z.coerce.number().int().min(100).max(30_000).default(2_500),
       /** Lavalink — optional in development, required in production. */
       LAVALINK_HOST: optional(z.string().min(1)),
       LAVALINK_PORT: port.default(2333),

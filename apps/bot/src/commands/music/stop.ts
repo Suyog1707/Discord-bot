@@ -3,7 +3,8 @@
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import {
-  requireActivePlayer,
+  intentTarget,
+  runRoomIntent,
   requireRouter,
   requireVoiceContext,
 } from '../../music/voice-context.js';
@@ -20,11 +21,14 @@ export default defineCommand({
   async execute({ interaction }) {
     const client = interaction.client as BotClient;
     const router = requireRouter(client);
-    const player = requireActivePlayer(router, requireVoiceContext(interaction));
+    const context = requireVoiceContext(interaction);
 
-    await player.stop();
-    await interaction.editReply({
-      content: '⏹️ Stopped and cleared the queue.',
+    const result = await runRoomIntent(router, interaction, {
+      action: 'stop',
+      ...intentTarget(context, interaction.user.id),
     });
+    if (result === null) return;
+
+    await interaction.editReply({ content: '⏹️ Stopped and cleared the queue.' });
   },
 });
