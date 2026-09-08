@@ -17,6 +17,7 @@ import { BotClient } from './core/bot-client.js';
 import { PeerDirectory } from './music/peers.js';
 import { PlayerRouter, type RouterBot } from './music/player-router.js';
 import { createInternalServer } from './server/index.js';
+import { HEALTHY, observeHealth, type WatchdogState } from './server/watchdog.js';
 import { logger } from './lib/logger.js';
 
 // Validate configuration before anything else, so a missing variable is
@@ -24,25 +25,20 @@ import { logger } from './lib/logger.js';
 const env = getEnv();
 
 /**
- * The fleet: the primary, then one client per extra player.
+ * One container, one identity.
  *
  * Discord allows one voice connection per guild per token, so a server playing
- * in several channels at once needs one application per room. The primary is
- * the bot users talk to; the rest are headless players it can hand a channel
- * to. With `BOT_FLEET` unset this is a single client and the process behaves
- * exactly as it always has.
+ * in several channels at once needs one application per room — and each of
+ * those now runs in its own container, so a crash takes down one room rather
+ * than all of them. Which application this is comes entirely from env; nothing
+ * here knows or cares how many others exist.
  */
-const primary = new BotClient();
-const workers = env.BOT_FLEET.map(
-  (entry) =>
-    new BotClient({
-      token: entry.token,
-      clientId: entry.clientId,
-      label: entry.label,
-      role: 'worker',
-    }),
-);
-const fleet = [primary, ...workers];
+const client = new BotClient({
+  token: env.BOT_TOKEN,
+  clientId: env.BOT_CLIENT_ID,
+  label: env.BOT_LABEL,
+  role: env.BOT_ROLE,
+});
 
 /**
  * One router over every player, shared by all of them.
@@ -52,18 +48,23 @@ const fleet = [primary, ...workers];
  * worker is serving. Clients whose Lavalink is unconfigured have no manager
  * and simply do not appear as players.
  */
-const routerBots: readonly RouterBot[] = fleet.flatMap((client) => {
-  const music = client.music;
-  if (music === undefined) return [];
-  return [
-    {
-      botId: client.identity.label,
-      clientId: client.identity.clientId,
-      music,
-      isInGuild: (guildId: string) => client.guilds.cache.has(guildId),
-    },
-  ];
-});
+/**
+ * The router still exists, and still knows one bot — this one.
+ *
+ * Its remote arm is what reaches the others, so the shape it sees locally is
+ * the same whether a room is here or somewhere else.
+ */
+const routerBots: readonly RouterBot[] =
+  client.music === undefined
+    ? []
+    : [
+        {
+          botId: client.identity.label,
+          clientId: client.identity.clientId,
+          music: client.music,
+          isInGuild: (guildId: string) => client.guilds.cache.has(guildId),
+        },
+      ];
 /**
  * How this container finds and calls the others.
  *
@@ -73,28 +74,19 @@ const routerBots: readonly RouterBot[] = fleet.flatMap((client) => {
  */
 const peerHost = env.BOT_PEER_HOST ?? hostname();
 const peers = new PeerDirectory({
-  redis: primary.redis,
-  selfBotId: primary.identity.label,
+  redis: client.redis,
+  selfBotId: client.identity.label,
   timeoutMs: env.BOT_PEER_TIMEOUT_MS,
   ttlSeconds: PLAYER_STATE_TTL_SECONDS,
 });
 
 const router = new PlayerRouter(routerBots, peers);
-for (const client of fleet) {
-  client.router = router;
-  client.peers = peers;
-  client.peerBaseUrl = `http://${peerHost}:${String(env.BOT_INTERNAL_PORT)}`;
-}
+client.router = router;
+client.peers = peers;
+client.peerBaseUrl = `http://${peerHost}:${String(env.BOT_INTERNAL_PORT)}`;
 
-/**
- * One server per process, not per client.
- *
- * It answers for the container, and while several identities still share a
- * process only one of them can hold the port — so it is bound once, against
- * the primary. When each identity has a container of its own this is simply
- * the only client there is.
- */
-const internal = createInternalServer(primary, env.BOT_INTERNAL_PORT);
+/** Health for Docker, and the surface siblings call in on. */
+const internal = createInternalServer(client, env.BOT_INTERNAL_PORT);
 
 /** Signals that should trigger a graceful shutdown. */
 const SHUTDOWN_SIGNALS = ['SIGINT', 'SIGTERM'] as const;
@@ -116,7 +108,7 @@ async function shutdown(reason: string, exitCode: number): Promise<void> {
   // Stop answering before the bots go down, so nothing is told this
   // container is well while it is on its way out.
   await internal.stop().catch(() => undefined);
-  await Promise.allSettled(fleet.map((client) => client.shutdown(reason)));
+  await client.shutdown(reason);
   await getPrismaClient({ databaseUrl: env.DATABASE_URL })
     .$disconnect()
     .catch((error: unknown) => {
@@ -184,30 +176,44 @@ process.on('uncaughtException', (error) => {
 });
 
 try {
-  // Sequentially, so a bad token names itself instead of arriving in a pile of
-  // concurrent failures — and so the primary is up before any player is.
-  for (const client of fleet) {
-    await client.start();
-  }
+  await client.start();
   /**
    * Started after the gateway, so a healthcheck never sees a bot that is
    * listening but not yet connected. Not fatal yet — nothing depends on it
    * until siblings start calling each other, and refusing to run a working
    * bot over a port clash would be the worse trade today.
    */
+  /**
+   * Quit if the gateway stays gone.
+   *
+   * Docker restarts a crash, not a stall — without this a wedged container
+   * sits there looking healthy and silently plays nothing. `unref` so the
+   * timer never keeps a shutting-down process alive.
+   */
+  let watchdog: WatchdogState = HEALTHY;
+  setInterval(() => {
+    const verdict = observeHealth(watchdog, {
+      gatewayUp: client.isReady(),
+      now: Date.now(),
+      exitAfterMs: env.BOT_UNHEALTHY_EXIT_AFTER_MS,
+    });
+    if (verdict.kind === 'ok') {
+      watchdog = verdict.next;
+      return;
+    }
+    logger.fatal(
+      { downForMs: verdict.downForMs, player: env.BOT_LABEL },
+      'Gateway has been down too long; exiting so the container is restarted',
+    );
+    void shutdown('gateway-lost', 1);
+  }, env.BOT_HEALTH_CHECK_MS).unref();
+
   await internal.start().catch((error: unknown) => {
     logger.error(
       { err: error, port: env.BOT_INTERNAL_PORT },
       'Internal server could not bind; health checks and peer calls are unavailable',
     );
   });
-
-  if (workers.length > 0) {
-    logger.info(
-      { players: workers.length + 1, labels: fleet.map((client) => client.identity.label) },
-      'Fleet ready',
-    );
-  }
 } catch (error) {
   // Configuration errors are the operator's problem, not a crash — print the
   // actionable message without a stack trace.

@@ -23,36 +23,6 @@ const logLevelSchema = z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal
 
 const snowflake = z.string().regex(SNOWFLAKE_PATTERN, 'Must be a valid Discord ID.');
 
-/** One extra player bot: a Discord application this process also logs in as. */
-const botFleetEntrySchema = z.object({
-  token: z.string().min(1, 'Each BOT_FLEET entry needs a token.'),
-  clientId: snowflake,
-  /** Short name for logs and the dashboard, e.g. "player-2". */
-  label: z.string().min(1).max(32),
-});
-
-export type BotFleetEntry = z.infer<typeof botFleetEntrySchema>;
-
-/**
- * Parse `BOT_FLEET` from JSON.
- *
- * A misconfigured fleet is an operator problem that must be caught at boot, so
- * malformed JSON fails loudly with a usable message rather than silently
- * degrading to one bot — the symptom of which would be "the second channel
- * just doesn't work" with nothing in the logs to explain it.
- */
-const botFleetSchema = z.preprocess((value) => {
-  if (value === undefined || (typeof value === 'string' && value.trim() === '')) return [];
-  if (typeof value !== 'string') return value;
-  try {
-    // `unknown`, not `any`: the array schema below is what decides the shape.
-    return JSON.parse(value) as unknown;
-  } catch {
-    // Surfaced by the array schema below as a type error on the whole field.
-    return value;
-  }
-}, z.array(botFleetEntrySchema).max(16, 'At most 16 extra player bots.').default([]));
-
 /** Accepts `true/false`, `1/0`, `yes/no`; tolerates surrounding whitespace. */
 const booleanish = z
   .string()
@@ -201,17 +171,20 @@ export const botEnvSchema = requireInProduction(
       /** Register slash commands to one guild for instant iteration during development. */
       BOT_DEV_GUILD_ID: optional(snowflake),
       /**
-       * Extra player bots, as a JSON array of `{ token, clientId, label }`.
+       * Which application this container is, and what it does.
        *
-       * Discord allows one voice connection per guild per *token*, so playing
-       * in several channels of one server at once needs one Discord
-       * application per simultaneous room. `BOT_TOKEN` above is the primary —
-       * the only bot with slash commands — and every entry here is a headless
-       * player it can hand a channel to.
+       * `primary` owns the slash commands, the guards and the dashboard
+       * command bus — and plays as well, so a server that only ever needs one
+       * room still invites one bot. A `player` is headless: it holds a voice
+       * channel and answers intents, nothing else.
        *
-       * Empty or unset means single-room behaviour, exactly as before.
+       * There is deliberately no fleet count anywhere. Each container
+       * registers itself in `player_bots` on startup, so the system learns its
+       * roster rather than being told a number.
        */
-      BOT_FLEET: botFleetSchema,
+      BOT_ROLE: z.enum(['primary', 'player']).default('primary'),
+      /** Short name for logs, the roster and the invite prompt, e.g. "player-2". */
+      BOT_LABEL: z.string().min(1).max(32).default('main'),
       /**
        * Port for the container's private HTTP surface (health, and later the
        * calls siblings make to each other).
@@ -236,6 +209,19 @@ export const botEnvSchema = requireInProduction(
        * whole interaction.
        */
       BOT_PEER_TIMEOUT_MS: z.coerce.number().int().min(100).max(30_000).default(2_500),
+      /**
+       * How long a container may sit disconnected before it quits.
+       *
+       * Docker restarts containers that crash, not ones that are alive and
+       * wedged — so a bot whose gateway has gone and not come back ends itself
+       * and lets the restart policy give it a fresh connection. Generous on
+       * purpose: discord.js reconnects on its own, and a threshold shorter
+       * than its backoff would restart a bot that was about to recover. Zero
+       * disables it.
+       */
+      BOT_UNHEALTHY_EXIT_AFTER_MS: z.coerce.number().int().min(0).max(3_600_000).default(120_000),
+      /** How often that check runs. */
+      BOT_HEALTH_CHECK_MS: z.coerce.number().int().min(1_000).max(600_000).default(15_000),
       /** Lavalink — optional in development, required in production. */
       LAVALINK_HOST: optional(z.string().min(1)),
       LAVALINK_PORT: port.default(2333),

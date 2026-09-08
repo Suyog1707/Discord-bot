@@ -16,10 +16,15 @@
 # published ports, which are already held by the first. Export DOCKER_CONTEXT
 # yourself to override the pin.
 #
-# The bot also runs here, in production mode, built from apps/bot/Dockerfile.
-# For fast hot-reload development, stop the bot container (`docker stop
-# dmp-bot`) and run `pnpm dev` on the host instead — both talk to the same
-# Lavalink. The web app runs on the host / Vercel per docs/DEPLOYMENT.md.
+# The bots also run here, in production mode, built from apps/bot/Dockerfile —
+# one container per Discord application, because Discord allows a single voice
+# connection per guild per token and each simultaneous room needs its own.
+#
+# For fast hot-reload development, stop them (`docker compose stop bot-main
+# bot-player-2 ...`, or just `bot-main`) and run `pnpm dev` on the host instead:
+# that runs one identity in-process, which is the whole bot minus the extra
+# rooms, and talks to this same Lavalink. The web app runs on the host / Vercel
+# per docs/DEPLOYMENT.md.
 
 name: discord-music
 
@@ -120,18 +125,51 @@ services:
 
   # The bot, in production mode. Built from the repo root so the workspace
   # lockfile is in the build context (see apps/bot/Dockerfile).
-  bot:
+  # ---------------------------------------------------------------- the bots
+  #
+  # One container per Discord application. Discord allows one voice connection
+  # per guild per token, so a server playing in several channels at once needs
+  # one application per room — and a container each, so a crash takes down one
+  # room rather than all of them.
+  #
+  # They are written out rather than generated: seven near-identical blocks is
+  # repetitive, but you can read this file and see exactly what runs, and change
+  # one player without touching the others.
+  #
+  # `bot-main` is the primary: it owns the slash commands, the guards and the
+  # dashboard command bus, and plays as well — so a server that only ever needs
+  # one room still invites one bot. The rest are headless players.
+  #
+  # Adding an eighth is a copy of a player block plus its two tokens in .env.
+  # Nothing in the code knows how many there are; each registers itself on
+  # startup.
+  #
+  # HOW MANY ACTUALLY RUN is decided in .env, not here. Each player sits behind
+  # a compose profile, so `bot-main` alone starts by default — the single-room
+  # setup that has always worked — and players are switched on with
+  # COMPOSE_PROFILES:
+  #
+  #   COMPOSE_PROFILES=players            # every player below
+  #   COMPOSE_PROFILES=player-2,player-3  # just those two
+  #
+  # A player with no profile active is never started, so an identity you have
+  # not created yet cannot sit in a restart loop complaining about a missing
+  # token.
+
+  bot-main:
     build:
       context: ..
       dockerfile: apps/bot/Dockerfile
-    container_name: dmp-bot
-    restart: unless-stopped
+    container_name: dmp-bot-main
+    # `always`, not `unless-stopped`: the pool is meant to be up, including
+    # after the host reboots.
+    restart: always
     depends_on:
       lavalink:
         condition: service_healthy
-    # Real configuration (BOT_TOKEN, DATABASE_URL, REDIS_URL, …) comes from the
-    # repo-root .env; the entries below override it where the container's view
-    # of the world differs from the host's.
+    # Real configuration (DATABASE_URL, REDIS_URL, …) comes from the repo-root
+    # .env; the entries below override it where the container's view of the
+    # world differs from the host's, and give this container its identity.
     env_file:
       - ../.env
     environment:
@@ -144,12 +182,19 @@ services:
       LAVALINK_SECURE: 'false'
       LAVALINK_PASSWORD: ${LAVALINK_PASSWORD:-youshallnotpass}
       BOT_INTERNAL_PORT: ${BOT_INTERNAL_PORT:-8080}
+      # Siblings reach this container by service name, so that is the address
+      # it advertises — the container's own hostname is an opaque id.
+      BOT_PEER_HOST: bot-main
+      BOT_ROLE: primary
+      BOT_LABEL: main
+      BOT_TOKEN: ${BOT_TOKEN}
+      BOT_CLIENT_ID: ${BOT_CLIENT_ID}
     # Probed with node rather than curl: the image is node:22-alpine, which
     # ships neither curl nor a wget with predictable flags, and node is
     # guaranteed present because it is what runs the bot. Unhealthy means the
     # gateway is gone — see `resolveBotHealth` for why that is the only thing
     # reported as unhealthy.
-    healthcheck:
+    healthcheck: &bot-healthcheck
       test:
         [
           'CMD',
@@ -161,6 +206,162 @@ services:
       timeout: 5s
       retries: 3
       start_period: 40s
+
+  bot-player-2:
+    profiles: ['players', 'player-2']
+    build:
+      context: ..
+      dockerfile: apps/bot/Dockerfile
+    container_name: dmp-bot-player-2
+    restart: always
+    depends_on:
+      lavalink:
+        condition: service_healthy
+    env_file:
+      - ../.env
+    environment:
+      NODE_ENV: production
+      LAVALINK_HOST: lavalink
+      LAVALINK_PORT: 2333
+      LAVALINK_SECURE: 'false'
+      LAVALINK_PASSWORD: ${LAVALINK_PASSWORD:-youshallnotpass}
+      BOT_INTERNAL_PORT: ${BOT_INTERNAL_PORT:-8080}
+      BOT_PEER_HOST: bot-player-2
+      BOT_ROLE: player
+      BOT_LABEL: player-2
+      BOT_TOKEN: ${BOT_PLAYER_2_TOKEN:-}
+      BOT_CLIENT_ID: ${BOT_PLAYER_2_CLIENT_ID:-}
+    healthcheck: *bot-healthcheck
+
+  bot-player-3:
+    profiles: ['players', 'player-3']
+    build:
+      context: ..
+      dockerfile: apps/bot/Dockerfile
+    container_name: dmp-bot-player-3
+    restart: always
+    depends_on:
+      lavalink:
+        condition: service_healthy
+    env_file:
+      - ../.env
+    environment:
+      NODE_ENV: production
+      LAVALINK_HOST: lavalink
+      LAVALINK_PORT: 2333
+      LAVALINK_SECURE: 'false'
+      LAVALINK_PASSWORD: ${LAVALINK_PASSWORD:-youshallnotpass}
+      BOT_INTERNAL_PORT: ${BOT_INTERNAL_PORT:-8080}
+      BOT_PEER_HOST: bot-player-3
+      BOT_ROLE: player
+      BOT_LABEL: player-3
+      BOT_TOKEN: ${BOT_PLAYER_3_TOKEN:-}
+      BOT_CLIENT_ID: ${BOT_PLAYER_3_CLIENT_ID:-}
+    healthcheck: *bot-healthcheck
+
+  bot-player-4:
+    profiles: ['players', 'player-4']
+    build:
+      context: ..
+      dockerfile: apps/bot/Dockerfile
+    container_name: dmp-bot-player-4
+    restart: always
+    depends_on:
+      lavalink:
+        condition: service_healthy
+    env_file:
+      - ../.env
+    environment:
+      NODE_ENV: production
+      LAVALINK_HOST: lavalink
+      LAVALINK_PORT: 2333
+      LAVALINK_SECURE: 'false'
+      LAVALINK_PASSWORD: ${LAVALINK_PASSWORD:-youshallnotpass}
+      BOT_INTERNAL_PORT: ${BOT_INTERNAL_PORT:-8080}
+      BOT_PEER_HOST: bot-player-4
+      BOT_ROLE: player
+      BOT_LABEL: player-4
+      BOT_TOKEN: ${BOT_PLAYER_4_TOKEN:-}
+      BOT_CLIENT_ID: ${BOT_PLAYER_4_CLIENT_ID:-}
+    healthcheck: *bot-healthcheck
+
+  bot-player-5:
+    profiles: ['players', 'player-5']
+    build:
+      context: ..
+      dockerfile: apps/bot/Dockerfile
+    container_name: dmp-bot-player-5
+    restart: always
+    depends_on:
+      lavalink:
+        condition: service_healthy
+    env_file:
+      - ../.env
+    environment:
+      NODE_ENV: production
+      LAVALINK_HOST: lavalink
+      LAVALINK_PORT: 2333
+      LAVALINK_SECURE: 'false'
+      LAVALINK_PASSWORD: ${LAVALINK_PASSWORD:-youshallnotpass}
+      BOT_INTERNAL_PORT: ${BOT_INTERNAL_PORT:-8080}
+      BOT_PEER_HOST: bot-player-5
+      BOT_ROLE: player
+      BOT_LABEL: player-5
+      BOT_TOKEN: ${BOT_PLAYER_5_TOKEN:-}
+      BOT_CLIENT_ID: ${BOT_PLAYER_5_CLIENT_ID:-}
+    healthcheck: *bot-healthcheck
+
+  bot-player-6:
+    profiles: ['players', 'player-6']
+    build:
+      context: ..
+      dockerfile: apps/bot/Dockerfile
+    container_name: dmp-bot-player-6
+    restart: always
+    depends_on:
+      lavalink:
+        condition: service_healthy
+    env_file:
+      - ../.env
+    environment:
+      NODE_ENV: production
+      LAVALINK_HOST: lavalink
+      LAVALINK_PORT: 2333
+      LAVALINK_SECURE: 'false'
+      LAVALINK_PASSWORD: ${LAVALINK_PASSWORD:-youshallnotpass}
+      BOT_INTERNAL_PORT: ${BOT_INTERNAL_PORT:-8080}
+      BOT_PEER_HOST: bot-player-6
+      BOT_ROLE: player
+      BOT_LABEL: player-6
+      BOT_TOKEN: ${BOT_PLAYER_6_TOKEN:-}
+      BOT_CLIENT_ID: ${BOT_PLAYER_6_CLIENT_ID:-}
+    healthcheck: *bot-healthcheck
+
+  bot-player-7:
+    profiles: ['players', 'player-7']
+    build:
+      context: ..
+      dockerfile: apps/bot/Dockerfile
+    container_name: dmp-bot-player-7
+    restart: always
+    depends_on:
+      lavalink:
+        condition: service_healthy
+    env_file:
+      - ../.env
+    environment:
+      NODE_ENV: production
+      LAVALINK_HOST: lavalink
+      LAVALINK_PORT: 2333
+      LAVALINK_SECURE: 'false'
+      LAVALINK_PASSWORD: ${LAVALINK_PASSWORD:-youshallnotpass}
+      BOT_INTERNAL_PORT: ${BOT_INTERNAL_PORT:-8080}
+      BOT_PEER_HOST: bot-player-7
+      BOT_ROLE: player
+      BOT_LABEL: player-7
+      BOT_TOKEN: ${BOT_PLAYER_7_TOKEN:-}
+      BOT_CLIENT_ID: ${BOT_PLAYER_7_CLIENT_ID:-}
+    healthcheck: *bot-healthcheck
 
 volumes:
   lavalink-plugins:

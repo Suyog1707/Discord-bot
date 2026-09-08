@@ -68,10 +68,10 @@ const INTENTS = [
 ] as const;
 
 /**
- * A worker announces nothing and reads no messages — it exists to hold a voice
+ * A player announces nothing and reads no messages — it exists to hold a voice
  * connection — so it asks for the minimum Discord will let it have.
  */
-const WORKER_INTENTS = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] as const;
+const PLAYER_INTENTS = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] as const;
 
 /**
  * Which Discord application this client logs in as.
@@ -88,7 +88,7 @@ export interface BotIdentity {
   readonly clientId: string;
   /** Short name for logs, e.g. "main" or "player-2". */
   readonly label: string;
-  readonly role: 'primary' | 'worker';
+  readonly role: 'primary' | 'player';
 }
 
 export class BotClient extends Client {
@@ -176,7 +176,7 @@ export class BotClient extends Client {
     };
 
     super({
-      intents: resolved.role === 'worker' ? [...WORKER_INTENTS] : [...INTENTS],
+      intents: resolved.role === 'player' ? [...PLAYER_INTENTS] : [...INTENTS],
       partials: [Partials.Channel, Partials.GuildMember],
       // Cache only what the bot reads. Message/reaction caches would grow unbounded.
       makeCache: Options.cacheWithLimits({

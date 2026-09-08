@@ -4,11 +4,11 @@
  *
  *   pnpm run check:env
  *
- * Reports problems for the web app and the bot in a single pass, so a fresh
- * clone gets one complete list of what to fill in rather than discovering
- * missing variables one crash at a time.
+ * Reports problems for the web app and for every bot identity in a single
+ * pass, so a fresh clone gets one complete list of what to fill in rather than
+ * discovering missing variables one crash at a time.
  *
- * Exits 0 when both runtimes validate, 1 otherwise.
+ * Exits 0 when every runtime validates, 1 otherwise.
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -87,10 +87,92 @@ try {
 
 const { botEnvSchema, parseEnv, webEnvSchema } = schemas;
 
-const runtimes = [
-  { label: 'apps/web', schema: webEnvSchema },
-  { label: 'apps/bot', schema: botEnvSchema },
-];
+/**
+ * Every bot identity configured here, primary first.
+ *
+ * Each container runs exactly ONE identity, so each is validated on its own
+ * against the same schema — with its token and client id substituted in — and
+ * a broken player is reported as a broken player rather than as a vague
+ * complaint about the bot.
+ *
+ * Players are discovered from the variable names rather than counted, because
+ * nothing else in this system knows how many bots there are either. Adding an
+ * eighth means adding BOT_PLAYER_8_TOKEN and its client id; this script picks
+ * it up with no change.
+ */
+function botIdentities(source) {
+  const numbers = Object.keys(source)
+    .map((key) => /^BOT_PLAYER_(\d+)_(?:TOKEN|CLIENT_ID)$/u.exec(key)?.[1])
+    .filter((n) => n !== undefined)
+    .map(Number)
+    .filter(
+      (n) =>
+        (source[`BOT_PLAYER_${n}_TOKEN`] ?? '') !== '' ||
+        (source[`BOT_PLAYER_${n}_CLIENT_ID`] ?? '') !== '',
+    );
+
+  const players = [...new Set(numbers)]
+    .sort((a, b) => a - b)
+    .map((n) => ({
+      label: `apps/bot (player-${n})`,
+      schema: botEnvSchema,
+      source: {
+        ...source,
+        BOT_ROLE: 'player',
+        BOT_LABEL: `player-${n}`,
+        BOT_TOKEN: source[`BOT_PLAYER_${n}_TOKEN`] ?? '',
+        BOT_CLIENT_ID: source[`BOT_PLAYER_${n}_CLIENT_ID`] ?? '',
+      },
+    }));
+
+  return [
+    { label: 'apps/web', schema: webEnvSchema, source },
+    { label: 'apps/bot (main)', schema: botEnvSchema, source: { ...source, BOT_ROLE: 'primary' } },
+    ...players,
+  ];
+}
+
+/**
+ * A player switched on in COMPOSE_PROFILES but never given an identity.
+ *
+ * Docker would start that container and `restart: always` would keep starting
+ * it, each time failing on a blank token. Catching it here turns a silent
+ * restart loop into one line of output before anything is launched.
+ */
+function unconfiguredProfiles(source) {
+  const active = (source.COMPOSE_PROFILES ?? '')
+    .split(',')
+    .map((name) => name.trim())
+    .filter((name) => name !== '');
+
+  return active
+    .map((name) => /^player-(\d+)$/u.exec(name)?.[1])
+    .filter((n) => n !== undefined)
+    .filter((n) => (source[`BOT_PLAYER_${n}_TOKEN`] ?? '') === '')
+    .map((n) => `COMPOSE_PROFILES starts player-${n}, but BOT_PLAYER_${n}_TOKEN is not set`);
+}
+
+/**
+ * Two containers sharing a token is the one misconfiguration this whole design
+ * exists to prevent: Discord allows a single voice connection per guild per
+ * token, so the second bot would silently steal the first one's channel.
+ */
+function duplicateIdentities(runtimes) {
+  const seen = new Map();
+  const clashes = [];
+
+  for (const runtime of runtimes) {
+    if (!runtime.label.startsWith('apps/bot')) continue;
+    const token = runtime.source.BOT_TOKEN ?? '';
+    if (token === '') continue;
+
+    const first = seen.get(token);
+    if (first === undefined) seen.set(token, runtime.label);
+    else clashes.push(`${first} and ${runtime.label} share the same BOT_TOKEN`);
+  }
+
+  return clashes;
+}
 
 /**
  * `--production` validates against production rules regardless of the NODE_ENV
@@ -107,9 +189,23 @@ if (asProduction) {
 
 let failed = false;
 
-for (const { label, schema } of runtimes) {
+const runtimes = botIdentities(source);
+
+for (const clash of duplicateIdentities(runtimes)) {
+  failed = true;
+  console.error(`${RED}\u2717${RESET} ${clash}.`);
+  console.error(`  ${DIM}Each bot needs its own Discord application.${RESET}\n`);
+}
+
+for (const problem of unconfiguredProfiles(source)) {
+  failed = true;
+  console.error(`${RED}\u2717${RESET} ${problem}.`);
+  console.error(`  ${DIM}Create the application, or drop it from COMPOSE_PROFILES.${RESET}\n`);
+}
+
+for (const { label, schema, source: identity } of runtimes) {
   try {
-    parseEnv(schema, source, label);
+    parseEnv(schema, identity, label);
     console.log(`${GREEN}✓${RESET} ${label} configuration is valid`);
   } catch (error) {
     failed = true;

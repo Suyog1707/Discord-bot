@@ -65,56 +65,31 @@ describe('botEnvSchema', () => {
     expect(env.BOT_DEV_GUILD_ID).toBe('987654321098765432');
   });
 
-  describe('BOT_FLEET', () => {
-    const entry = { token: 'tok-2', clientId: '987654321098765432', label: 'player-2' };
+  describe('identity', () => {
+    /** The default is the single-container deployment every setup starts as. */
+    it('defaults to the primary, labelled main', () => {
+      const env = parseEnv(botEnvSchema, validBotEnv, 'apps/bot');
 
-    /** Unset is the single-bot deployment every server runs today. */
-    it('defaults to no extra players', () => {
-      expect(parseEnv(botEnvSchema, validBotEnv, 'apps/bot').BOT_FLEET).toEqual([]);
+      expect(env.BOT_ROLE).toBe('primary');
+      expect(env.BOT_LABEL).toBe('main');
     });
 
-    it('treats a blank value as no extra players', () => {
-      const env = parseEnv(botEnvSchema, { ...validBotEnv, BOT_FLEET: '   ' }, 'apps/bot');
-      expect(env.BOT_FLEET).toEqual([]);
-    });
-
-    it('parses a JSON array of players', () => {
+    it('accepts a headless player identity', () => {
       const env = parseEnv(
         botEnvSchema,
-        { ...validBotEnv, BOT_FLEET: JSON.stringify([entry]) },
+        { ...validBotEnv, BOT_ROLE: 'player', BOT_LABEL: 'player-2' },
         'apps/bot',
       );
-      expect(env.BOT_FLEET).toEqual([entry]);
+
+      expect(env.BOT_ROLE).toBe('player');
+      expect(env.BOT_LABEL).toBe('player-2');
     });
 
-    /**
-     * A fleet that silently parses to nothing would present as "the second
-     * channel just doesn't work", with nothing in the logs to explain it.
-     */
-    it('rejects malformed JSON rather than falling back to one bot', () => {
+    /** A typo here would silently produce a container that does nothing useful. */
+    it('rejects an unknown role', () => {
       expect(() =>
-        parseEnv(botEnvSchema, { ...validBotEnv, BOT_FLEET: '[{oops' }, 'apps/bot'),
+        parseEnv(botEnvSchema, { ...validBotEnv, BOT_ROLE: 'worker' }, 'apps/bot'),
       ).toThrow(ConfigurationError);
-    });
-
-    it('rejects an entry with a bad client id', () => {
-      expect(() =>
-        parseEnv(
-          botEnvSchema,
-          { ...validBotEnv, BOT_FLEET: JSON.stringify([{ ...entry, clientId: 'nope' }]) },
-          'apps/bot',
-        ),
-      ).toThrow(/Must be a valid Discord ID/u);
-    });
-
-    it('rejects an entry with no token', () => {
-      expect(() =>
-        parseEnv(
-          botEnvSchema,
-          { ...validBotEnv, BOT_FLEET: JSON.stringify([{ ...entry, token: '' }]) },
-          'apps/bot',
-        ),
-      ).toThrow(/needs a token/u);
     });
   });
 
