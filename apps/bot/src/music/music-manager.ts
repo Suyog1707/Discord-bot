@@ -255,6 +255,17 @@ function canonicalFromSpotify(meta: SpotifyTrackMeta): CanonicalTrack {
   });
 }
 
+/** One room a bot is serving, in a shape that can cross a process boundary. */
+export interface RoomState {
+  readonly guildId: string;
+  readonly voiceChannelId: string;
+  readonly isPlaying: boolean;
+  readonly hasListeners: boolean;
+  readonly stayConnected: boolean;
+  /** Epoch ms since the room emptied, or null while it has listeners. */
+  readonly emptySince: number | null;
+}
+
 export interface JoinOptions {
   readonly guildId: string;
   readonly voiceChannelId: string;
@@ -608,6 +619,24 @@ export class MusicManager {
 
   get activePlayerCount(): number {
     return this.#players.size;
+  }
+
+  /**
+   * Every room this bot is serving, as plain data.
+   *
+   * The same facts allocation needs about a player, in a shape that survives a
+   * network hop — so one container can answer "what are you doing?" without
+   * handing out a live player it cannot serialise.
+   */
+  get rooms(): readonly RoomState[] {
+    return [...this.#players.entries()].map(([guildId, player]) => ({
+      guildId,
+      voiceChannelId: player.voiceChannelId,
+      isPlaying: player.isPlaying,
+      hasListeners: player.hasListeners,
+      stayConnected: player.stayConnected,
+      emptySince: player.emptySince,
+    }));
   }
 
   /**

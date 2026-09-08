@@ -212,6 +212,14 @@ export const botEnvSchema = requireInProduction(
        * Empty or unset means single-room behaviour, exactly as before.
        */
       BOT_FLEET: botFleetSchema,
+      /**
+       * Port for the container's private HTTP surface (health, and later the
+       * calls siblings make to each other).
+       *
+       * Bound inside the container and never published, so every player can
+       * use the same number — they are reached by service name, not by port.
+       */
+      BOT_INTERNAL_PORT: port.default(8080),
       /** Lavalink — optional in development, required in production. */
       LAVALINK_HOST: optional(z.string().min(1)),
       LAVALINK_PORT: port.default(2333),

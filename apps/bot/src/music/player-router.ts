@@ -16,7 +16,7 @@ import { getLogger } from '../lib/logger.js';
 
 import { allocateBot, type FleetMember } from './bot-allocation.js';
 import type { GuildPlayer } from './guild-player.js';
-import type { JoinOptions, MusicManager } from './music-manager.js';
+import type { JoinOptions, MusicManager, RoomState } from './music-manager.js';
 
 const logger = getLogger('player-router');
 
@@ -118,6 +118,18 @@ export class PlayerRouter {
       }
     }
     return undefined;
+  }
+
+  /**
+   * Every room this process is serving, across all its bots, as plain data.
+   *
+   * What a sibling container gets when it asks "what are you doing?" — and the
+   * direct answer when the shared room index in Redis is cold.
+   */
+  ownRooms(): readonly (RoomState & { readonly botId: string })[] {
+    return this.#bots.flatMap((bot) =>
+      bot.music.rooms.map((room) => ({ ...room, botId: bot.botId })),
+    );
   }
 
   /** Every room currently playing in a guild. */

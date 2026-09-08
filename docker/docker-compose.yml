@@ -143,6 +143,24 @@ services:
       LAVALINK_PORT: 2333
       LAVALINK_SECURE: 'false'
       LAVALINK_PASSWORD: ${LAVALINK_PASSWORD:-youshallnotpass}
+      BOT_INTERNAL_PORT: ${BOT_INTERNAL_PORT:-8080}
+    # Probed with node rather than curl: the image is node:22-alpine, which
+    # ships neither curl nor a wget with predictable flags, and node is
+    # guaranteed present because it is what runs the bot. Unhealthy means the
+    # gateway is gone — see `resolveBotHealth` for why that is the only thing
+    # reported as unhealthy.
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:'+(process.env.BOT_INTERNAL_PORT||8080)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
 
 volumes:
   lavalink-plugins:

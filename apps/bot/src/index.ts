@@ -13,6 +13,7 @@ import { RestError } from 'shoukaku';
 import { getEnv } from './config/env.js';
 import { BotClient } from './core/bot-client.js';
 import { PlayerRouter, type RouterBot } from './music/player-router.js';
+import { createInternalServer } from './server/index.js';
 import { logger } from './lib/logger.js';
 
 // Validate configuration before anything else, so a missing variable is
@@ -63,6 +64,16 @@ const routerBots: readonly RouterBot[] = fleet.flatMap((client) => {
 const router = new PlayerRouter(routerBots);
 for (const client of fleet) client.router = router;
 
+/**
+ * One server per process, not per client.
+ *
+ * It answers for the container, and while several identities still share a
+ * process only one of them can hold the port — so it is bound once, against
+ * the primary. When each identity has a container of its own this is simply
+ * the only client there is.
+ */
+const internal = createInternalServer(primary, env.BOT_INTERNAL_PORT);
+
 /** Signals that should trigger a graceful shutdown. */
 const SHUTDOWN_SIGNALS = ['SIGINT', 'SIGTERM'] as const;
 
@@ -80,6 +91,9 @@ async function shutdown(reason: string, exitCode: number): Promise<void> {
   // Every client stops before the database does. Prisma is a process-wide
   // singleton, so a client disconnecting it on its own way out would pull the
   // pool from under the players still shutting down.
+  // Stop answering before the bots go down, so nothing is told this
+  // container is well while it is on its way out.
+  await internal.stop().catch(() => undefined);
   await Promise.allSettled(fleet.map((client) => client.shutdown(reason)));
   await getPrismaClient({ databaseUrl: env.DATABASE_URL })
     .$disconnect()
@@ -153,6 +167,19 @@ try {
   for (const client of fleet) {
     await client.start();
   }
+  /**
+   * Started after the gateway, so a healthcheck never sees a bot that is
+   * listening but not yet connected. Not fatal yet — nothing depends on it
+   * until siblings start calling each other, and refusing to run a working
+   * bot over a port clash would be the worse trade today.
+   */
+  await internal.start().catch((error: unknown) => {
+    logger.error(
+      { err: error, port: env.BOT_INTERNAL_PORT },
+      'Internal server could not bind; health checks and peer calls are unavailable',
+    );
+  });
+
   if (workers.length > 0) {
     logger.info(
       { players: workers.length + 1, labels: fleet.map((client) => client.identity.label) },
