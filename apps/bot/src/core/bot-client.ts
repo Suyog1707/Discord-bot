@@ -11,6 +11,8 @@ import { fileURLToPath } from 'node:url';
 import { getPrismaClient, pingDatabase, type PrismaClient } from '@discord-music/database';
 import {
   ConfigurationError,
+  DEFERRAL_MANIFEST_KEY,
+  DEFERRAL_MANIFEST_TTL_SECONDS,
   PLAYER_EVENT_CHANNEL,
   PLAYER_STATE_TTL_SECONDS,
   playerRoomIndexKey,
@@ -29,6 +31,7 @@ import { Client, GatewayIntentBits, Options, Partials } from 'discord.js';
 import { getEnv, getLavalinkNode, isDevelopment, isProduction } from '../config/env.js';
 import { getLogger, logger, type Logger } from '../lib/logger.js';
 import { PlayerCommandSubscriber } from '../music/command-subscriber.js';
+import { InteractionSubscriber } from './interaction-subscriber.js';
 import { MusicManager } from '../music/music-manager.js';
 import type { PlayerRouter } from '../music/player-router.js';
 import type { PeerDirectory } from '../music/peers.js';
@@ -165,6 +168,7 @@ export class BotClient extends Client {
 
   #redis: Redis | undefined;
   #commandSubscriber: PlayerCommandSubscriber | undefined;
+  #interactionSubscriber: InteractionSubscriber | undefined;
   /** Keeps this container's presence entry from expiring. */
   #heartbeat: NodeJS.Timeout | undefined;
   #shuttingDown = false;
@@ -312,13 +316,21 @@ export class BotClient extends Client {
       ? join(moduleDirectory, '..', 'events')
       : join(moduleDirectory, 'events');
 
-    // A player registers no slash commands with Discord, so loading them would
-    // only build a registry nothing can ever reach. It still needs the event
-    // handlers — voice state changes are how its own player learns the room
-    // emptied.
-    if (this.identity.role === 'primary') {
-      await this.commands.loadFrom(commandsDirectory);
-    }
+    /**
+     * Every role loads the commands. Only one *registers* them.
+     *
+     * These used to be the same decision, and it was right while a player
+     * could never be handed a command: Discord delivers an interaction to the
+     * application that registered it, so a player's registry was unreachable.
+     * The router changed that. A command now arrives on a player's queue
+     * because the router decided that player owns the caller's channel, and
+     * the player has to be able to find and run it.
+     *
+     * Registration stays the primary's alone — that is `commands:deploy`,
+     * which refuses to run as a player, and it is what keeps one `/play` in
+     * the picker rather than seven.
+     */
+    await this.commands.loadFrom(commandsDirectory);
     await this.events.loadFrom(eventsDirectory);
     this.events.attach(this);
 
@@ -337,7 +349,15 @@ export class BotClient extends Client {
      * them acts.
      */
     await this.#startCommandSubscriber();
+    /**
+     * Commands that arrive over Redis rather than the gateway.
+     *
+     * Every bot listens on its own queue — the router has already decided this
+     * one owns the caller's channel, so there is nothing here to filter.
+     */
+    await this.#startInteractionSubscriber();
     this.#startPresenceHeartbeat();
+    if (this.identity.role === 'primary') void this.#publishDeferralManifest();
 
     this.logger.info(
       { durationMs: Date.now() - startedAt, player: this.identity.label },
@@ -441,6 +461,51 @@ export class BotClient extends Client {
     } catch (error) {
       this.logger.warn({ err: error }, 'Dashboard command subscriber failed to start');
       this.#commandSubscriber = undefined;
+    }
+  }
+
+  /**
+   * Take routed commands off this container's queue.
+   *
+   * Needs Redis and nothing else — a bot with no audio server can still answer
+   * `/help`. Failure is logged rather than fatal: the gateway path still works
+   * while the router is being brought up.
+   */
+  async #startInteractionSubscriber(): Promise<void> {
+    const redisUrl = getEnv().REDIS_URL;
+    if (this.#redis === undefined || redisUrl === undefined) return;
+
+    try {
+      this.#interactionSubscriber = new InteractionSubscriber(redisUrl, this.#redis, this);
+      await this.#interactionSubscriber.start();
+    } catch (error) {
+      this.logger.warn({ err: error }, 'Routed command subscriber failed to start');
+      this.#interactionSubscriber = undefined;
+    }
+  }
+
+  /**
+   * Tell the router how each command wants to be acknowledged.
+   *
+   * Published by the primary alone, because it is the only container that
+   * loads the command modules. Best-effort: a missing manifest costs the
+   * default, which is the safe one.
+   */
+  async #publishDeferralManifest(): Promise<void> {
+    const redis = this.#redis;
+    if (redis === undefined) return;
+
+    try {
+      const manifest = this.commands.toDeferralManifest();
+      await redis.set(
+        DEFERRAL_MANIFEST_KEY,
+        JSON.stringify(manifest),
+        'EX',
+        DEFERRAL_MANIFEST_TTL_SECONDS,
+      );
+      this.logger.info({ commands: Object.keys(manifest).length }, 'Deferral manifest published');
+    } catch (error) {
+      this.logger.warn({ err: error }, 'Could not publish the deferral manifest');
     }
   }
 
@@ -569,6 +634,9 @@ export class BotClient extends Client {
       this.destroy(),
       this.#redis === undefined ? Promise.resolve() : closeRedis(this.#redis),
       this.#commandSubscriber === undefined ? Promise.resolve() : this.#commandSubscriber.stop(),
+      this.#interactionSubscriber === undefined
+        ? Promise.resolve()
+        : this.#interactionSubscriber.stop(),
     ]);
 
     for (const result of results) {

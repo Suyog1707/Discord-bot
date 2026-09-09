@@ -44,8 +44,7 @@ export default defineCommand({
   cooldownSeconds: 3,
   // `play` queues tracks for the whole channel and announces it there; the
   // rest of the subcommands are personal bookkeeping nobody else needs to see.
-  deferral: (interaction) =>
-    interaction.options.getSubcommand() === 'play' ? 'public' : 'ephemeral',
+  deferral: { bySubcommand: { play: 'public' }, otherwise: 'ephemeral' },
 
   async execute({ interaction }) {
     const client = interaction.client as BotClient;

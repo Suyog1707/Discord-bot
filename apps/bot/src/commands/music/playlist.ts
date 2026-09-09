@@ -14,7 +14,7 @@ import type { Playlist } from '@discord-music/database';
 import { AttachmentBuilder, EmbedBuilder, type SlashCommandStringOption } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
-import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
+import { defineCommand, SlashCommandBuilder, type DeferralSpec } from '../../core/command.js';
 import type { PlaylistRef } from '../../services/playlists-service.js';
 import type { QueuedTrack } from '../../music/track.js';
 import { formatTrackDuration } from '../../music/track.js';
@@ -63,7 +63,19 @@ const nameOption = (description: string) => (option: SlashCommandStringOption) =
     .setAutocomplete(true);
 
 /** Subcommands whose result is for the whole channel, not just the caller. */
-const PUBLIC_SUBCOMMANDS = new Set(['play', 'shuffle']);
+const PUBLIC_SUBCOMMANDS = ['play', 'shuffle'] as const;
+
+/**
+ * Declared as data, not as a function.
+ *
+ * The command router acknowledges every interaction before the bot sees it,
+ * and it cannot call into this app — so the rule has to be something it can
+ * read out of a published manifest.
+ */
+const PUBLIC_SUBCOMMAND_DEFERRAL: DeferralSpec = {
+  bySubcommand: Object.fromEntries(PUBLIC_SUBCOMMANDS.map((name) => [name, 'public'])),
+  otherwise: 'ephemeral',
+};
 
 export default defineCommand({
   data: new SlashCommandBuilder()
@@ -198,8 +210,7 @@ export default defineCommand({
   cooldownSeconds: 3,
   // `play` and `shuffle` fill the channel's queue and belong in the channel;
   // every other subcommand manages the caller's own library.
-  deferral: (interaction) =>
-    PUBLIC_SUBCOMMANDS.has(interaction.options.getSubcommand()) ? 'public' : 'ephemeral',
+  deferral: PUBLIC_SUBCOMMAND_DEFERRAL,
 
   async autocomplete({ interaction }) {
     const client = interaction.client as BotClient;

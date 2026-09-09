@@ -24,11 +24,21 @@ export type AnySlashCommandBuilder =
 export const COMMAND_CATEGORIES = ['general', 'music', 'queue', 'playlist', 'settings'] as const;
 export type CommandCategory = (typeof COMMAND_CATEGORIES)[number];
 
-/** Visibility of the deferred acknowledgement Discord shows while a command runs. */
-export type DeferralMode = 'public' | 'ephemeral';
+/**
+ * Visibility of the acknowledgement, and the rule that picks it.
+ *
+ * Defined in `@discord-music/shared` rather than here, because the command
+ * router in apps/web has to evaluate the same rule and cannot import anything
+ * from this app — the command modules pull in discord.js, Lavalink and Prisma.
+ */
+import type { DeferralSpec } from '@discord-music/shared';
 
-/** Applied when a command does not declare {@link CommandDefinition.deferral}. */
-export const DEFAULT_DEFERRAL: DeferralMode = 'ephemeral';
+export {
+  DEFAULT_DEFERRAL,
+  resolveDeferral,
+  type DeferralMode,
+  type DeferralSpec,
+} from '@discord-music/shared';
 
 /** Everything a handler needs, passed explicitly rather than reached for globally. */
 export interface CommandContext {
@@ -89,24 +99,20 @@ export interface CommandDefinition {
    * A command must never call `deferReply` itself, and must respond with
    * `editReply`/`followUp`.
    */
-  readonly deferral?: DeferralMode | ((interaction: ChatInputCommandInteraction) => DeferralMode);
+  readonly deferral?: DeferralSpec;
   execute(context: CommandContext): Promise<void>;
   autocomplete?(context: AutocompleteContext): Promise<void>;
 }
 
 /**
- * Resolve the acknowledgement mode for one invocation.
+ * The invoked subcommand, or null when the command has none.
  *
- * Kept separate from the dispatcher so the defaulting rule — the thing that
- * decides whether a command races Discord's three-second window — is testable
- * on its own.
+ * The one thing `resolveDeferral` needs off an interaction, pulled out so the
+ * rule itself stays a pure function of two plain values — which is what lets
+ * the router evaluate it from raw JSON.
  */
-export function resolveDeferral(
-  command: Pick<CommandDefinition, 'deferral'>,
-  interaction: ChatInputCommandInteraction,
-): DeferralMode {
-  if (typeof command.deferral === 'function') return command.deferral(interaction);
-  return command.deferral ?? DEFAULT_DEFERRAL;
+export function subcommandOf(interaction: ChatInputCommandInteraction): string | null {
+  return interaction.options.getSubcommand(false);
 }
 
 /**

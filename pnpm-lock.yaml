@@ -72,7 +72,7 @@ importers:
         specifier: workspace:*
         version: link:../../packages/shared
       discord.js:
-        specifier: ^14.22.1
+        specifier: 14.27.0
         version: 14.27.0
       ioredis:
         specifier: ^5.11.1

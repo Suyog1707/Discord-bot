@@ -13,7 +13,11 @@ import { pathToFileURL } from 'node:url';
 
 import type { RESTPostAPIChatInputApplicationCommandsJSONBody } from 'discord.js';
 
-import { ConfigurationError } from '@discord-music/shared';
+import {
+  ConfigurationError,
+  type DeferralManifest,
+  type DeferralSpec,
+} from '@discord-music/shared';
 
 import { getLogger } from '../lib/logger.js';
 import { COMMAND_CATEGORIES, type CommandCategory, type CommandDefinition } from './command.js';
@@ -81,6 +85,26 @@ export class CommandRegistry {
     return this.values()
       .filter((command) => includeDevOnly || command.devOnly !== true)
       .map((command) => command.data.toJSON());
+  }
+
+  /**
+   * What the command router needs to know about every command.
+   *
+   * It acknowledges each interaction before this bot sees it, and Discord
+   * fixes visibility at that moment — but the router cannot import these
+   * modules, which pull in discord.js, Lavalink and Prisma. So the primary
+   * publishes the answer instead, and the router looks it up.
+   *
+   * Commands that declare nothing are included with their spec omitted, which
+   * resolves to the default. Listing them anyway means a reader of the
+   * manifest sees the whole command set rather than only the exceptions.
+   */
+  toDeferralManifest(): DeferralManifest {
+    const manifest: Record<string, DeferralSpec> = {};
+    for (const command of this.values()) {
+      if (command.deferral !== undefined) manifest[command.data.name] = command.deferral;
+    }
+    return manifest;
   }
 
   /**

@@ -20,7 +20,7 @@
   "dependencies": {
     "@discord-music/database": "workspace:*",
     "@discord-music/shared": "workspace:*",
-    "discord.js": "^14.22.1",
+    "discord.js": "14.27.0",
     "ioredis": "^5.11.1",
     "pino": "^9.14.0",
     "shoukaku": "^4.1.1",
