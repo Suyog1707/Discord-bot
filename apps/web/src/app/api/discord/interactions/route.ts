@@ -17,6 +17,7 @@
  * body is the only thing separating a real command from a forgery, which is
  * why `verifyDiscordSignature` runs before anything else looks at the payload.
  */
+import { INTERACTION_TYPE } from '@discord-music/shared';
 import { after, NextResponse } from 'next/server';
 
 import { verifyDiscordSignature } from '@/lib/discord/verify-signature';
@@ -29,16 +30,11 @@ export const dynamic = 'force-dynamic';
 /** Bounds the `after()` work; the routing itself should finish in well under 2s. */
 export const maxDuration = 30;
 
-/** Discord's interaction types. */
-const PING = 1;
-const APPLICATION_COMMAND = 2;
-const MESSAGE_COMPONENT = 3;
-const AUTOCOMPLETE = 4;
-const MODAL_SUBMIT = 5;
-
 /** Discord's response types. */
 const PONG = 1;
 const DEFERRED_MESSAGE = 5;
+/** Acknowledge a component without changing the message it is on. */
+const DEFERRED_UPDATE = 6;
 const AUTOCOMPLETE_RESULT = 8;
 
 /** Only the caller sees it. */
@@ -86,11 +82,11 @@ export async function POST(request: Request): Promise<Response> {
   const type = interaction.type ?? -1;
 
   switch (type) {
-    case PING:
+    case INTERACTION_TYPE.ping:
       // The handshake Discord performs when the URL is saved.
       return NextResponse.json({ type: PONG });
 
-    case APPLICATION_COMMAND: {
+    case INTERACTION_TYPE.command: {
       const deferral = await deferralFor(interaction);
 
       /**
@@ -116,7 +112,7 @@ export async function POST(request: Request): Promise<Response> {
       });
     }
 
-    case AUTOCOMPLETE:
+    case INTERACTION_TYPE.autocomplete:
       /**
        * Answered here or not at all — there is no deferral for autocomplete,
        * so a round trip to a bot cannot fit in the budget. Suggestions arrive
@@ -125,11 +121,25 @@ export async function POST(request: Request): Promise<Response> {
        */
       return NextResponse.json({ type: AUTOCOMPLETE_RESULT, data: { choices: [] } });
 
-    case MESSAGE_COMPONENT:
-    case MODAL_SUBMIT:
-      // Routed by the message they belong to rather than by the caller's voice
-      // channel, which is a different lookup and lands in a later change.
-      logger.warn({ type }, 'Component interaction reached the router');
+    case INTERACTION_TYPE.component: {
+      /**
+       * Acknowledged as a deferred *update*, which changes nothing on screen.
+       *
+       * That matters: the controller is a long-lived message other people are
+       * looking at, and a deferred *message* would leave a "thinking…" hanging
+       * off it. The bot then edits that message or speaks beside it.
+       */
+      after(async () => {
+        const { routeComponent } = await import('@/lib/interactions/route-command');
+        await routeComponent(interaction as Parameters<typeof routeComponent>[0]);
+      });
+
+      return NextResponse.json({ type: DEFERRED_UPDATE });
+    }
+
+    case INTERACTION_TYPE.modalSubmit:
+      // Nothing in this bot uses modals yet; saying so beats a silent failure.
+      logger.warn({ type }, 'Modal submission reached the router');
       return NextResponse.json({
         type: DEFERRED_MESSAGE,
         data: { flags: EPHEMERAL },

@@ -373,6 +373,15 @@ export class BotClient extends Client {
     void peers
       .announce(guildId, voiceChannelId, { botId: this.identity.label, baseUrl })
       .catch(() => undefined);
+    /**
+     * The promise has been kept, so let it go.
+     *
+     * A claim exists to cover the gap between being chosen and being connected.
+     * This is the far side of that gap: the room is announced, so anybody
+     * deciding now can see the real thing. Waiting for the TTL instead would
+     * leave this bot looking busy to the next person for fifteen seconds.
+     */
+    void peers.releaseClaim(this.identity.label, guildId, voiceChannelId).catch(() => undefined);
     // The room set just changed, so the presence entry allocation reads is now
     // out of date. Republishing here is what keeps the gap between a room being
     // taken and the allocator knowing about it down to one Redis write.

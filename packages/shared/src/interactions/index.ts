@@ -6,6 +6,7 @@
  * side needs to agree on lives here — the visibility of the acknowledgement,
  * the envelope on the wire, and the decision itself.
  */
+export * from './claims.js';
 export * from './deferral.js';
 export * from './envelope.js';
 export * from './route.js';

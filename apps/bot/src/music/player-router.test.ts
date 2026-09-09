@@ -232,6 +232,8 @@ function fakePeers(options: {
     selfBotId: 'main',
     ownerOf: () => Promise.resolve(options.owner),
     liveBots: () => Promise.resolve(options.live ?? []),
+    claimedRooms: () => Promise.resolve(new Map<string, string>()),
+    releaseClaim: vi.fn(),
     sendJoin,
     sendIntent: vi.fn(),
     announce: vi.fn(),

@@ -14,6 +14,7 @@
  */
 import {
   decodeInteractionEnvelope,
+  INTERACTION_TYPE,
   INTERACTION_ACK_TTL_SECONDS,
   INTERACTION_MAX_AGE_MS,
   interactionAckKey,
@@ -21,13 +22,20 @@ import {
   type InteractionEnvelope,
 } from '@discord-music/shared';
 import { closeRedis, createRedisClient, type Redis } from '@discord-music/shared/redis';
-import type { APIChatInputApplicationCommandInteraction } from 'discord.js';
+import type {
+  APIChatInputApplicationCommandInteraction,
+  APIMessageComponentInteraction,
+} from 'discord.js';
 
 import { getLogger } from '../lib/logger.js';
 
 import type { BotClient } from './bot-client.js';
 import { dispatchChatInputCommand } from './dispatch-command.js';
-import { rehydrateChatInputInteraction } from './interaction-rehydrate.js';
+import { dispatchMusicComponent, isMusicComponent } from './dispatch-component.js';
+import {
+  rehydrateChatInputInteraction,
+  rehydrateComponentInteraction,
+} from './interaction-rehydrate.js';
 
 const logger = getLogger('routed-commands');
 
@@ -167,6 +175,29 @@ export class InteractionSubscriber {
       return;
     }
 
+    const routedLogger = logger.child({ routed: true, routeLatencyMs });
+
+    /**
+     * A button, not a command.
+     *
+     * Setting an interactions endpoint URL diverts everything an application
+     * receives, so the controller's own buttons come this way too. They are
+     * routed by the message they sit on rather than by the caller's voice
+     * channel, and they land back on the bot that posted it.
+     */
+    if (envelope.payload.type === INTERACTION_TYPE.component) {
+      const component = rehydrateComponentInteraction(
+        this.#client,
+        envelope.payload as unknown as APIMessageComponentInteraction,
+      );
+      if (!isMusicComponent(component)) {
+        logger.warn({ customId: component.customId }, 'Routed an unrecognised component');
+        return;
+      }
+      await dispatchMusicComponent(this.#client, component, routedLogger);
+      return;
+    }
+
     const interaction = rehydrateChatInputInteraction(
       this.#client,
       envelope.payload as unknown as APIChatInputApplicationCommandInteraction,
@@ -175,11 +206,7 @@ export class InteractionSubscriber {
 
     this.#warnOnVoiceDrift(envelope, interaction.member);
 
-    await dispatchChatInputCommand(
-      this.#client,
-      interaction,
-      logger.child({ routed: true, routeLatencyMs }),
-    );
+    await dispatchChatInputCommand(this.#client, interaction, routedLogger);
   }
 
   /**

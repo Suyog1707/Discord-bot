@@ -14,10 +14,12 @@
  * slow or gone must degrade one command, never block the music.
  */
 import {
+  botClaimKey,
   PLAYER_BOT_TTL_SECONDS,
   playerBotIndexKey,
   playerBotKey,
   playerRoomOwnerKey,
+  roomClaimKey,
   type BotPresence,
 } from '@discord-music/shared';
 import { readLiveBots, type Redis } from '@discord-music/shared/redis';
@@ -120,6 +122,49 @@ export class PeerDirectory {
       logger.debug({ err: error }, 'Fleet presence lookup failed');
       return [];
     }
+  }
+
+  /**
+   * Which bots the command router has promised to a channel.
+   *
+   * Read alongside presence when deciding, so this container agrees with a
+   * decision already made rather than making a second one. Best-effort: a
+   * failed read degrades to "no promises outstanding", which is what it was
+   * before the router existed.
+   */
+  async claimedRooms(): Promise<ReadonlyMap<string, string>> {
+    const redis = this.#redis;
+    if (redis === undefined) return new Map();
+
+    try {
+      const ids = await redis.smembers(playerBotIndexKey());
+      if (ids.length === 0) return new Map();
+
+      const claims = await redis.mget(...ids.map((id) => botClaimKey(id)));
+      return new Map(
+        ids.flatMap((id, index) => {
+          const voiceChannelId = claims[index];
+          return voiceChannelId == null ? [] : [[id, voiceChannelId] as const];
+        }),
+      );
+    } catch (error) {
+      logger.debug({ err: error }, 'Claim lookup failed');
+      return new Map();
+    }
+  }
+
+  /**
+   * Let go of a promise, now that it has been kept.
+   *
+   * The TTL would do this eventually, but "eventually" is fifteen seconds of
+   * a bot looking busy to the next person who asks.
+   */
+  async releaseClaim(botId: string, guildId: string, voiceChannelId: string): Promise<void> {
+    if (this.#redis === undefined) return;
+    await Promise.all([
+      this.#redis.del(botClaimKey(botId)).catch(() => 0),
+      this.#redis.del(roomClaimKey(guildId, voiceChannelId)).catch(() => 0),
+    ]);
   }
 
   /**

@@ -14,9 +14,13 @@ import 'server-only';
  * handing the work over.
  */
 import {
+  botClaimKey,
+  CLAIM_TTL_MS,
   encodeInteractionEnvelope,
+  interactionAckKey,
   interactionQueueKey,
   INTERACTION_QUEUE_TTL_SECONDS,
+  roomClaimKey,
   routeInteraction,
   type DeferralMode,
   type RawInteraction,
@@ -93,6 +97,43 @@ export async function routeCommand(input: RouteCommandInput): Promise<void> {
       return;
     }
 
+    /**
+     * Reserve the bot before handing the work over.
+     *
+     * Only when the decision actually promised a room — an owner already in
+     * the channel, or a command with no room at all, has nothing to reserve.
+     *
+     * A lost race is not retried into itself. The bot that won is the right
+     * answer for this channel too, so the command follows it rather than
+     * allocating a second bot for the same room.
+     */
+    let botId = decision.botId;
+    if (decision.claims && decision.voiceChannelId !== null) {
+      const won = await redis.set(
+        botClaimKey(botId),
+        decision.voiceChannelId,
+        'PX',
+        CLAIM_TTL_MS,
+        'NX',
+      );
+      if (won === null) {
+        const holder = await redis.get(roomClaimKey(guildId, decision.voiceChannelId));
+        if (holder === null) {
+          logger.info({ commandName, guildId, botId }, 'Lost the race for a player');
+          await reply(
+            payload,
+            'Every player is busy in another channel right now. Try again shortly.',
+            deferral,
+          );
+          return;
+        }
+        // Somebody claimed this very room a moment ago; follow them.
+        botId = holder;
+      } else {
+        await redis.set(roomClaimKey(guildId, decision.voiceChannelId), botId, 'PX', CLAIM_TTL_MS);
+      }
+    }
+
     const envelope = encodeInteractionEnvelope({
       payload,
       deferral,
@@ -110,7 +151,7 @@ export async function routeCommand(input: RouteCommandInput): Promise<void> {
      * there so a container that never comes back does not accumulate a queue
      * of commands nobody wants answered any more.
      */
-    const queue = interactionQueueKey(decision.botId);
+    const queue = interactionQueueKey(botId);
     await redis.rpush(queue, envelope);
     await redis.expire(queue, INTERACTION_QUEUE_TTL_SECONDS);
 
@@ -119,11 +160,13 @@ export async function routeCommand(input: RouteCommandInput): Promise<void> {
         commandName,
         guildId,
         voiceChannelId: decision.voiceChannelId,
-        botId: decision.botId,
+        botId,
         reason: decision.reason,
       },
       'Command routed',
     );
+
+    await confirmPickup(payload, botId, deferral);
   } catch (error) {
     const unavailable = error instanceof FleetUnavailableError;
     logger.error({ err: error, commandName, unavailable }, 'Routing failed');
@@ -137,6 +180,45 @@ export async function routeCommand(input: RouteCommandInput): Promise<void> {
     );
   }
 }
+
+/**
+ * Make sure somebody actually took the work.
+ *
+ * Discord has already been told "thinking…", so a bot that never picks up
+ * leaves a reply nothing will ever finish — the user watches a spinner until
+ * the interaction expires fifteen minutes later. That is a failure the gateway
+ * path could not produce, so it needs an answer here rather than a shrug.
+ *
+ * Two reads, not a poll. The bot writes its ack before doing any work, so it
+ * appears within milliseconds of pickup; the second read exists only to cover
+ * a container that was mid-restart when the work arrived.
+ */
+async function confirmPickup(
+  payload: RawInteraction,
+  botId: string,
+  deferral: DeferralMode,
+): Promise<void> {
+  const redis = getRedis();
+  if (redis === undefined) return;
+
+  const key = interactionAckKey(payload.id);
+  for (const delayMs of PICKUP_CHECKS_MS) {
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    const picked = await redis.get(key).catch(() => 'unknown');
+    if (picked !== null) return;
+  }
+
+  getLogger('interactions').error({ botId, interactionId: payload.id }, 'Nobody picked that up');
+  await reply(payload, `**${botId}** did not respond. Try again in a moment.`, deferral);
+}
+
+/**
+ * When to look, measured from the publish.
+ *
+ * Bounded on purpose: this runs inside a metered function, and a retry loop
+ * here would be a job queue nobody designed.
+ */
+const PICKUP_CHECKS_MS = [400, 900] as const;
 
 /** Edit the placeholder the route already sent. */
 async function reply(
@@ -165,4 +247,64 @@ function callerIdOf(payload: RawInteraction): string | null {
   };
   const id = raw.member?.user?.id ?? raw.user?.id;
   return typeof id === 'string' ? id : null;
+}
+
+/**
+ * Send a button back to the bot whose message it is on.
+ *
+ * A component is not routed by where the caller is standing — it belongs to a
+ * specific message, and only the bot that posted that message has the state
+ * behind it: the player the controller is showing, or the collector that
+ * `/spotify` left open. `message.author.id` is that bot's user id, which for a
+ * bot is also its application id, so the roster maps it straight back.
+ */
+export async function routeComponent(payload: RawInteraction): Promise<void> {
+  const logger = getLogger('interactions');
+  const guildId = payload.guild_id ?? null;
+  const authorId = messageAuthorIdOf(payload);
+
+  try {
+    const redis = getRedis();
+    if (redis === undefined || guildId === null || authorId === null) {
+      logger.warn({ guildId, authorId }, 'Component interaction could not be routed');
+      return;
+    }
+
+    const { fleet } = await readFleet(guildId, null);
+    const botId = [...fleet.clientIds].find(([, clientId]) => clientId === authorId)?.[0];
+    if (botId === undefined) {
+      logger.warn({ authorId, guildId }, 'No bot in the roster posted that message');
+      return;
+    }
+
+    const queue = interactionQueueKey(botId);
+    await redis.rpush(
+      queue,
+      encodeInteractionEnvelope({
+        payload,
+        // A component is answered with a deferred *update*; the mode is
+        // carried only so the envelope has one shape.
+        deferral: 'ephemeral',
+        voiceChannelId: null,
+        routedAt: Date.now(),
+      }),
+    );
+    await redis.expire(queue, INTERACTION_QUEUE_TTL_SECONDS);
+
+    logger.info({ botId, guildId, customId: customIdOf(payload) }, 'Component routed');
+  } catch (error) {
+    logger.error({ err: error, guildId }, 'Component routing failed');
+  }
+}
+
+/** Who posted the message this component sits on. */
+function messageAuthorIdOf(payload: RawInteraction): string | null {
+  const id = (payload as { readonly message?: { readonly author?: { readonly id?: unknown } } })
+    .message?.author?.id;
+  return typeof id === 'string' ? id : null;
+}
+
+function customIdOf(payload: RawInteraction): string | undefined {
+  const id = (payload as { readonly data?: { readonly custom_id?: unknown } }).data?.custom_id;
+  return typeof id === 'string' ? id : undefined;
 }

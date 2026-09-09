@@ -490,10 +490,11 @@ export class PlayerRouter {
     const peers = this.#peers;
     if (fleet === undefined || peers === undefined) return this.#localFleetView(guildId);
 
-    const [roster, invited, presence] = await Promise.all([
+    const [roster, invited, presence, routed] = await Promise.all([
       fleet.listBots(),
       fleet.botsInGuild(guildId),
       peers.liveBots(),
+      peers.claimedRooms(),
     ]);
     // A roster that has not caught up with this container yet would leave it
     // out of its own allocation, so it stands in for itself.
@@ -503,7 +504,15 @@ export class PlayerRouter {
       roster,
       invited,
       presence: this.#withOwnRooms(presence),
-      claims: this.#claims,
+      /**
+       * This process's own reservations, plus any the command router made.
+       *
+       * The router picks a bot before the command reaches it, and its choice
+       * arrives here as a claim on that bot — so `allocateBot` answers
+       * `existing` and this container agrees with the decision instead of
+       * making a second one. No separate "you were chosen" protocol.
+       */
+      claims: new Map([...routed, ...this.#claims]),
       guildId,
       now: Date.now(),
       staleAfterMs: PLAYER_BOT_STALE_MS,

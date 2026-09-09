@@ -23,9 +23,14 @@
  */
 import type { DeferralMode } from '@discord-music/shared';
 import {
+  ButtonInteraction,
   ChatInputCommandInteraction,
+  ComponentType,
+  StringSelectMenuInteraction,
   type APIChatInputApplicationCommandInteraction,
+  type APIMessageComponentInteraction,
   type Client,
+  type MessageComponentInteraction,
 } from 'discord.js';
 
 /**
@@ -70,6 +75,38 @@ export function rehydrateChatInputInteraction(
   interaction.deferred = true;
   interaction.replied = false;
   interaction.ephemeral = deferral === 'ephemeral';
+
+  return interaction;
+}
+
+type ComponentConstructor = new (
+  client: Client<true>,
+  data: APIMessageComponentInteraction,
+) => MessageComponentInteraction;
+
+/**
+ * The same trick for a button or a select menu.
+ *
+ * Needed because setting an interactions endpoint URL diverts *all* of an
+ * application's interactions, not only its commands — so the primary's own
+ * controller buttons arrive this way too, and have to keep working.
+ *
+ * Marked deferred rather than ephemeral: the router answers a component with a
+ * deferred *update*, which changes nothing on screen, so `editReply` edits the
+ * message the button sits on and `followUp` speaks beside it.
+ */
+export function rehydrateComponentInteraction(
+  client: Client<true>,
+  payload: APIMessageComponentInteraction,
+): MessageComponentInteraction {
+  const Component = (payload.data.component_type === ComponentType.StringSelect
+    ? StringSelectMenuInteraction
+    : ButtonInteraction) as unknown as ComponentConstructor;
+
+  const interaction = new Component(client, payload);
+  interaction.deferred = true;
+  interaction.replied = false;
+  interaction.ephemeral = false;
 
   return interaction;
 }

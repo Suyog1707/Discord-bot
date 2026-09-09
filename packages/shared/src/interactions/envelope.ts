@@ -57,6 +57,21 @@ export const INTERACTION_QUEUE_TTL_SECONDS = 60;
 export const INTERACTION_MAX_AGE_MS = 15_000;
 
 /**
+ * Discord's interaction types, as numbers on the wire.
+ *
+ * Named here rather than reached for out of discord.js, because the router has
+ * no discord.js and the envelope's `type` is a plain number by the time either
+ * side reads it.
+ */
+export const INTERACTION_TYPE = {
+  ping: 1,
+  command: 2,
+  component: 3,
+  autocomplete: 4,
+  modalSubmit: 5,
+} as const;
+
+/**
  * Ids as Discord sends them.
  *
  * Plain strings rather than the branded snowflake schema: these come straight
