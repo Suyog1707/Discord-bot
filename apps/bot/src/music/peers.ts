@@ -10,8 +10,11 @@
  * sibling in turn would work too and is what `/rooms` is for, but it costs a
  * fan-out on a path that runs on every command.
  *
- * Every lookup and every call is bounded and fails soft. A sibling that is
- * slow or gone must degrade one command, never block the music.
+ * It no longer *calls* anybody. The command router sends each interaction to
+ * the bot that should run it, so the question "who has this?" is now asked to
+ * decide whether a room is free, not to decide who to forward to. Every lookup
+ * still fails soft: a stale answer must degrade one command, never block the
+ * music.
  */
 import {
   botClaimKey,
@@ -26,49 +29,29 @@ import { readLiveBots, type Redis } from '@discord-music/shared/redis';
 
 import { getLogger } from '../lib/logger.js';
 
-import type { IntentResult, RoomIntent } from './intent.js';
-import type { JoinOptions } from './music-manager.js';
-
 const logger = getLogger('peers');
 
 /** Who owns a room, and where to reach them. */
 export interface RoomOwner {
   readonly botId: string;
-  /** e.g. `http://dmp-bot-player-2:8080` — reachable only inside the network. */
-  readonly baseUrl: string;
 }
 
 export interface PeerDirectoryOptions {
   readonly redis: Redis | undefined;
   /** This container's own id, so it can tell itself apart from a sibling. */
   readonly selfBotId: string;
-  /** How long a peer has to answer before the caller gives up on it. */
-  readonly timeoutMs: number;
   /** Snapshot lifetime, reused so ownership cannot outlive what it points at. */
   readonly ttlSeconds: number;
 }
 
-/** What a container answers when asked to take a room. */
-export type JoinOutcome =
-  | { readonly kind: 'joined' }
-  /**
-   * The player is already in a different channel of this guild. One token
-   * holds one voice connection per server, so this is a refusal, not a move —
-   * the allocator's picture was a moment out of date and it should look again.
-   */
-  | { readonly kind: 'busy'; readonly voiceChannelId: string }
-  | { readonly kind: 'error'; readonly message: string };
-
 export class PeerDirectory {
   readonly #redis: Redis | undefined;
   readonly #selfBotId: string;
-  readonly #timeoutMs: number;
   readonly #ttlSeconds: number;
 
   constructor(options: PeerDirectoryOptions) {
     this.#redis = options.redis;
     this.#selfBotId = options.selfBotId;
-    this.#timeoutMs = options.timeoutMs;
     this.#ttlSeconds = options.ttlSeconds;
   }
 
@@ -167,31 +150,6 @@ export class PeerDirectory {
     ]);
   }
 
-  /**
-   * Ask a container to take a room.
-   *
-   * Separate from `sendIntent` because it is the one call about a room that
-   * does not exist yet: every intent is applied to a player that is already
-   * there, and this is what puts one there.
-   */
-  async sendJoin(baseUrl: string, options: JoinOptions): Promise<JoinOutcome> {
-    try {
-      const response = await fetch(`${baseUrl}/join`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(options),
-        signal: AbortSignal.timeout(this.#timeoutMs),
-      });
-      return (await response.json()) as JoinOutcome;
-    } catch (error) {
-      logger.warn({ err: error, baseUrl }, 'Peer did not answer a join');
-      return {
-        kind: 'error',
-        message: 'That player is not responding right now. Try again shortly.',
-      };
-    }
-  }
-
   /** Claim a room, so siblings can route to this container for it. */
   async announce(guildId: string, voiceChannelId: string, owner: RoomOwner): Promise<void> {
     if (this.#redis === undefined) return;
@@ -222,43 +180,11 @@ export class PeerDirectory {
       const raw = await this.#redis.get(playerRoomOwnerKey(guildId, voiceChannelId));
       if (raw === null) return undefined;
       const parsed = JSON.parse(raw) as Partial<RoomOwner>;
-      if (typeof parsed.botId !== 'string' || typeof parsed.baseUrl !== 'string') return undefined;
-      return { botId: parsed.botId, baseUrl: parsed.baseUrl };
+      if (typeof parsed.botId !== 'string') return undefined;
+      return { botId: parsed.botId };
     } catch (error) {
       logger.debug({ err: error, guildId, voiceChannelId }, 'Room owner lookup failed');
       return undefined;
-    }
-  }
-
-  /**
-   * Run an intent on the container that owns the room.
-   *
-   * A failure here is reported as a result rather than thrown, because every
-   * caller is rendering a reply to somebody: "that player is not responding"
-   * is a better answer than an exception trace.
-   */
-  async sendIntent(owner: RoomOwner, intent: RoomIntent): Promise<IntentResult> {
-    try {
-      const response = await fetch(`${owner.baseUrl}/intent`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(intent),
-        signal: AbortSignal.timeout(this.#timeoutMs),
-      });
-      const body = (await response.json()) as IntentResult;
-      if (!response.ok && body.kind !== 'error') {
-        return { kind: 'error', message: `Player ${owner.botId} refused that.` };
-      }
-      return body;
-    } catch (error) {
-      logger.warn(
-        { err: error, botId: owner.botId, action: intent.action },
-        'Peer did not answer an intent',
-      );
-      return {
-        kind: 'error',
-        message: `The player holding that channel is not responding. Try again shortly.`,
-      };
     }
   }
 }

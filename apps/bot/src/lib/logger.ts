@@ -21,10 +21,25 @@ function getRootLogger(): Logger {
   }));
 }
 
-/** Proxy that defers construction of the real logger until a property is touched. */
+/**
+ * Proxy that defers construction of the real logger until a property is touched.
+ *
+ * Methods are bound to the resolved logger on the way out, and that is not a
+ * tidiness: pino's `child` reads the parent off `this`, so handing it back
+ * unbound means `this` is the proxy and the bindings are silently dropped.
+ * Every `logger.child({ command, guildId })` in this app was producing a line
+ * with neither — the module tag survived only because it is applied inside
+ * `resolve()`, on a real logger.
+ */
 function lazyLogger(resolve: () => Logger): Logger {
   return new Proxy({} as Logger, {
-    get: (_target, property) => Reflect.get(resolve(), property) as unknown,
+    get: (_target, property) => {
+      const target = resolve();
+      const value = Reflect.get(target, property) as unknown;
+      return typeof value === 'function'
+        ? (value as (...args: never[]) => unknown).bind(target)
+        : value;
+    },
     set: (_target, property, value) => Reflect.set(resolve(), property, value),
     has: (_target, property) => Reflect.has(resolve(), property),
   });

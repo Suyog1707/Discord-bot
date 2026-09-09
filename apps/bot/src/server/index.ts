@@ -1,10 +1,13 @@
 /**
  * The container's private HTTP surface.
  *
- * Each bot runs in its own container, and two things need to reach it that a
- * Discord gateway connection cannot carry: Docker asking whether it is well,
- * and — once the fleet is split across containers — a sibling asking it to act
- * on a room it owns.
+ * Each bot runs in its own container, and one thing needs to reach it that a
+ * Discord gateway connection cannot carry: Docker asking whether it is well.
+ *
+ * It used to carry more. Commands about a room another container owned were
+ * forwarded here over HTTP — until the command router started sending each
+ * interaction to the bot that should handle it, at which point nothing ever
+ * asked a sibling for anything again.
  *
  * Bound inside the container and never published, so it is reachable by
  * service name on the compose network and from nowhere else. Node's own `http`
@@ -17,9 +20,6 @@ import { pingDatabase } from '@discord-music/database';
 
 import type { BotClient } from '../core/bot-client.js';
 import { getLogger } from '../lib/logger.js';
-import { applyIntent } from '../music/apply-intent.js';
-import { decodeIntent } from '../music/intent.js';
-import { decodeJoinRequest } from '../music/join-request.js';
 
 import { resolveBotHealth, type BotDependencyReport, type DependencyStatus } from './health.js';
 
@@ -27,22 +27,6 @@ const logger = getLogger('internal-server');
 
 /** A probe that hangs must not hold the healthcheck open. */
 const PROBE_TIMEOUT_MS = 2_000;
-
-/** Generous for a control message; a body larger than this is not one. */
-const MAX_BODY_BYTES = 64 * 1024;
-
-async function readJson(request: IncomingMessage): Promise<unknown> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of request) {
-    const buffer = chunk as Buffer;
-    size += buffer.length;
-    if (size > MAX_BODY_BYTES) throw new Error('Request body too large');
-    chunks.push(buffer);
-  }
-  if (size === 0) return undefined;
-  return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
-}
 
 export interface InternalServer {
   readonly port: number;
@@ -126,62 +110,6 @@ export function createInternalServer(client: BotClient, port: number): InternalS
       // is cold, and when you want to ask one container what it thinks.
       const rooms = client.router?.ownRooms() ?? [];
       send(response, 200, { bot: client.identity.label, rooms });
-      return;
-    }
-
-    if (path === '/join' && request.method === 'POST') {
-      // The only call about a room that does not exist yet: every intent acts
-      // on a player that is already there, and this is what puts one there.
-      // Allocation has already happened on the primary, so there is nothing
-      // left to choose — only to do it, or to say why it cannot.
-      const options = decodeJoinRequest(await readJson(request));
-      if (options === null) {
-        send(response, 400, { kind: 'error', message: 'Malformed join request' });
-        return;
-      }
-
-      const router = client.router;
-      if (router === undefined) {
-        send(response, 503, { kind: 'error', message: 'This player has no audio server.' });
-        return;
-      }
-
-      logger.info(
-        { guildId: options.guildId, voiceChannelId: options.voiceChannelId },
-        'Taking a room on request',
-      );
-      send(response, 200, await router.joinLocal(options));
-      return;
-    }
-
-    if (path === '/intent' && request.method === 'POST') {
-      const intent = decodeIntent(await readJson(request));
-      if (intent === null) {
-        send(response, 400, { error: 'Malformed intent' });
-        return;
-      }
-
-      // The owner is asked directly, so a room this container does not serve
-      // is a routing mistake by the caller rather than something to guess at.
-      const room = client.router?.roomFor(intent.guildId, intent.voiceChannelId);
-      if (room === undefined) {
-        send(response, 409, {
-          kind: 'error',
-          message: 'This container does not serve that room.',
-        });
-        return;
-      }
-
-      logger.info(
-        {
-          action: intent.action,
-          guildId: intent.guildId,
-          voiceChannelId: intent.voiceChannelId,
-          issuedBy: intent.issuedBy,
-        },
-        'Applying intent',
-      );
-      send(response, 200, await applyIntent(room, intent));
       return;
     }
 

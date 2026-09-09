@@ -38,7 +38,6 @@ function busy(botId: string, voiceChannelId: string, overrides = {}): FleetMembe
 function fleet(members: readonly FleetMember[], uninvited: readonly RosterEntry[] = []): FleetView {
   return {
     members,
-    addresses: new Map(members.map((member) => [member.botId, `http://${member.botId}:8080`])),
     clientIds: new Map(ROSTER.map((entry) => [entry.botId, entry.clientId])),
     uninvited,
     primaryBotId: members.some((member) => member.botId === 'main') ? 'main' : undefined,

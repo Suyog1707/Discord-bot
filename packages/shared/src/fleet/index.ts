@@ -33,8 +33,6 @@ export interface BotPresence {
   /** Discord application id — what an invite URL for this player needs. */
   readonly clientId: string;
   readonly role: 'primary' | 'player';
-  /** e.g. `http://bot-player-2:8080` — reachable only inside the network. */
-  readonly baseUrl: string;
   /** Every room this container is serving, in every guild. */
   readonly rooms: readonly RoomState[];
   /**
@@ -63,8 +61,6 @@ export interface RosterEntry {
 export interface FleetView {
   /** What `allocateBot` needs, one entry per identity that could take a room. */
   readonly members: readonly FleetMember[];
-  /** Where to reach each live player, by id. */
-  readonly addresses: ReadonlyMap<string, string>;
   /** Application ids, so an invite can be offered for a player by name. */
   readonly clientIds: ReadonlyMap<string, string>;
   /**
@@ -134,7 +130,6 @@ function isStale(entry: BotPresence, input: BuildFleetInput): boolean {
 
 export function buildFleet(input: BuildFleetInput): FleetView {
   const byId = new Map(input.presence.map((entry) => [entry.botId, entry]));
-  const addresses = new Map<string, string>();
   const clientIds = new Map<string, string>();
   const members: FleetMember[] = [];
   const uninvited: RosterEntry[] = [];
@@ -147,7 +142,6 @@ export function buildFleet(input: BuildFleetInput): FleetView {
     const live = byId.get(entry.botId);
     if (live === undefined) continue;
     if (isStale(live, input)) continue;
-    addresses.set(entry.botId, live.baseUrl);
     if (live.role === 'primary' && input.invited.has(entry.clientId)) {
       primaryBotId = entry.botId;
     }
@@ -173,5 +167,5 @@ export function buildFleet(input: BuildFleetInput): FleetView {
     });
   }
 
-  return { members, addresses, clientIds, uninvited, primaryBotId };
+  return { members, clientIds, uninvited, primaryBotId };
 }

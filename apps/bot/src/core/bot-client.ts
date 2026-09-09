@@ -142,13 +142,6 @@ export class BotClient extends Client {
   peers: PeerDirectory | undefined;
 
   /**
-   * The address siblings reach this container on, e.g.
-   * `http://dmp-bot-player-2:8080`. Undefined while every bot shares one
-   * process, where there is nobody to reach.
-   */
-  peerBaseUrl: string | undefined;
-
-  /**
    * Intent parsing, taste and recommendations. Always present — with nothing
    * configured its services are simply disabled, so callers never branch.
    */
@@ -365,13 +358,12 @@ export class BotClient extends Client {
     );
   }
 
-  /** Advertise that this container serves a room, if it can be reached at all. */
+  /** Advertise that this container serves a room. */
   #announceRoom(guildId: string, voiceChannelId: string): void {
     const peers = this.peers;
-    const baseUrl = this.peerBaseUrl;
-    if (peers === undefined || baseUrl === undefined) return;
+    if (peers === undefined) return;
     void peers
-      .announce(guildId, voiceChannelId, { botId: this.identity.label, baseUrl })
+      .announce(guildId, voiceChannelId, { botId: this.identity.label })
       .catch(() => undefined);
     /**
      * The promise has been kept, so let it go.
@@ -398,15 +390,13 @@ export class BotClient extends Client {
    */
   #announceSelf(): void {
     const peers = this.peers;
-    const baseUrl = this.peerBaseUrl;
-    if (peers === undefined || baseUrl === undefined) return;
+    if (peers === undefined) return;
 
     void peers
       .announceSelf({
         botId: this.identity.label,
         clientId: this.identity.clientId,
         role: this.identity.role,
-        baseUrl,
         rooms: this.music?.rooms ?? [],
       })
       .catch(() => undefined);

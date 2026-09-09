@@ -8,7 +8,6 @@ const GUILD = '111111111111111111';
 function view(overrides: Partial<FleetView> = {}): FleetView {
   return {
     members: [],
-    addresses: new Map(),
     clientIds: new Map([
       ['main', 'app-main'],
       ['player-2', 'app-2'],

@@ -12,7 +12,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { applyIntent } from './apply-intent.js';
-import { decodeIntent, roomIntentSchema } from './intent.js';
+import { roomIntentSchema } from './intent.js';
 import type { RoomPlayer } from './player-router.js';
 
 const GUILD = '111111111111111111';
@@ -92,26 +92,32 @@ function fakeRoom(overrides: Record<string, unknown> = {}): RoomPlayer & {
 
 const base = { guildId: GUILD, voiceChannelId: VOICE, issuedBy: USER } as const;
 
+/** What `decodeIntent` used to do, now that only the schema remains. */
+function decode(raw: unknown) {
+  const result = roomIntentSchema.safeParse(raw);
+  return result.success ? result.data : null;
+}
+
 describe('intent schema', () => {
   it('accepts a well-formed intent', () => {
-    expect(decodeIntent({ action: 'skip', ...base })).toEqual({ action: 'skip', ...base });
+    expect(decode({ action: 'skip', ...base })).toEqual({ action: 'skip', ...base });
   });
 
   it('rejects an unknown action', () => {
-    expect(decodeIntent({ action: 'self-destruct', ...base })).toBeNull();
+    expect(decode({ action: 'self-destruct', ...base })).toBeNull();
   });
 
   /** Every intent names its room; without that one room could reach another. */
   it('rejects an intent with no room', () => {
-    expect(decodeIntent({ action: 'skip', guildId: GUILD, issuedBy: USER })).toBeNull();
+    expect(decode({ action: 'skip', guildId: GUILD, issuedBy: USER })).toBeNull();
   });
 
   it('rejects an out-of-range queue position', () => {
-    expect(decodeIntent({ action: 'remove', ...base, position: 0 })).toBeNull();
+    expect(decode({ action: 'remove', ...base, position: 0 })).toBeNull();
   });
 
   it('defaults a dislike to skipping what is playing', () => {
-    const intent = decodeIntent({ action: 'dislike', ...base, trackKey: 'artist::song' });
+    const intent = decode({ action: 'dislike', ...base, trackKey: 'artist::song' });
     expect(intent).toMatchObject({ skipIfPlaying: true });
   });
 

@@ -6,8 +6,6 @@
  *   2. Construct and start the client (env is validated on first import).
  *   3. Shut down cleanly on SIGINT/SIGTERM so Docker and systemd restarts are graceful.
  */
-import { hostname } from 'node:os';
-
 import { getPrismaClient } from '@discord-music/database';
 import { isAppError, PLAYER_STATE_TTL_SECONDS } from '@discord-music/shared';
 import { RestError } from 'shoukaku';
@@ -63,22 +61,18 @@ const routerBots: readonly RouterBot[] =
         },
       ];
 /**
- * How this container finds and calls the others.
+ * How this container makes itself findable.
  *
- * Also how it makes itself findable: the presence entry it publishes is the
- * only evidence an idle player exists at all, since a bot holding no rooms
- * leaves no trace in the room state.
+ * The presence entry it publishes is the only evidence an idle player exists
+ * at all, since a bot holding no rooms leaves no trace in the room state — and
+ * that is what the command router reads to decide who should take a channel.
  *
- * `BOT_PEER_HOST` matters more than it looks. A container's own hostname is an
- * opaque id, so without it siblings would be told to call
- * `http://e14fca1f44ee:8080`; compose sets it to the service name, which is
- * what Docker actually resolves.
+ * It no longer publishes an address. Nothing dials a sibling any more, so a
+ * URL here would be a field that goes stale without anybody noticing.
  */
-const peerHost = env.BOT_PEER_HOST ?? hostname();
 const peers = new PeerDirectory({
   redis: client.redis,
   selfBotId: client.identity.label,
-  timeoutMs: env.BOT_PEER_TIMEOUT_MS,
   ttlSeconds: PLAYER_STATE_TTL_SECONDS,
 });
 
@@ -89,9 +83,8 @@ const router = new PlayerRouter(routerBots, {
 });
 client.router = router;
 client.peers = peers;
-client.peerBaseUrl = `http://${peerHost}:${String(env.BOT_INTERNAL_PORT)}`;
 
-/** Health for Docker, and the surface siblings call in on. */
+/** Health for Docker, and the wedged-container check. */
 const internal = createInternalServer(client, env.BOT_INTERNAL_PORT);
 
 /** Signals that should trigger a graceful shutdown. */

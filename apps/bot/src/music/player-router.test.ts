@@ -1,5 +1,3 @@
-/* eslint-disable @typescript-eslint/unbound-method -- these are spies being
-   asserted on, never detached and called. */
 /**
  * Routing a guild's several rooms to the bots serving them.
  *
@@ -215,27 +213,24 @@ describe('leaveRoom', () => {
 });
 
 /* -------------------------------------------------------------------------- */
-/* Rooms in other containers                                                   */
+/* Rooms other containers hold                                                 */
 /*                                                                             */
-/* The split's whole point: a command arriving at one bot may be about a room  */
-/* another one is holding. What matters is that the router never pretends a    */
-/* remote room is local, and never joins a channel somebody is already in.     */
+/* Nothing calls across any more — the command router sends each interaction   */
+/* to the bot that should run it. What matters now is that a bot never joins a */
+/* channel somebody else is in, and never quietly joins one it was not given.  */
 /* -------------------------------------------------------------------------- */
 
 function fakePeers(options: {
-  owner?: { botId: string; baseUrl: string };
+  owner?: { botId: string };
   live?: readonly BotPresence[];
-  join?: ReturnType<typeof vi.fn>;
-}): PeerDirectory & { sendJoin: ReturnType<typeof vi.fn> } {
-  const sendJoin = options.join ?? vi.fn(() => Promise.resolve({ kind: 'joined' }));
+  claims?: ReadonlyMap<string, string>;
+}): PeerDirectory {
   return {
     selfBotId: 'main',
     ownerOf: () => Promise.resolve(options.owner),
     liveBots: () => Promise.resolve(options.live ?? []),
-    claimedRooms: () => Promise.resolve(new Map<string, string>()),
+    claimedRooms: () => Promise.resolve(options.claims ?? new Map<string, string>()),
     releaseClaim: vi.fn(),
-    sendJoin,
-    sendIntent: vi.fn(),
     announce: vi.fn(),
     announceSelf: vi.fn(),
     release: vi.fn(),
@@ -248,7 +243,6 @@ function presence(botId: string, rooms: BotPresence['rooms'] = []): BotPresence 
     botId,
     clientId: `app-${botId}`,
     role: botId === 'main' ? 'primary' : 'player',
-    baseUrl: `http://bot-${botId}:8080`,
     rooms,
   };
 }
@@ -259,49 +253,26 @@ const fleetOf = (...botIds: readonly string[]) => ({
 });
 
 describe('openRoom', () => {
-  it('reports a room another container holds without joining it', async () => {
-    const local = fakeBot('main');
-    const peers = fakePeers({ owner: { botId: 'player-2', baseUrl: 'http://bot-player-2:8080' } });
-    const router = new PlayerRouter([local], { peers, fleet: fleetOf('main', 'player-2') });
-
-    const handle = await router.openRoom(join('room-a'));
-
-    expect(handle).toMatchObject({ botId: 'player-2', local: undefined });
-    // Nobody was asked to join: somebody is already in that channel.
-    expect(peers.sendJoin).not.toHaveBeenCalled();
-  });
-
-  it('hands the room to a free container when this one is busy', async () => {
-    const local = fakeBot('main', { player: { voiceChannelId: 'room-a' } });
-    const peers = fakePeers({ live: [presence('main'), presence('player-2')] });
-    const router = new PlayerRouter([local], { peers, fleet: fleetOf('main', 'player-2') });
-
-    const handle = await router.openRoom(join('room-b'));
-
-    expect(peers.sendJoin).toHaveBeenCalledWith(
-      'http://bot-player-2:8080',
-      expect.objectContaining({ voiceChannelId: 'room-b' }),
-    );
-    expect(handle).toMatchObject({ botId: 'player-2', local: undefined });
-  });
-
-  it('refuses when the chosen container turns out to be busy after all', async () => {
-    // The picture was a moment out of date. Better a plain "try again" than a
-    // retry into the same race.
-    const peers = fakePeers({
-      live: [presence('main'), presence('player-2')],
-      join: vi.fn(() => Promise.resolve({ kind: 'busy', voiceChannelId: 'room-z' })),
-    });
-    const router = new PlayerRouter([fakeBot('main', { player: { voiceChannelId: 'room-a' } })], {
+  it('leaves a room somebody else holds alone', async () => {
+    const peers = fakePeers({ owner: { botId: 'player-2' } });
+    const router = new PlayerRouter([fakeBot('main')], {
       peers,
       fleet: fleetOf('main', 'player-2'),
     });
 
-    await expect(router.openRoom(join('room-b'))).rejects.toThrow(/just been taken/iu);
+    const handle = await router.openRoom(join('room-a'));
+
+    // Named, not joined: two bots in one channel is the failure this prevents.
+    expect(handle).toMatchObject({ botId: 'player-2', local: undefined });
   });
 
-  it('keeps the room here when this container is the one allocated', async () => {
-    const peers = fakePeers({ live: [presence('main'), presence('player-2')] });
+  it('joins when the router reserved this bot for the room', async () => {
+    // The reservation arrives as a claim on ourselves, which is how the bot
+    // learns it was chosen — there is no separate "you were picked" message.
+    const peers = fakePeers({
+      live: [presence('main'), presence('player-2')],
+      claims: new Map([['main', 'room-a']]),
+    });
     const router = new PlayerRouter([fakeBot('main')], {
       peers,
       fleet: fleetOf('main', 'player-2'),
@@ -310,27 +281,19 @@ describe('openRoom', () => {
     const handle = await router.openRoom(join('room-a'));
 
     expect(handle.local?.player.voiceChannelId).toBe('room-a');
-    expect(peers.sendJoin).not.toHaveBeenCalled();
-  });
-});
-
-describe('joinLocal', () => {
-  it('takes the room it is told to take', async () => {
-    const router = new PlayerRouter([fakeBot('player-2')]);
-
-    await expect(router.joinLocal(join('room-a'))).resolves.toEqual({ kind: 'joined' });
   });
 
-  it('refuses a second channel in the same server', async () => {
-    // One token holds one voice connection per guild, so this is a refusal
-    // rather than a move — abandoning the first channel would be worse.
-    const router = new PlayerRouter([
-      fakeBot('player-2', { player: { voiceChannelId: 'room-a' } }),
-    ]);
-
-    await expect(router.joinLocal(join('room-b'))).resolves.toEqual({
-      kind: 'busy',
-      voiceChannelId: 'room-a',
+  it('refuses rather than joining a room allocated to another bot', async () => {
+    // Should not happen — the router routes to the bot it picked. Reaching here
+    // means the picture moved underneath, and there is deliberately nothing to
+    // fall back on: forwarding is the mechanism this design removed, and
+    // joining anyway would put two bots in one channel.
+    const peers = fakePeers({ live: [presence('main'), presence('player-2')] });
+    const router = new PlayerRouter([fakeBot('main', { player: { voiceChannelId: 'room-a' } })], {
+      peers,
+      fleet: fleetOf('main', 'player-2'),
     });
+
+    await expect(router.openRoom(join('room-b'))).rejects.toThrow(/should be handling/iu);
   });
 });

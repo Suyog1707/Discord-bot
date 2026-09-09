@@ -15,7 +15,6 @@ function present(botId: string, rooms: BotPresence['rooms'] = []): BotPresence {
     botId,
     clientId: `app-${botId === 'main' ? 'main' : botId.slice(-1)}`,
     role: botId === 'main' ? 'primary' : 'player',
-    baseUrl: `http://bot-${botId}:8080`,
     rooms,
   };
 }
@@ -115,7 +114,7 @@ describe('buildFleet', () => {
     expect(view.members[0]?.claimedFor).toBe('room-a');
   });
 
-  it('gives an address for every live player', () => {
+  it('knows the application id of a player that is not running', () => {
     const view = buildFleet({
       roster: ROSTER,
       invited: new Set(),
@@ -124,7 +123,6 @@ describe('buildFleet', () => {
       guildId: GUILD,
     });
 
-    expect(view.addresses.get('player-2')).toBe('http://bot-player-2:8080');
     // Application ids come from the roster, so an invite can be offered for a
     // player that is not running.
     expect(view.clientIds.get('player-3')).toBe('app-3');

@@ -189,9 +189,3 @@ export type IntentResult =
 export function encodeIntent(intent: RoomIntent): string {
   return JSON.stringify(intent);
 }
-
-/** Parse and validate an incoming intent; null when malformed. */
-export function decodeIntent(raw: unknown): RoomIntent | null {
-  const result = roomIntentSchema.safeParse(raw);
-  return result.success ? result.data : null;
-}

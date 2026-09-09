@@ -203,22 +203,15 @@ export class PlayerRouter {
   /**
    * Run an intent against a room, wherever it lives.
    *
-   * The only thing a caller needs to know is the room. Whether that means a
-   * method call on a player in this process or an HTTP request to a sibling is
-   * this method's business — and the local path is the same code the sibling
-   * would run, so there is one implementation, not two.
+   * Always local now. The command router sends each interaction to the bot
+   * that owns the room, so by the time a command runs, the room it is about is
+   * here — and a room that is not is one nothing in this process can act on.
    */
   async runIntent(intent: RoomIntent): Promise<IntentResult> {
     const local = this.roomFor(intent.guildId, intent.voiceChannelId);
     if (local !== undefined) return applyIntent(local, intent);
 
-    const owner = await this.#peers?.ownerOf(intent.guildId, intent.voiceChannelId);
-    if (owner === undefined || owner.botId === this.#peers?.selfBotId) {
-      // Nobody owns it, or the only claim is a stale one of our own — either
-      // way there is no player here to act on.
-      return { kind: 'error', message: 'Nothing is playing in that channel.' };
-    }
-    return this.#peers?.sendIntent(owner, intent) ?? { kind: 'error', message: 'No player.' };
+    return { kind: 'error', message: 'Nothing is playing in that channel.' };
   }
 
   /**
@@ -309,31 +302,6 @@ export class PlayerRouter {
   }
 
   /**
-   * Take a room with this container's own bot, allocation already decided.
-   *
-   * What `POST /join` calls. The primary has picked this player, so there is
-   * nothing left to choose — but the refusal below still matters: one token
-   * holds one voice connection per server, so a player already in another
-   * channel of this guild must say so rather than abandon that channel.
-   */
-  async joinLocal(
-    options: JoinOptions,
-  ): Promise<
-    { readonly kind: 'joined' } | { readonly kind: 'busy'; readonly voiceChannelId: string }
-  > {
-    const [bot] = this.#bots;
-    if (bot === undefined) throw new ValidationError('This player has no audio server.');
-
-    const player = bot.music.getPlayer(options.guildId);
-    if (player !== undefined && player.voiceChannelId !== options.voiceChannelId) {
-      return { kind: 'busy', voiceChannelId: player.voiceChannelId };
-    }
-
-    await bot.music.getOrCreatePlayer(options);
-    return { kind: 'joined' };
-  }
-
-  /**
    * Pick a bot for a room and reserve it, one guild at a time.
    *
    * Deciding now needs three reads — the roster, the guild's invitations and
@@ -399,7 +367,7 @@ export class PlayerRouter {
 
   /** Choose a bot for a room nobody is serving, and put it there. */
   async #allocateRoom(options: JoinOptions): Promise<RoomHandle> {
-    const { allocation, view } = await this.#claimBot(options);
+    const { allocation } = await this.#claimBot(options);
 
     try {
       if (allocation.kind === 'reclaim') {
@@ -430,37 +398,23 @@ export class PlayerRouter {
         };
       }
 
-      const baseUrl = view.addresses.get(allocation.botId);
-      const peers = this.#peers;
-      if (baseUrl === undefined || peers === undefined) {
-        throw new ValidationError('No player is available right now. Try again shortly.');
-      }
-
-      const outcome = await peers.sendJoin(baseUrl, options);
-      if (outcome.kind === 'error') throw new ValidationError(outcome.message);
-      if (outcome.kind === 'busy') {
-        // The picture was a moment out of date. Say so plainly rather than
-        // retrying into the same race.
-        throw new ValidationError(
-          `**${allocation.botId}** has just been taken for <#${outcome.voiceChannelId}>. ` +
-            'Try again in a moment.',
-        );
-      }
-
-      logger.info(
-        {
-          guildId: options.guildId,
-          voiceChannelId: options.voiceChannelId,
-          botId: allocation.botId,
-        },
-        'Room handed to another container',
+      /**
+       * The router chose somebody else.
+       *
+       * That should not happen: it routes an interaction to the bot it picked,
+       * and its reservation reaches this container as a claim on itself, so
+       * `allocateBot` answers `existing`. Reaching here means the picture moved
+       * underneath — a stale owner claim, or a bot that dropped out between the
+       * decision and the command arriving.
+       *
+       * There is deliberately nothing to fall back on. Forwarding to the winner
+       * over HTTP is the mechanism this design removed, and joining anyway
+       * would put two bots in one channel. Say so and let the caller retry.
+       */
+      throw new ValidationError(
+        `**${allocation.botId}** should be handling that channel, not this bot. ` +
+          'Try again in a moment.',
       );
-      return {
-        botId: allocation.botId,
-        guildId: options.guildId,
-        voiceChannelId: options.voiceChannelId,
-        local: undefined,
-      };
     } finally {
       this.#claims.delete(allocation.botId);
     }
@@ -536,7 +490,6 @@ export class PlayerRouter {
         botId: bot.botId,
         clientId: bot.clientId,
         role: presence.find((entry) => entry.botId === bot.botId)?.role ?? 'primary',
-        baseUrl: presence.find((entry) => entry.botId === bot.botId)?.baseUrl ?? '',
         rooms: bot.music.rooms,
       })),
     ];
@@ -564,7 +517,6 @@ export class PlayerRouter {
 
     return {
       members,
-      addresses: new Map(),
       clientIds: new Map(this.#bots.map((bot) => [bot.botId, bot.clientId])),
       // This container is the whole fleet, so "not invited" means one of its
       // own bots is not in this guild.

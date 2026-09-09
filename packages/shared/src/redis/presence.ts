@@ -28,13 +28,11 @@ export function parseBotPresence(payload: string): BotPresence | undefined {
     const parsed = JSON.parse(payload) as Partial<BotPresence>;
     if (typeof parsed.botId !== 'string' || parsed.botId === '') return undefined;
     if (typeof parsed.clientId !== 'string' || parsed.clientId === '') return undefined;
-    if (typeof parsed.baseUrl !== 'string') return undefined;
 
     return {
       botId: parsed.botId,
       clientId: parsed.clientId,
       role: parsed.role === 'player' ? 'player' : 'primary',
-      baseUrl: parsed.baseUrl,
       rooms: Array.isArray(parsed.rooms) ? (parsed.rooms as readonly RoomState[]) : [],
       // Absent on an entry written before the field existed. Left absent rather
       // than defaulted, so freshness stays a fact the writer stated.
