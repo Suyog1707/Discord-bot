@@ -20,7 +20,7 @@ import {
   playerRoomOwnerKey,
   type BotPresence,
 } from '@discord-music/shared';
-import type { Redis } from '@discord-music/shared/redis';
+import { readLiveBots, type Redis } from '@discord-music/shared/redis';
 
 import { getLogger } from '../lib/logger.js';
 
@@ -28,26 +28,6 @@ import type { IntentResult, RoomIntent } from './intent.js';
 import type { JoinOptions } from './music-manager.js';
 
 const logger = getLogger('peers');
-
-function parsePresence(payload: string): BotPresence | undefined {
-  try {
-    const parsed = JSON.parse(payload) as Partial<BotPresence>;
-    if (typeof parsed.botId !== 'string' || typeof parsed.baseUrl !== 'string') return undefined;
-    if (typeof parsed.clientId !== 'string') return undefined;
-    return {
-      botId: parsed.botId,
-      clientId: parsed.clientId,
-      role: parsed.role === 'player' ? 'player' : 'primary',
-      baseUrl: parsed.baseUrl,
-      rooms: Array.isArray(parsed.rooms) ? parsed.rooms : [],
-      // Absent on an entry written before the field existed. Left absent rather
-      // than defaulted, so freshness stays a fact the writer stated.
-      ...(typeof parsed.sentAt === 'number' ? { sentAt: parsed.sentAt } : {}),
-    };
-  } catch {
-    return undefined;
-  }
-}
 
 /** Who owns a room, and where to reach them. */
 export interface RoomOwner {
@@ -135,26 +115,7 @@ export class PeerDirectory {
     const redis = this.#redis;
     if (redis === undefined) return [];
     try {
-      const ids = await redis.smembers(playerBotIndexKey());
-      if (ids.length === 0) return [];
-
-      const raw = await redis.mget(...ids.map((id) => playerBotKey(id)));
-      const live: BotPresence[] = [];
-      const gone: string[] = [];
-
-      ids.forEach((id, index) => {
-        const payload = raw[index];
-        if (payload == null) {
-          gone.push(id);
-          return;
-        }
-        const parsed = parsePresence(payload);
-        if (parsed === undefined) gone.push(id);
-        else live.push(parsed);
-      });
-
-      if (gone.length > 0) redis.srem(playerBotIndexKey(), ...gone).catch(() => 0);
-      return live;
+      return await readLiveBots(redis);
     } catch (error) {
       logger.debug({ err: error }, 'Fleet presence lookup failed');
       return [];

@@ -14,7 +14,7 @@
 import { botInviteUrl } from '../discord/index.js';
 
 import type { Allocation } from './bot-allocation.js';
-import { nextUninvited, type FleetView } from './index.js';
+import type { FleetView } from './index.js';
 
 /** An allocation that named no bot — the only kind with anything to say. */
 export type RefusedAllocation = Extract<Allocation, { readonly kind: 'invite' | 'full' }>;
@@ -32,7 +32,7 @@ export function describeAllocation(
   guildId: string,
 ): string {
   if (allocation.kind === 'invite') {
-    const next = nextUninvited(rosterOf(view), invitedOf(view));
+    const [next] = view.uninvited;
     if (next === undefined) {
       // `invite` said one existed, so the view changed underneath us. Say the
       // true thing rather than offering a link to nobody.
@@ -58,18 +58,4 @@ export function describeAllocation(
     ? 'No player is available right now. Try again shortly.'
     : `Every player is already busy — currently in ${busy}. Wait for one to finish, ` +
         'or join one of those channels.';
-}
-
-/** The roster, back out of the view that was built from it. */
-function rosterOf(view: FleetView): readonly { botId: string; clientId: string }[] {
-  return [...view.clientIds].map(([botId, clientId]) => ({ botId, clientId }));
-}
-
-/** Application ids of the players already in this guild. */
-function invitedOf(view: FleetView): ReadonlySet<string> {
-  return new Set(
-    view.members
-      .filter((member) => member.inGuild)
-      .map((member) => view.clientIds.get(member.botId) ?? member.botId),
-  );
 }

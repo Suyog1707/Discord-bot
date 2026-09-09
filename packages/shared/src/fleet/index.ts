@@ -67,6 +67,22 @@ export interface FleetView {
   readonly addresses: ReadonlyMap<string, string>;
   /** Application ids, so an invite can be offered for a player by name. */
   readonly clientIds: ReadonlyMap<string, string>;
+  /**
+   * Players this guild has not added, in roster order.
+   *
+   * Computed here because this is the one place that holds both the roster and
+   * the guild's invitations. Callers that reconstructed it from `members` and
+   * `clientIds` were rebuilding a fact this function already knew, and getting
+   * it subtly wrong when a player was in the roster but not running.
+   */
+  readonly uninvited: readonly RosterEntry[];
+  /**
+   * The primary, when it is running and in this guild.
+   *
+   * Which identity is primary is a fact each container states about itself, so
+   * it belongs here rather than being guessed from a label.
+   */
+  readonly primaryBotId: string | undefined;
 }
 
 export interface BuildFleetInput {
@@ -121,14 +137,20 @@ export function buildFleet(input: BuildFleetInput): FleetView {
   const addresses = new Map<string, string>();
   const clientIds = new Map<string, string>();
   const members: FleetMember[] = [];
+  const uninvited: RosterEntry[] = [];
+  let primaryBotId: string | undefined;
 
   for (const entry of input.roster) {
     clientIds.set(entry.botId, entry.clientId);
+    if (!input.invited.has(entry.clientId)) uninvited.push(entry);
 
     const live = byId.get(entry.botId);
     if (live === undefined) continue;
     if (isStale(live, input)) continue;
     addresses.set(entry.botId, live.baseUrl);
+    if (live.role === 'primary' && input.invited.has(entry.clientId)) {
+      primaryBotId = entry.botId;
+    }
 
     // One token holds one voice connection per server, so a player serves at
     // most one room in this guild — finding a second would mean Discord had
@@ -151,20 +173,5 @@ export function buildFleet(input: BuildFleetInput): FleetView {
     });
   }
 
-  return { members, addresses, clientIds };
-}
-
-/**
- * The next player this guild could add, or undefined when it has them all.
- *
- * Read off the roster rather than off presence: an invite for a player that
- * happens to be restarting is still a valid invite, and the alternative —
- * telling a server it cannot add anything because a container is down — would
- * be wrong for as long as the restart takes.
- */
-export function nextUninvited(
-  roster: readonly RosterEntry[],
-  invited: ReadonlySet<string>,
-): RosterEntry | undefined {
-  return roster.find((entry) => !invited.has(entry.clientId));
+  return { members, addresses, clientIds, uninvited, primaryBotId };
 }

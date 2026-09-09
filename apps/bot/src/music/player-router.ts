@@ -15,7 +15,6 @@ import {
   describeAllocation,
   PLAYER_BOT_STALE_MS,
   buildFleet,
-  nextUninvited,
   ValidationError,
   type BotAllocation,
   type BotPresence,
@@ -376,7 +375,7 @@ export class PlayerRouter {
         fleet: view.members,
         now: Date.now(),
         reclaimGraceMs: this.#reclaimGraceMs,
-        hasUninvitedPlayers: this.#nextUninvited(view) !== undefined,
+        hasUninvitedPlayers: view.uninvited.length > 0,
       });
 
       // Nothing available. Whether that is fixable by the user — "add another
@@ -558,19 +557,12 @@ export class PlayerRouter {
       members,
       addresses: new Map(),
       clientIds: new Map(this.#bots.map((bot) => [bot.botId, bot.clientId])),
+      // This container is the whole fleet, so "not invited" means one of its
+      // own bots is not in this guild.
+      uninvited: this.#bots
+        .filter((bot) => !bot.isInGuild(guildId))
+        .map((bot) => ({ botId: bot.botId, clientId: bot.clientId })),
+      primaryBotId: this.#bots.find((bot) => bot.isInGuild(guildId))?.botId,
     };
-  }
-
-  /** The next player this guild has not added, in fleet order. */
-  #nextUninvited(view: FleetView): RosterEntry | undefined {
-    const roster = [...view.clientIds].map(([botId, clientId]) => ({ botId, clientId }));
-    const invited = new Set(
-      view.members
-        .filter((member) => member.inGuild)
-        .map((member) => {
-          return view.clientIds.get(member.botId) ?? member.botId;
-        }),
-    );
-    return nextUninvited(roster, invited);
   }
 }

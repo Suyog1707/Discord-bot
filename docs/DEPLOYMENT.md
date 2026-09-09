@@ -29,6 +29,24 @@ Targets: Web → Vercel · Bot + Lavalink → VPS · PostgreSQL → managed · R
    generates the client and falls back to `DATABASE_URL` without it.
    Add the production callback URL in the Discord developer portal:
    `https://<domain>/api/auth/callback/discord`.
+
+   The web app also hosts the **command router** — Discord posts every slash
+   command to `POST /api/discord/interactions` rather than sending it down a
+   bot's gateway connection — so it needs two variables that used to belong
+   only to the bot:
+
+   - `BOT_PUBLIC_KEY` — the command application's public key. Without it the
+     route refuses to serve at all (503), because an endpoint that cannot check
+     signatures is one anybody can drive.
+   - `BOT_TOKEN` — used for exactly one call, asking Discord which voice
+     channel the caller is standing in. The interaction payload does not carry
+     it and there is no other way to find out. This is a real widening of what
+     a Vercel compromise would reach; see docs/SECURITY.md.
+
+   Turn on **Fluid compute** for the project. Autocomplete is the one path with
+   no deferral to hide behind — it must answer inside three seconds — and cold
+   starts are what threaten it.
+
 4. **Lavalink (VPS)** — run `docker/lavalink/application.yml` with a strong
    `LAVALINK_PASSWORD`; keep port 2333 firewalled to the bot host only. Deploy
    the `yt-cipher` sidecar alongside it (it is in `docker/docker-compose.yml`)

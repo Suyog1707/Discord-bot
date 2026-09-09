@@ -150,6 +150,45 @@ export const webEnvSchema = requireInProduction(
       SPOTIFY_CLIENT_ID: optional(z.string().min(1)),
       SPOTIFY_CLIENT_SECRET: optional(z.string().min(1)),
       SPOTIFY_REDIRECT_URI: optional(z.url()),
+
+      /* ---------------------------------------------------------------- */
+      /* The command router                                                */
+      /*                                                                   */
+      /* Discord posts every interaction to this app rather than down the  */
+      /* bot's gateway connection, so the dashboard now holds two          */
+      /* credentials that used to belong only to the bot.                  */
+      /* ---------------------------------------------------------------- */
+
+      /**
+       * The command application's public key, for checking Discord's
+       * signature on every request.
+       *
+       * Without it anybody who finds the endpoint could make the bot say
+       * anything, so the route refuses to serve at all when it is unset —
+       * optional here only because the dashboard runs perfectly well without
+       * the router while it is being brought up.
+       */
+      BOT_PUBLIC_KEY: optional(z.string().min(1)),
+      /**
+       * A bot token, used for exactly one call: asking Discord which voice
+       * channel the caller is standing in.
+       *
+       * The interaction payload does not carry it and there is no other way to
+       * find out, so routing needs a token from a bot that is in the guild.
+       * This is a real widening of what a Vercel compromise would reach — see
+       * docs/SECURITY.md — and the reason it is only ever used for that one
+       * read.
+       */
+      BOT_TOKEN: optional(z.string().min(1)),
+      /**
+       * How long a room must sit empty before another channel may take its
+       * player.
+       *
+       * Duplicated from the bot's own setting for as long as both allocate.
+       * Once the router is the only allocator the bot's copy goes away; until
+       * then the two should be set to the same value.
+       */
+      ROOM_RECLAIM_GRACE_MS: z.coerce.number().int().min(0).max(3_600_000).default(60_000),
     }),
   ['REDIS_URL'],
 );

@@ -13,6 +13,8 @@ function view(overrides: Partial<FleetView> = {}): FleetView {
       ['main', 'app-main'],
       ['player-2', 'app-2'],
     ]),
+    uninvited: [{ botId: 'player-2', clientId: 'app-2' }],
+    primaryBotId: 'main',
     ...overrides,
   };
 }
@@ -55,6 +57,7 @@ describe('describeAllocation', () => {
     // the true thing rather than pointing at nobody.
     const everyone = view({
       members: [busy('main', '2'), busy('player-2', '3')],
+      uninvited: [],
     });
 
     expect(describeAllocation({ kind: 'invite' }, everyone, GUILD)).toBe(

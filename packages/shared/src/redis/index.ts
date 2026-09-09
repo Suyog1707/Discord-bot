@@ -120,3 +120,5 @@ export async function closeRedis(client: Redis): Promise<void> {
     client.disconnect();
   }
 }
+
+export * from './presence.js';

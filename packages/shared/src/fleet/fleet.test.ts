@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildFleet, nextUninvited, type BotPresence, type RosterEntry } from './index.js';
+import { buildFleet, type BotPresence, type RosterEntry } from './index.js';
 
 const GUILD = 'guild-1';
 
@@ -185,18 +185,53 @@ describe('buildFleet staleness', () => {
   });
 });
 
-describe('nextUninvited', () => {
-  it('names the first player the guild has not added', () => {
-    expect(nextUninvited(ROSTER, new Set(['app-main']))?.botId).toBe('player-2');
+describe('uninvited', () => {
+  const uninvitedFor = (invited: readonly string[]) =>
+    buildFleet({
+      roster: ROSTER,
+      invited: new Set(invited),
+      presence: [present('main')],
+      claims: new Map(),
+      guildId: GUILD,
+    }).uninvited.map((entry) => entry.botId);
+
+  it('lists the players this guild has not added, in roster order', () => {
+    expect(uninvitedFor(['app-main'])).toEqual(['player-2', 'player-3']);
   });
 
-  it('names nobody when the guild has them all', () => {
-    expect(nextUninvited(ROSTER, new Set(['app-main', 'app-2', 'app-3']))).toBeUndefined();
+  it('is empty when the guild has them all', () => {
+    expect(uninvitedFor(['app-main', 'app-2', 'app-3'])).toEqual([]);
   });
 
-  it('offers a player that is not currently running', () => {
+  it('still lists a player that is not running', () => {
     // Read off the roster, not off presence: an invite for a container that
     // happens to be restarting is still a valid invite.
-    expect(nextUninvited(ROSTER, new Set(['app-main', 'app-2']))?.botId).toBe('player-3');
+    expect(uninvitedFor(['app-main', 'app-2'])).toEqual(['player-3']);
+  });
+});
+
+describe('primaryBotId', () => {
+  it('names the primary from what it says about itself, not from its label', () => {
+    const view = buildFleet({
+      roster: ROSTER,
+      invited: new Set(['app-main', 'app-2']),
+      presence: [present('main'), present('player-2')],
+      claims: new Map(),
+      guildId: GUILD,
+    });
+
+    expect(view.primaryBotId).toBe('main');
+  });
+
+  it('is undefined when the primary is not in this guild', () => {
+    const view = buildFleet({
+      roster: ROSTER,
+      invited: new Set(['app-2']),
+      presence: [present('main'), present('player-2')],
+      claims: new Map(),
+      guildId: GUILD,
+    });
+
+    expect(view.primaryBotId).toBeUndefined();
   });
 });
