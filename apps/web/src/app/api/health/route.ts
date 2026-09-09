@@ -11,7 +11,7 @@ import { pingDatabase } from '@discord-music/database';
 
 import { apiSuccess, withErrorHandling } from '@/lib/api';
 import { getDb } from '@/lib/db';
-import { isProduction } from '@/lib/env';
+import { getEnv, isProduction } from '@/lib/env';
 import { resolveHealth, type DependencyStatus, type HealthStatus } from '@/lib/health';
 import { getRedis } from '@/lib/redis';
 
@@ -26,6 +26,20 @@ interface HealthPayload {
   readonly dependencies: {
     readonly database: DependencyStatus;
     readonly redis: DependencyStatus;
+  };
+  /**
+   * Whether this deployment can serve slash commands.
+   *
+   * Booleans, never values. Both are easy to forget when promoting a
+   * deployment, and each fails in a way that looks like something else: with
+   * no public key every command is refused as a forgery, and with no bot token
+   * the router cannot ask Discord where the caller is standing, so `/play`
+   * tells people to join a voice channel they are already in. Neither says so
+   * out loud, which is why they are worth reporting.
+   */
+  readonly router: {
+    readonly signatureKey: boolean;
+    readonly botToken: boolean;
   };
 }
 
@@ -53,11 +67,16 @@ export const GET = withErrorHandling('GET /api/health', async () => {
 
   const { status, httpStatus } = resolveHealth(dependencies, isProduction());
 
+  const env = getEnv();
   const payload: HealthPayload = {
     status,
     uptimeSeconds: Math.round(process.uptime()),
     timestamp: new Date().toISOString(),
     dependencies,
+    router: {
+      signatureKey: env.BOT_PUBLIC_KEY !== undefined,
+      botToken: env.BOT_TOKEN !== undefined,
+    },
   };
 
   return apiSuccess(payload, {
