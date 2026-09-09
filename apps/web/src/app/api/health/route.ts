@@ -13,7 +13,7 @@ import { apiSuccess, withErrorHandling } from '@/lib/api';
 import { getDb } from '@/lib/db';
 import { getEnv, isProduction } from '@/lib/env';
 import { resolveHealth, type DependencyStatus, type HealthStatus } from '@/lib/health';
-import { getRedis } from '@/lib/redis';
+import { getReadyRedis, isRedisConfigured } from '@/lib/redis';
 
 // Always execute; a cached health check is worse than no health check.
 export const dynamic = 'force-dynamic';
@@ -44,12 +44,22 @@ interface HealthPayload {
 }
 
 async function checkRedis(): Promise<DependencyStatus> {
-  const redis = getRedis();
-  if (redis === undefined) return 'not_configured';
+  if (!isRedisConfigured()) return 'not_configured';
 
   try {
-    // A resolved PING is the signal; ioredis rejects if the socket is unusable.
-    await redis.ping();
+    /**
+     * Connect, then ping — not ping alone.
+     *
+     * The shared client is lazy, so on the first request an instance serves
+     * there is no socket yet and a bare ping fails on a perfectly healthy
+     * Redis. That made the probe report `unhealthy` with a 503 for the first
+     * few seconds of every cold start, which is exactly the sort of thing a
+     * monitor pages somebody about at three in the morning.
+     *
+     * `connectRedis` still throws when Redis is genuinely unreachable, so a
+     * real outage reports `down` as before.
+     */
+    await getReadyRedis();
     return 'up';
   } catch {
     return 'down';
