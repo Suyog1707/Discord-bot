@@ -22,9 +22,10 @@ import {
   type InteractionEnvelope,
 } from '@discord-music/shared';
 import { closeRedis, createRedisClient, type Redis } from '@discord-music/shared/redis';
-import type {
-  APIChatInputApplicationCommandInteraction,
-  APIMessageComponentInteraction,
+import {
+  Events,
+  type APIChatInputApplicationCommandInteraction,
+  type APIMessageComponentInteraction,
 } from 'discord.js';
 
 import { getLogger } from '../lib/logger.js';
@@ -190,11 +191,26 @@ export class InteractionSubscriber {
         this.#client,
         envelope.payload as unknown as APIMessageComponentInteraction,
       );
-      if (!isMusicComponent(component)) {
-        logger.warn({ customId: component.customId }, 'Routed an unrecognised component');
+      if (isMusicComponent(component)) {
+        await dispatchMusicComponent(this.#client, component, routedLogger);
         return;
       }
-      await dispatchMusicComponent(this.#client, component, routedLogger);
+
+      /**
+       * Anything else goes to the collectors.
+       *
+       * `/spotify playlists` holds its paging state in a closure behind a
+       * component collector, and a collector listens for this event on this
+       * client — so a routed click has to be put back into the same stream it
+       * would have arrived on. The gateway handler ignores these, so nothing
+       * handles it twice.
+       */
+      // Narrowed rather than cast: the event's type is the union of concrete
+      // interactions, and these two are the only kinds anything here builds.
+      if (component.isButton() || component.isStringSelectMenu()) {
+        this.#client.emit(Events.InteractionCreate, component);
+        routedLogger.debug({ customId: component.customId }, 'Routed component re-emitted');
+      }
       return;
     }
 

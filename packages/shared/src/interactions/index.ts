@@ -7,6 +7,7 @@
  * the envelope on the wire, and the decision itself.
  */
 export * from './claims.js';
+export * from './custom-id.js';
 export * from './deferral.js';
 export * from './envelope.js';
 export * from './route.js';

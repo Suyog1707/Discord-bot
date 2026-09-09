@@ -80,3 +80,38 @@ Targets: Web → Vercel · Bot + Lavalink → VPS · PostgreSQL → managed · R
   use the direct connection.
 - The bot refuses to boot in production if any dependency is unreachable —
   fix the dependency rather than downgrading NODE_ENV.
+
+## Switching commands to the router
+
+Discord delivers an application's interactions either down its gateway
+connection or to an HTTPS endpoint — never both. Setting the endpoint moves
+_all_ of them: commands, buttons and menus alike.
+
+Do it once, on the command application only. The player applications keep their
+gateways and are untouched.
+
+1. Confirm the router answers. Discord validates the URL by sending a PING and
+   a handful of deliberately-invalid signatures; it will refuse the URL unless
+   the bad ones come back 401.
+2. Developer portal → the command application → General Information →
+   **Interactions Endpoint URL** → `https://<domain>/api/discord/interactions`
+   → Save.
+3. Check a command in each server. Player containers should start logging
+   commands they have never seen before (`"routed": true`).
+4. Check a controller button, and `/spotify playlists` if Spotify tokens are
+   configured — those are the two paths that change shape, not just address.
+
+### Rolling back
+
+**Clear the Interactions Endpoint URL.** Commands resume over the gateway
+within seconds, with no deploy and no restart.
+
+That works because the gateway path is never removed: the bots still need it
+for voice, for guild events, and for the components of every message a _player_
+posts. Rehearse it once so it is a known move rather than a thing to work out
+under pressure.
+
+The failure it covers is real and worth naming: with the endpoint set, an
+outage of the web deployment takes down every slash command in every server.
+Before, the same was true of the primary bot container. The blast radius has
+not grown, but it has moved somewhere else, and this is the lever.

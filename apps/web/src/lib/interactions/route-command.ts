@@ -15,6 +15,7 @@ import 'server-only';
  */
 import {
   botClaimKey,
+  componentOwnerOf,
   CLAIM_TTL_MS,
   encodeInteractionEnvelope,
   interactionAckKey,
@@ -271,9 +272,24 @@ export async function routeComponent(payload: RawInteraction): Promise<void> {
     }
 
     const { fleet } = await readFleet(guildId, null);
-    const botId = [...fleet.clientIds].find(([, clientId]) => clientId === authorId)?.[0];
+
+    /**
+     * Two ways to know whose button this is.
+     *
+     * The controller is posted by the bot that owns the room, so the message's
+     * author names it. Anything a *command* posted cannot be identified that
+     * way — every command reply goes out under the command application, so
+     * they all look alike — and those components carry the bot's name in their
+     * own id instead. The tag wins where it exists.
+     */
+    const tagged = componentOwnerOf(customIdOf(payload) ?? '');
+    const botId =
+      tagged !== null && fleet.clientIds.has(tagged)
+        ? tagged
+        : [...fleet.clientIds].find(([, clientId]) => clientId === authorId)?.[0];
+
     if (botId === undefined) {
-      logger.warn({ authorId, guildId }, 'No bot in the roster posted that message');
+      logger.warn({ authorId, guildId }, 'Nothing in the roster owns that component');
       return;
     }
 

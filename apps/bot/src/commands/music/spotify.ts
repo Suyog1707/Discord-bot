@@ -7,7 +7,13 @@
  * streams from Spotify: tracks resolve through Lavalink search from
  * metadata, the same path as Spotify URLs in `/play`.
  */
-import { NotFoundError, toAppError, UpstreamError } from '@discord-music/shared';
+import {
+  baseCustomId,
+  NotFoundError,
+  toAppError,
+  UpstreamError,
+  withComponentOwner,
+} from '@discord-music/shared';
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -42,7 +48,7 @@ function clip(text: string, max = 100): string {
   return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
 }
 
-function pageView(items: readonly UserPlaylist[], page: number) {
+function pageView(items: readonly UserPlaylist[], page: number, botId: string) {
   const totalPages = Math.max(Math.ceil(items.length / PAGE_SIZE), 1);
   const slice = items.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
 
@@ -65,7 +71,7 @@ function pageView(items: readonly UserPlaylist[], page: number) {
     });
 
   const select = new StringSelectMenuBuilder()
-    .setCustomId('spl:select')
+    .setCustomId(withComponentOwner('spl:select', botId))
     .setPlaceholder('Choose a playlist…')
     .addOptions(
       slice.map((item) => ({
@@ -86,12 +92,12 @@ function pageView(items: readonly UserPlaylist[], page: number) {
     rows.push(
       new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(
         new ButtonBuilder()
-          .setCustomId('spl:prev')
+          .setCustomId(withComponentOwner('spl:prev', botId))
           .setEmoji('◀️')
           .setStyle(ButtonStyle.Secondary)
           .setDisabled(page === 0),
         new ButtonBuilder()
-          .setCustomId('spl:next')
+          .setCustomId(withComponentOwner('spl:next', botId))
           .setEmoji('▶️')
           .setStyle(ButtonStyle.Secondary)
           .setDisabled(page >= totalPages - 1),
@@ -101,7 +107,7 @@ function pageView(items: readonly UserPlaylist[], page: number) {
   return { embeds: [embed], components: rows };
 }
 
-function detailView(item: UserPlaylist) {
+function detailView(item: UserPlaylist, botId: string) {
   const embed = new EmbedBuilder()
     .setColor(EMBED_COLOR)
     .setTitle(item.name)
@@ -118,17 +124,26 @@ function detailView(item: UserPlaylist) {
   if (item.artworkUrl !== null) embed.setThumbnail(item.artworkUrl);
 
   const actions = new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(
-    new ButtonBuilder().setCustomId('spl:play').setLabel('Play now').setStyle(ButtonStyle.Success),
     new ButtonBuilder()
-      .setCustomId('spl:queue')
+      .setCustomId(withComponentOwner('spl:play', botId))
+      .setLabel('Play now')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(withComponentOwner('spl:queue', botId))
       .setLabel('Add to queue')
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
-      .setCustomId('spl:import')
+      .setCustomId(withComponentOwner('spl:import', botId))
       .setLabel('Import')
       .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('spl:sync').setLabel('Sync').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('spl:back').setLabel('Back').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(withComponentOwner('spl:sync', botId))
+      .setLabel('Sync')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(withComponentOwner('spl:back', botId))
+      .setLabel('Back')
+      .setStyle(ButtonStyle.Secondary),
   );
   return { embeds: [embed], components: [actions] };
 }
@@ -165,35 +180,45 @@ async function browsePlaylists(
     );
   }
 
+  /**
+   * Which bot is running this.
+   *
+   * The collector below holds the paging state in a closure, so every click
+   * has to come back to this process. Command replies all go out under the
+   * command application's name, so the message cannot say which bot that is —
+   * the buttons carry it instead.
+   */
+  const botId = client.identity.label;
+
   let page = 0;
   let selected: UserPlaylist | null = null;
-  const message = await interaction.editReply(pageView(items, page));
+  const message = await interaction.editReply(pageView(items, page, botId));
 
   const collector = message.createMessageComponentCollector({ time: BROWSE_TTL_MS });
 
   collector.on('collect', (component) => {
     void (async () => {
       try {
-        if (component.isStringSelectMenu() && component.customId === 'spl:select') {
+        if (component.isStringSelectMenu() && baseCustomId(component.customId) === 'spl:select') {
           const [value] = component.values;
           selected = items.find((item) => item.spotifyId === value) ?? null;
           if (selected === null) return;
-          await component.update(detailView(selected));
+          await component.update(detailView(selected, botId));
           return;
         }
         if (!component.isButton()) return;
 
-        switch (component.customId) {
+        switch (baseCustomId(component.customId)) {
           case 'spl:prev':
           case 'spl:next': {
             page += component.customId === 'spl:next' ? 1 : -1;
             page = Math.max(0, Math.min(page, Math.ceil(items.length / PAGE_SIZE) - 1));
-            await component.update(pageView(items, page));
+            await component.update(pageView(items, page, botId));
             return;
           }
           case 'spl:back':
             selected = null;
-            await component.update(pageView(items, page));
+            await component.update(pageView(items, page, botId));
             return;
           case 'spl:import':
           case 'spl:sync': {
