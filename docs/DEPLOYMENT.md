@@ -111,6 +111,17 @@ for voice, for guild events, and for the components of every message a _player_
 posts. Rehearse it once so it is a known move rather than a thing to work out
 under pressure.
 
+**What rolling back costs.** Commands come back, but single-room only. The
+layer that let one bot hand a channel to another was removed once the router
+had proved itself, so on the gateway path the main bot receives everything and
+has no way to pass a second channel to a sibling. A server already playing in
+two channels keeps both — nothing disconnects — but a _new_ second room cannot
+be started until the endpoint URL is restored.
+
+That is a deliberate trade: keeping a parallel hand-off mechanism alive forever,
+to insure against a switch that flips back in seconds, is a standing
+maintenance cost for a momentary one.
+
 The failure it covers is real and worth naming: with the endpoint set, an
 outage of the web deployment takes down every slash command in every server.
 Before, the same was true of the primary bot container. The blast radius has
