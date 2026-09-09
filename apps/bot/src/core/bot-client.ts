@@ -247,6 +247,22 @@ export class BotClient extends Client {
                 // Let the room go before anything else can be told to send
                 // commands into a container that is no longer in it.
                 void this.peers?.release(guildId, voiceChannelId).catch(() => undefined);
+                /**
+                 * And say so about ourselves, exactly as taking a room does.
+                 *
+                 * The presence entry is what allocation reads, and it carries
+                 * the rooms this container held when it was last written —
+                 * including `hasListeners: true`, because that snapshot was
+                 * taken while people were in the channel. Leaving it until the
+                 * next heartbeat means that for up to `BOT_HEARTBEAT_MS` a bot
+                 * that just disconnected still looks like it is playing to a
+                 * full room: not idle, and not reclaimable either. The next
+                 * `/play` is told every player is busy.
+                 *
+                 * The player is already out of `#players` by the time this
+                 * runs, so `music.rooms` is accurate here.
+                 */
+                this.#announceSelf();
                 return;
               }
               redis.set(key, payload, 'EX', PLAYER_STATE_TTL_SECONDS).catch(() => 0);

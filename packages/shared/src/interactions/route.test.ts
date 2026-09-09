@@ -80,6 +80,36 @@ describe('routeInteraction', () => {
       expect(decision).toMatchObject({ claims: false });
     });
 
+    it('ignores a claim the owner itself does not back up', () => {
+      /**
+       * The claim outlives the room — hours, not seconds — so it is routinely
+       * left pointing at a channel a bot has been kicked from or crashed out
+       * of. Trusting the name alone sends the command to somebody who will
+       * drop it while the caller watches a spinner.
+       *
+       * Here `main` is alive and idle but holds no room; the claim is a
+       * leftover and the channel is allocated like any other.
+       */
+      const decision = route({
+        ownerBotId: 'main',
+        fleet: fleet([idle('main'), idle('player-2')]),
+      });
+
+      expect(decision).toMatchObject({ kind: 'dispatch', reason: 'free', claims: true });
+    });
+
+    it('ignores a claim naming a bot that is busy somewhere else', () => {
+      // Same leftover, but the bot has since taken a different channel. Its own
+      // account of itself wins.
+      const decision = route({
+        voiceChannelId: ROOM_A,
+        ownerBotId: 'main',
+        fleet: fleet([busy('main', ROOM_B), idle('player-2')]),
+      });
+
+      expect(decision).toMatchObject({ botId: 'player-2', reason: 'free' });
+    });
+
     it('allocates afresh when the owner is no longer running', () => {
       // The owner claim expires on a timer, not on a crash, so a bot named
       // there but missing from the fleet is gone and the room is free.

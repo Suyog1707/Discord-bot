@@ -1,3 +1,5 @@
+/* eslint-disable @typescript-eslint/unbound-method -- these are spies being
+   asserted on, never detached and called. */
 /**
  * Routing a guild's several rooms to the bots serving them.
  *
@@ -224,13 +226,13 @@ function fakePeers(options: {
   owner?: { botId: string };
   live?: readonly BotPresence[];
   claims?: ReadonlyMap<string, string>;
-}): PeerDirectory {
+}): PeerDirectory & { releaseClaim: ReturnType<typeof vi.fn> } {
   return {
     selfBotId: 'main',
     ownerOf: () => Promise.resolve(options.owner),
     liveBots: () => Promise.resolve(options.live ?? []),
     claimedRooms: () => Promise.resolve(options.claims ?? new Map<string, string>()),
-    releaseClaim: vi.fn(),
+    releaseClaim: vi.fn(() => Promise.resolve()),
     announce: vi.fn(),
     announceSelf: vi.fn(),
     release: vi.fn(),
@@ -281,6 +283,21 @@ describe('openRoom', () => {
     const handle = await router.openRoom(join('room-a'));
 
     expect(handle.local?.player.voiceChannelId).toBe('room-a');
+  });
+
+  it('lets the reservation go however the join ends', async () => {
+    // It used to be released only by a *successful* join, so a failure left
+    // the bot looking promised to a channel it never reached — busy, for the
+    // full fifteen seconds of the claim's life.
+    const peers = fakePeers({ live: [presence('main'), presence('player-2')] });
+    const router = new PlayerRouter([fakeBot('main', { player: { voiceChannelId: 'room-a' } })], {
+      peers,
+      fleet: fleetOf('main', 'player-2'),
+    });
+
+    await expect(router.openRoom(join('room-b'))).rejects.toThrow();
+
+    expect(peers.releaseClaim).toHaveBeenCalledWith('player-2', GUILD, 'room-b');
   });
 
   it('refuses rather than joining a room allocated to another bot', async () => {

@@ -417,6 +417,23 @@ export class PlayerRouter {
       );
     } finally {
       this.#claims.delete(allocation.botId);
+      /**
+       * And the router's reservation, which until now only a *successful* join
+       * released — `releaseClaim` was reached solely from `#announceRoom`.
+       *
+       * So a join that failed left the reservation standing for its full TTL,
+       * and for those fifteen seconds allocation skipped that bot as promised
+       * to a channel it never reached. Every way a join can fail hit this:
+       * Lavalink down, a handover, the refusal above, or the caller simply
+       * leaving voice.
+       *
+       * Releasing on the way out covers both outcomes. On success the room has
+       * been announced and the reservation is already redundant; on failure it
+       * is exactly the thing that must not linger.
+       */
+      void this.#peers
+        ?.releaseClaim(allocation.botId, options.guildId, options.voiceChannelId)
+        .catch(() => undefined);
     }
   }
 

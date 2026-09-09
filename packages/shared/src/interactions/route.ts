@@ -55,14 +55,22 @@ export function routeInteraction(input: RouteInteractionInput): RoutingDecision 
   }
 
   /**
-   * The owner claim outlives the container that wrote it — it expires on a
-   * timer, not on a crash — so a bot named there but missing from the fleet is
-   * gone, and the room is free. Falling through to allocation is what lets a
-   * channel recover from a player that died without saying goodbye.
+   * The owner claim is a hint, checked against what the bot says about itself.
+   *
+   * It expires on a timer rather than on a crash, and it is written with a
+   * lifetime measured in hours — so it routinely outlives the room. A bot that
+   * was kicked from the guild, or died without saying goodbye, leaves its name
+   * on a channel it is no longer in, and trusting that alone sends commands to
+   * somebody who will drop them while the caller waits for a reply.
+   *
+   * Presence is the second opinion: it is republished on every room change and
+   * on a heartbeat, and it lists the rooms actually held. Agreement means the
+   * claim is live; disagreement means it is a leftover, and the room is free to
+   * allocate like any other.
    */
   if (input.ownerBotId !== null && voiceChannelId !== null) {
     const owner = fleet.members.find((member) => member.botId === input.ownerBotId);
-    if (owner !== undefined) {
+    if (owner?.serving?.voiceChannelId === voiceChannelId) {
       return {
         kind: 'dispatch',
         botId: owner.botId,
