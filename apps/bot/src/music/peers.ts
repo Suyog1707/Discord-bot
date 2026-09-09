@@ -18,12 +18,12 @@ import {
   playerBotIndexKey,
   playerBotKey,
   playerRoomOwnerKey,
+  type BotPresence,
 } from '@discord-music/shared';
 import type { Redis } from '@discord-music/shared/redis';
 
 import { getLogger } from '../lib/logger.js';
 
-import type { BotPresence } from './fleet.js';
 import type { IntentResult, RoomIntent } from './intent.js';
 import type { JoinOptions } from './music-manager.js';
 
@@ -40,6 +40,9 @@ function parsePresence(payload: string): BotPresence | undefined {
       role: parsed.role === 'player' ? 'player' : 'primary',
       baseUrl: parsed.baseUrl,
       rooms: Array.isArray(parsed.rooms) ? parsed.rooms : [],
+      // Absent on an entry written before the field existed. Left absent rather
+      // than defaulted, so freshness stays a fact the writer stated.
+      ...(typeof parsed.sentAt === 'number' ? { sentAt: parsed.sentAt } : {}),
     };
   } catch {
     return undefined;
@@ -102,9 +105,12 @@ export class PeerDirectory {
   async announceSelf(presence: BotPresence): Promise<void> {
     const redis = this.#redis;
     if (redis === undefined) return;
+    // Stamped here rather than by the caller: this is the write, so this is the
+    // only place that can promise the timestamp matches it.
+    const entry: BotPresence = { ...presence, sentAt: Date.now() };
     await Promise.all([
       redis
-        .set(playerBotKey(presence.botId), JSON.stringify(presence), 'EX', PLAYER_BOT_TTL_SECONDS)
+        .set(playerBotKey(entry.botId), JSON.stringify(entry), 'EX', PLAYER_BOT_TTL_SECONDS)
         .catch(() => undefined),
       // The index outlives the entries on purpose: it is the only way to find
       // them again, and a member whose entry has expired is simply skipped.

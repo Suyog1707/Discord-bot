@@ -10,19 +10,22 @@
  * Callers ask for a room and get a player. Which application is actually in
  * the channel is this module's business and nobody else's.
  */
-import { botInviteUrl, ValidationError } from '@discord-music/shared';
+import {
+  allocateBot,
+  describeAllocation,
+  PLAYER_BOT_STALE_MS,
+  buildFleet,
+  nextUninvited,
+  ValidationError,
+  type BotAllocation,
+  type BotPresence,
+  type FleetView,
+  type RosterEntry,
+} from '@discord-music/shared';
 
 import { getLogger } from '../lib/logger.js';
 
 import { applyIntent } from './apply-intent.js';
-import { allocateBot, type BotAllocation } from './bot-allocation.js';
-import {
-  buildFleet,
-  nextUninvited,
-  type BotPresence,
-  type FleetView,
-  type RosterEntry,
-} from './fleet.js';
 import type { GuildPlayer } from './guild-player.js';
 import type { IntentResult, RoomIntent } from './intent.js';
 import type { JoinOptions, MusicManager, RoomState } from './music-manager.js';
@@ -376,34 +379,12 @@ export class PlayerRouter {
         hasUninvitedPlayers: this.#nextUninvited(view) !== undefined,
       });
 
-      if (allocation.kind === 'invite') {
-        // Name the player and hand over the link. "All busy, sorry" is a dead
-        // end; "all busy, here is the one-click fix" is not, and this is the one
-        // moment the multi-bot design becomes visible to anybody.
-        const next = this.#nextUninvited(view);
-        throw new ValidationError(
-          next === undefined
-            ? 'Every player is busy in another channel right now. Try again shortly.'
-            : `Every player is busy in another channel. Add **${next.botId}** to this server and ` +
-                `it can play here too:\n${botInviteUrl({
-                  clientId: next.clientId,
-                  guildId: options.guildId,
-                  // A player registers no slash commands.
-                  withCommands: false,
-                })}`,
-        );
-      }
-      if (allocation.kind === 'full') {
-        const busy = view.members
-          .filter((member) => member.serving !== null)
-          .map((member) => `<#${String(member.serving?.voiceChannelId)}>`)
-          .join(', ');
-        throw new ValidationError(
-          busy === ''
-            ? 'No player is available right now. Try again shortly.'
-            : `Every player is already busy — currently in ${busy}. Wait for one to finish, ` +
-                'or join one of those channels.',
-        );
+      // Nothing available. Whether that is fixable by the user — "add another
+      // bot, here is the link" — is the difference between a useful message and
+      // a dead end, and the wording lives beside the decision so it cannot be
+      // lost when the router starts making that decision instead.
+      if (allocation.kind === 'invite' || allocation.kind === 'full') {
+        throw new ValidationError(describeAllocation(allocation, view, options.guildId));
       }
 
       this.#claims.set(allocation.botId, options.voiceChannelId);
@@ -525,6 +506,8 @@ export class PlayerRouter {
       presence: this.#withOwnRooms(presence),
       claims: this.#claims,
       guildId,
+      now: Date.now(),
+      staleAfterMs: PLAYER_BOT_STALE_MS,
     });
   }
 

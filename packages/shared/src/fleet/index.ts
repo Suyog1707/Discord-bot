@@ -21,7 +21,11 @@
  * dead, two idle" is a table in a test rather than a scenario to reproduce.
  */
 import type { FleetMember } from './bot-allocation.js';
-import type { RoomState } from './music-manager.js';
+import type { RoomState } from './room-state.js';
+
+export * from './bot-allocation.js';
+export * from './describe-allocation.js';
+export * from './room-state.js';
 
 /** One container's own account of itself, as written to Redis. */
 export interface BotPresence {
@@ -33,6 +37,21 @@ export interface BotPresence {
   readonly baseUrl: string;
   /** Every room this container is serving, in every guild. */
   readonly rooms: readonly RoomState[];
+  /**
+   * Epoch ms this entry was written.
+   *
+   * The Redis key's own expiry is deliberately generous, so that one slow
+   * write or a brief hiccup does not make a healthy player vanish. That
+   * generosity is wrong for allocation, which wants a much fresher answer: a
+   * bot that stopped answering a minute ago should not be handed a new room and
+   * leave somebody looking at a spinner. Reading the age here lets the two use
+   * different thresholds without the key needing two lifetimes.
+   *
+   * Optional because an entry written by a container that predates this field
+   * is still a live container — it is treated as fresh rather than dropped, so
+   * a rolling deploy does not empty the fleet.
+   */
+  readonly sentAt?: number;
 }
 
 /** One identity as the roster records it, whether or not it is running. */
@@ -66,6 +85,14 @@ export interface BuildFleetInput {
   /** Rooms promised but not yet joined, as `botId → voiceChannelId`. */
   readonly claims: ReadonlyMap<string, string>;
   readonly guildId: string;
+  /**
+   * How old a presence entry may be and still be allocatable, with `now` to
+   * measure it against. Omit either to accept every entry the caller found,
+   * which is what a reader that only wants the picture — rather than to hand
+   * out a room — should do.
+   */
+  readonly now?: number;
+  readonly staleAfterMs?: number;
 }
 
 /**
@@ -75,6 +102,20 @@ export interface BuildFleetInput {
  * as idle: offering a room to a container that is not running would strand the
  * request, and "every player is busy" is a better answer than silence.
  */
+/**
+ * Whether a presence entry is too old to be given a room.
+ *
+ * An entry with no timestamp came from a container that predates the field and
+ * is treated as fresh — dropping it would empty the fleet halfway through a
+ * rolling deploy, which is a worse failure than the one this guards against.
+ */
+function isStale(entry: BotPresence, input: BuildFleetInput): boolean {
+  const { now, staleAfterMs } = input;
+  if (now === undefined || staleAfterMs === undefined) return false;
+  if (entry.sentAt === undefined) return false;
+  return now - entry.sentAt > staleAfterMs;
+}
+
 export function buildFleet(input: BuildFleetInput): FleetView {
   const byId = new Map(input.presence.map((entry) => [entry.botId, entry]));
   const addresses = new Map<string, string>();
@@ -86,6 +127,7 @@ export function buildFleet(input: BuildFleetInput): FleetView {
 
     const live = byId.get(entry.botId);
     if (live === undefined) continue;
+    if (isStale(live, input)) continue;
     addresses.set(entry.botId, live.baseUrl);
 
     // One token holds one voice connection per server, so a player serves at

@@ -10,7 +10,7 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 
-import type { BotPresence } from './fleet.js';
+import type { BotPresence } from '@discord-music/shared';
 import type { PeerDirectory } from './peers.js';
 import { PlayerRouter, type RouterBot } from './player-router.js';
 

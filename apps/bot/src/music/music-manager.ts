@@ -16,6 +16,7 @@ import {
   type MusicSource,
   type PlayerEventType,
   type PlayerSnapshot,
+  type RoomState,
 } from '@discord-music/shared';
 import type { Client } from 'discord.js';
 import {
@@ -255,16 +256,16 @@ function canonicalFromSpotify(meta: SpotifyTrackMeta): CanonicalTrack {
   });
 }
 
-/** One room a bot is serving, in a shape that can cross a process boundary. */
-export interface RoomState {
-  readonly guildId: string;
-  readonly voiceChannelId: string;
-  readonly isPlaying: boolean;
-  readonly hasListeners: boolean;
-  readonly stayConnected: boolean;
-  /** Epoch ms since the room emptied, or null while it has listeners. */
-  readonly emptySince: number | null;
-}
+/**
+ * Re-exported, not defined here.
+ *
+ * `RoomState` is a wire type — it is what a container publishes about itself,
+ * and what the command router reads to decide who takes a channel — so it lives
+ * in `@discord-music/shared` beside the allocation that consumes it. It is
+ * re-exported here because this is where a room's state is produced, and that
+ * is the import every bot-side caller reaches for.
+ */
+export type { RoomState };
 
 export interface JoinOptions {
   readonly guildId: string;

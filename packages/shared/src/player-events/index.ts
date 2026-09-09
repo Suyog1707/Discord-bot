@@ -197,6 +197,20 @@ export function playerBotIndexKey(): string {
 export const PLAYER_BOT_TTL_SECONDS = 90;
 
 /**
+ * How old a presence entry may be and still be handed a new room.
+ *
+ * Deliberately much shorter than the TTL above, and for the opposite reason.
+ * The TTL is generous so a healthy player does not vanish from the fleet over
+ * one slow write; this is tight so a player that stopped answering a minute
+ * ago is not given a channel it will never join, leaving somebody watching a
+ * spinner until the interaction expires.
+ *
+ * A constant rather than a setting because the router and the bots must agree
+ * on it exactly, and two environment variables cannot promise that.
+ */
+export const PLAYER_BOT_STALE_MS = 45_000;
+
+/**
  * Expiry for the retained snapshot.
  *
  * Disconnects delete the key outright, so this TTL is not the normal cleanup

@@ -51,6 +51,28 @@ async function main(): Promise<void> {
   const clear = process.argv.includes('--clear');
   const devGuildId = env.BOT_DEV_GUILD_ID;
 
+  /**
+   * Only one application may own the commands.
+   *
+   * Discord lists a command once per application that registered it, so
+   * deploying to a second one puts a second `/play` in the picker with no way
+   * for anybody to tell which bot each belongs to. Players are headless by
+   * design — they load no command modules at runtime — but this script reads
+   * whatever credentials are in scope, so running it from a player's
+   * environment, or with a player's token pasted into `.env`, is all it takes.
+   *
+   * `--clear` is allowed through: removing commands from an application that
+   * should not have had them is exactly the repair for having done this once.
+   */
+  if (env.BOT_ROLE !== 'primary' && !clear) {
+    throw new ConfigurationError(
+      `Refusing to deploy commands as "${env.BOT_LABEL}" (BOT_ROLE=${env.BOT_ROLE}). ` +
+        'Only the primary application registers commands — a second one would put a ' +
+        "duplicate of every command in the picker. Deploy with the primary's " +
+        'BOT_TOKEN and BOT_CLIENT_ID, or pass --clear to remove commands from this one.',
+    );
+  }
+
   const registry = new CommandRegistry();
   if (!clear) {
     await registry.loadFrom(join(moduleDirectory, '..', 'commands'));

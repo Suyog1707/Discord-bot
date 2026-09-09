@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildFleet, nextUninvited, type BotPresence, type RosterEntry } from './fleet.js';
+import { buildFleet, nextUninvited, type BotPresence, type RosterEntry } from './index.js';
 
 const GUILD = 'guild-1';
 
@@ -128,6 +128,60 @@ describe('buildFleet', () => {
     // Application ids come from the roster, so an invite can be offered for a
     // player that is not running.
     expect(view.clientIds.get('player-3')).toBe('app-3');
+  });
+});
+
+describe('buildFleet staleness', () => {
+  const NOW = 1_000_000;
+  const STALE_AFTER_MS = 45_000;
+
+  const withSentAt = (botId: string, sentAt: number): BotPresence => ({
+    ...present(botId),
+    sentAt,
+  });
+
+  const allocatable = (presence: readonly BotPresence[]) =>
+    buildFleet({
+      roster: ROSTER,
+      invited: new Set(['app-main', 'app-2', 'app-3']),
+      presence,
+      claims: new Map(),
+      guildId: GUILD,
+      now: NOW,
+      staleAfterMs: STALE_AFTER_MS,
+    }).members.map((member) => member.botId);
+
+  it('drops a player whose entry has gone quiet', () => {
+    // Its Redis key has not expired yet — the TTL is deliberately generous —
+    // but handing it a channel it will never join leaves somebody watching a
+    // spinner until the interaction dies.
+    expect(
+      allocatable([withSentAt('main', NOW - 1_000), withSentAt('player-2', NOW - 60_000)]),
+    ).toEqual(['main']);
+  });
+
+  it('keeps one that answered within the window', () => {
+    expect(allocatable([withSentAt('main', NOW - STALE_AFTER_MS)])).toEqual(['main']);
+  });
+
+  it('keeps an entry with no timestamp at all', () => {
+    // Written by a container that predates the field. Dropping it would empty
+    // the fleet halfway through a rolling deploy — a worse failure than the one
+    // the check exists to prevent.
+    expect(allocatable([present('main')])).toEqual(['main']);
+  });
+
+  it('accepts every entry when the caller did not ask about freshness', () => {
+    // A reader that only wants the picture, rather than to hand out a room.
+    const view = buildFleet({
+      roster: ROSTER,
+      invited: new Set(['app-main']),
+      presence: [withSentAt('main', NOW - 10 * 60_000)],
+      claims: new Map(),
+      guildId: GUILD,
+    });
+
+    expect(view.members.map((member) => member.botId)).toEqual(['main']);
   });
 });
 
