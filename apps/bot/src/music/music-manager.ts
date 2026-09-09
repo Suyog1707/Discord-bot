@@ -2080,27 +2080,33 @@ export class MusicManager {
         // set reflects what is actually still ahead. A queue that had already
         // reached its end does not stay silent: with autoplay on, the restored
         // listener's taste continues it.
-        const next = player.queue.skip();
+        player.queue.skip();
         this.#syncSessionQueue(guildId);
-        if (!player.hasListeners) {
-          // 24/7 means the bot waits in the channel, not that it performs to
-          // an empty one. The queue is restored and parked; the first person
-          // to walk in starts it (`GuildPlayer.onOccupancyChange`).
-          logger.info(
-            { guildId, tracks: persisted.tracks.length, listener },
-            '24/7: rejoined an empty channel; queue parked until somebody joins',
-          );
-          continue;
-        }
-        if (next !== null) {
-          await player.jumpTo(player.queue.currentIndex);
-        } else if (player.autoplayEnabled) {
-          const resumed = await player.resumeAutoplay();
-          logger.info(
-            { guildId, resumed, listener },
-            '24/7: restored queue was finished; autoplay asked to continue',
-          );
-        }
+
+        /**
+         * Restored, and waiting to be asked for.
+         *
+         * 24/7 means the bot waits in the channel — it does not mean it
+         * performs to whoever is standing there. This used to check whether
+         * anybody was present and, if so, start playing immediately: restart a
+         * container while somebody happened to be in the channel and the bot
+         * would appear and begin a queue from a previous session at them, with
+         * autoplay inventing more once it ran out. Nobody had asked for any of
+         * it.
+         *
+         * So the queue is loaded and armed either way, and the first `/play`,
+         * `/join` or press of the controller starts it.
+         */
+        player.armRestoredQueue();
+        logger.info(
+          {
+            guildId,
+            tracks: persisted.tracks.length,
+            listener,
+            listenersPresent: player.hasListeners,
+          },
+          '24/7: rejoined and restored the queue; waiting to be asked',
+        );
 
         logger.info(
           { guildId, tracks: persisted.tracks.length, listener },

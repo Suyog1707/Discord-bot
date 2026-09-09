@@ -265,6 +265,22 @@ export class GuildPlayer {
    * person asked for.
    */
   #pausedForEmptyRoom = false;
+
+  /**
+   * A queue that is loaded but that nobody has asked to hear.
+   *
+   * Set when the 24/7 restore reloads a channel's saved queue at startup.
+   * 24/7 means the bot waits in the channel; it does not mean it performs to
+   * whoever happens to walk in. Without this, restarting a container while
+   * somebody was sitting in the channel made the bot appear and immediately
+   * start playing a queue from a previous session — and if that queue had
+   * finished, autoplay invented new tracks for them.
+   *
+   * Distinct from {@link #pausedForEmptyRoom}, which marks music a person
+   * *did* start and the bot paused on their behalf. That still resumes on its
+   * own, because continuing is what was asked for.
+   */
+  #awaitingRequest = false;
   /**
    * Why the next track-end should advance with `skip()` instead of `advance()`.
    * The DISTINCTION matters for learning: `/skip` is a rejection of the song
@@ -486,6 +502,15 @@ export class GuildPlayer {
    * Resume autoplay on a parked player — the restore path, when the saved
    * queue had nothing left to play. Returns true when music started.
    */
+  /**
+   * Mark a restored queue as loaded but unasked-for.
+   *
+   * Called by the 24/7 restore. Cleared by the first deliberate request.
+   */
+  armRestoredQueue(): void {
+    this.#awaitingRequest = true;
+  }
+
   async resumeAutoplay(): Promise<boolean> {
     if (this.isPlaying) return true;
     // An empty room gets no radio. Whoever walks in starts it.
@@ -821,6 +846,15 @@ export class GuildPlayer {
     }
     // Playing already, or paused by a person: not this method's business.
     if (this.isPlaying || this.paused) return;
+
+    /**
+     * A restored queue waits to be asked for.
+     *
+     * Somebody walking into the channel is not a request for music. They may
+     * never have used the bot, and the queue may be from a session that had
+     * nothing to do with them — `/play`, `/join` or the controller starts it.
+     */
+    if (this.#awaitingRequest) return;
 
     if (await this.#startParked()) {
       this.#clearIdleTimer();
@@ -1298,6 +1332,10 @@ export class GuildPlayer {
    * channel has been told; not the end of the queue).
    */
   async #tryAutoplay(): Promise<'continued' | 'exhausted' | 'failed'> {
+    // Worse than resuming a queue: these are tracks that never existed until
+    // somebody walked past. `exhausted` because there is nothing to continue —
+    // no request has been made yet — and it must not schedule a retry.
+    if (this.#awaitingRequest) return 'exhausted';
     if (!this.#autoplayEnabled) return 'exhausted';
     // Generating a radio for nobody costs a full candidate sweep and writes
     // plays into history that no one heard. The drain path checks occupancy
@@ -1454,6 +1492,10 @@ export class GuildPlayer {
   }
 
   async #playTrack(track: QueuedTrack): Promise<void> {
+    // Whatever the queue was when it was restored, it is being played now
+    // because somebody asked — the paths that start music on their own are
+    // gated above.
+    this.#awaitingRequest = false;
     // A new play, so the end that eventually arrives is a different end from
     // the last one. Bumped before the request goes out: a `loadFailed` end
     // can arrive for a track that never produced a single frame, and it still

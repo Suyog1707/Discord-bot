@@ -1236,8 +1236,9 @@ describe('GuildPlayer empty-room playback', () => {
   });
 
   it('starts a queue that was parked while the room was empty', async () => {
+    // Music somebody queued, that ran on while the room emptied. Picking it up
+    // when they come back is continuing what was asked for.
     const h = harness();
-    // The shape a 24/7 restore leaves behind: tracks loaded, nothing playing.
     h.gp.onOccupancyChange(false);
     await settle();
     h.gp.queue.restore([track('saved', 'Saved')], 0, 'off');
@@ -1247,6 +1248,76 @@ describe('GuildPlayer empty-room playback', () => {
     await settle();
 
     expect(played(h.player)).toEqual(['encoded-saved']);
+  });
+
+  /**
+   * The 24/7 restore is a different thing entirely, and used to be treated the
+   * same. Reported from live use: "the bot suddenly joins the VC and starts
+   * playing, I gave no command" — a container restart while somebody happened
+   * to be standing in the 24/7 channel.
+   */
+  describe('a restored queue nobody has asked for', () => {
+    it('does not start when somebody walks in', async () => {
+      const h = harness();
+      h.gp.onOccupancyChange(false);
+      await settle();
+      h.gp.queue.restore([track('saved', 'Saved')], 0, 'off');
+      h.gp.armRestoredQueue();
+
+      h.gp.onOccupancyChange(true);
+      await settle();
+
+      expect(played(h.player)).toEqual([]);
+      expect(h.gp.isPlaying).toBe(false);
+    });
+
+    it('does not let autoplay invent tracks for them either', async () => {
+      // Worse than resuming a queue: this is music that never existed until
+      // somebody walked past.
+      const h = harness({ autoplayEnabled: true, autoplay: () => Promise.resolve(picks(2)) });
+      h.gp.onOccupancyChange(false);
+      await settle();
+      h.gp.armRestoredQueue();
+
+      h.gp.onOccupancyChange(true);
+      await settle();
+
+      expect(h.autoplay).not.toHaveBeenCalled();
+      expect(played(h.player)).toEqual([]);
+    });
+
+    it('plays as soon as somebody actually asks', async () => {
+      const h = harness();
+      h.gp.onOccupancyChange(false);
+      await settle();
+      h.gp.queue.restore([track('saved', 'Saved')], 0, 'off');
+      h.gp.armRestoredQueue();
+      h.gp.onOccupancyChange(true);
+      await settle();
+      expect(played(h.player)).toEqual([]);
+
+      // `/join` resumes from the saved cursor; `/play` would enqueue.
+      await h.gp.jumpTo(0);
+      await settle();
+
+      expect(played(h.player)).toEqual(['encoded-saved']);
+    });
+
+    it('stops waiting once it has been asked, so the room behaves normally after', async () => {
+      const h = harness();
+      h.gp.queue.restore([track('a', 'A'), track('b', 'B')], 0, 'off');
+      h.gp.armRestoredQueue();
+      await h.gp.jumpTo(0);
+      await settle();
+
+      // Everyone leaves and comes back: this is now ordinary paused music.
+      h.gp.onOccupancyChange(false);
+      await settle();
+      h.gp.onOccupancyChange(true);
+      await settle();
+
+      expect(h.gp.paused).toBe(false);
+    });
   });
 
   it('starts the radio for an arriving listener when the parked queue is empty', async () => {
