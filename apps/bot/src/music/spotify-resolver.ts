@@ -10,7 +10,18 @@
  * users use the data exposed by Spotify's public playlist page as a best-
  * effort fallback.
  */
-import { UpstreamError, ValidationError } from '@discord-music/shared';
+import {
+  rankSpotifyResults,
+  searchSpotifySuggestions as sharedSpotifySuggestions,
+  spotifyApiGet,
+  spotifyAppToken,
+  UpstreamError,
+  ValidationError,
+  type SpotifyCredentials,
+  type SpotifySearchHit,
+  type SpotifySearchKind,
+  type SpotifySearchPage,
+} from '@discord-music/shared';
 
 import { getEnv } from '../config/env.js';
 import { getLogger } from '../lib/logger.js';
@@ -18,9 +29,6 @@ import type { SpotifyService } from '../services/spotify-service.js';
 
 const logger = getLogger('spotify');
 
-const TOKEN_URL = 'https://accounts.spotify.com/api/token';
-const API_BASE = 'https://api.spotify.com/v1';
-const TIMEOUT_MS = 10_000;
 const ARTIST_TRACK_LIMIT = 10;
 
 const URL_PATTERN =
@@ -115,6 +123,26 @@ export function isSpotifyWebUrl(input: string): boolean {
   }
 }
 
+export type { SpotifySearchHit, SpotifySearchKind, SpotifySearchPage };
+export { rankSpotifyResults };
+
+/**
+ * This deployment's Spotify app credentials.
+ *
+ * Read here and passed down rather than reached for inside the shared search:
+ * the command router has its own environment and its own copy of these, and a
+ * shared module that read one app's config would be wrong for the other.
+ */
+function spotifyCredentials(): SpotifyCredentials {
+  const env = getEnv();
+  if (env.SPOTIFY_CLIENT_ID === undefined || env.SPOTIFY_CLIENT_SECRET === undefined) {
+    throw new UpstreamError(
+      'Spotify links need SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET configured.',
+    );
+  }
+  return { clientId: env.SPOTIFY_CLIENT_ID, clientSecret: env.SPOTIFY_CLIENT_SECRET };
+}
+
 export function isSpotifyConfigured(): boolean {
   const env = getEnv();
   return env.SPOTIFY_CLIENT_ID !== undefined && env.SPOTIFY_CLIENT_SECRET !== undefined;
@@ -124,73 +152,8 @@ function playlistTrackLimit(): number {
   return getEnv().SPOTIFY_PLAYLIST_MAX_TRACKS;
 }
 
-let cachedToken: { value: string; expiresAt: number } | null = null;
-
-async function appToken(): Promise<string> {
-  if (cachedToken !== null && cachedToken.expiresAt - Date.now() > 60_000) {
-    return cachedToken.value;
-  }
-
-  const env = getEnv();
-  if (env.SPOTIFY_CLIENT_ID === undefined || env.SPOTIFY_CLIENT_SECRET === undefined) {
-    throw new UpstreamError(
-      'Spotify links need SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET configured.',
-    );
-  }
-
-  const response = await fetch(TOKEN_URL, {
-    method: 'POST',
-    headers: {
-      Authorization: `Basic ${Buffer.from(
-        `${env.SPOTIFY_CLIENT_ID}:${env.SPOTIFY_CLIENT_SECRET}`,
-      ).toString('base64')}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: new URLSearchParams({ grant_type: 'client_credentials' }),
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  });
-  if (!response.ok) {
-    throw new UpstreamError(`Spotify auth failed (${String(response.status)}).`);
-  }
-  const data = (await response.json()) as { access_token: string; expires_in: number };
-  cachedToken = { value: data.access_token, expiresAt: Date.now() + data.expires_in * 1000 };
-  return cachedToken.value;
-}
-
-async function apiGet<T>(path: string, token: string): Promise<T> {
-  let response: Response;
-  try {
-    response = await fetch(path.startsWith('https://') ? path : `${API_BASE}${path}`, {
-      headers: { Authorization: `Bearer ${token}` },
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    });
-  } catch (error) {
-    throw new UpstreamError('Spotify did not respond in time. Try again shortly.', {
-      cause: error,
-    });
-  }
-  if (response.status === 404) {
-    throw new ValidationError('That Spotify link points at nothing (deleted or private?).');
-  }
-  if (response.status === 401) {
-    throw new UpstreamError(
-      'Spotify authorization expired. Reconnect your Spotify account and try again.',
-    );
-  }
-  if (response.status === 403) {
-    throw new ValidationError('Spotify does not allow access to that item.');
-  }
-  if (response.status === 429) {
-    throw new UpstreamError('Spotify is rate limiting requests. Try again shortly.');
-  }
-  if (!response.ok) {
-    throw new UpstreamError(`Spotify lookup failed (${String(response.status)}).`);
-  }
-  return (await response.json()) as T;
-}
-
 async function catalogueGet<T>(path: string): Promise<T> {
-  return apiGet<T>(path, await appToken());
+  return spotifyApiGet<T>(path, await spotifyAppToken(spotifyCredentials()));
 }
 
 interface RawTrack {
@@ -276,8 +239,8 @@ async function linkedPlaylist(id: string, token: string): Promise<SpotifyResolut
 
   // Name and first page are independent lookups — no reason to serialise them.
   const [playlist, firstPage] = await Promise.all([
-    apiGet<{ readonly name: string }>(`/playlists/${id}?fields=name`, token),
-    apiGet<PlaylistPage>(itemsPath(0), token),
+    spotifyApiGet<{ readonly name: string }>(`/playlists/${id}?fields=name`, token),
+    spotifyApiGet<PlaylistPage>(itemsPath(0), token),
   ]);
 
   const first = playablePlaylistTracks(firstPage).slice(0, limit);
@@ -297,7 +260,7 @@ async function linkedPlaylist(id: string, token: string): Promise<SpotifyResolut
             // Offsets are known up front, so the tail pages go out in parallel
             // instead of one `next` hop at a time.
             const pages = await mapBounded(tailOffsets, PAGE_CONCURRENCY, (offset) =>
-              apiGet<PlaylistPage>(itemsPath(offset), token),
+              spotifyApiGet<PlaylistPage>(itemsPath(offset), token),
             );
             return pages
               .flatMap((page) => playablePlaylistTracks(page))
@@ -399,12 +362,18 @@ function metaContent(html: string, property: string): string | null {
   return value === undefined ? null : htmlText(value);
 }
 
+/**
+ * The public embed page is scraped, not called, so it keeps its own budget
+ * rather than borrowing the Web API's.
+ */
+const EMBED_TIMEOUT_MS = 10_000;
+
 async function fetchEmbedPage(id: string, offset: number): Promise<string> {
   const url = new URL(`https://open.spotify.com/embed/playlist/${id}`);
   if (offset > 0) url.searchParams.set('offset', String(offset));
   const response = await fetch(url, {
     headers: { Accept: 'text/html', 'User-Agent': 'discord-music-platform/0.1' },
-    signal: AbortSignal.timeout(TIMEOUT_MS),
+    signal: AbortSignal.timeout(EMBED_TIMEOUT_MS),
   });
   if (!response.ok) throw new Error(`HTTP ${String(response.status)}`);
   return response.text();
@@ -530,7 +499,7 @@ export async function resolveSpotifyUrl(
   // A linked user reads through their own token; everyone else gets the app
   // token, which covers the public catalogue but not playlist items.
   const get = async <T>(path: string): Promise<T> =>
-    token === null ? catalogueGet<T>(path) : apiGet<T>(path, token);
+    token === null ? catalogueGet<T>(path) : spotifyApiGet<T>(path, token);
 
   switch (kind) {
     case 'track': {
@@ -632,216 +601,11 @@ export async function searchSpotifyTrack(title: string, artist: string): Promise
 
 /* ---------------------------------------------------- free-text search --- */
 
-export type SpotifySearchKind = 'track' | 'album' | 'artist' | 'playlist';
-
-/** The winner of a ranked Spotify search — always addressed by its own URL. */
-export interface SpotifySearchHit {
-  readonly kind: SpotifySearchKind;
-  readonly url: string;
-  readonly name: string;
-  readonly artist: string | null;
-}
-
-/** The slice of a `/search` response the ranking needs. */
-export interface SpotifySearchPage {
-  readonly tracks?: {
-    readonly items?: readonly ({
-      readonly name?: string;
-      readonly artists?: readonly { readonly name?: string }[];
-      readonly popularity?: number;
-      readonly external_urls?: { readonly spotify?: string };
-    } | null)[];
-  };
-  readonly albums?: {
-    readonly items?: readonly ({
-      readonly name?: string;
-      readonly artists?: readonly { readonly name?: string }[];
-      readonly album_type?: string;
-      readonly external_urls?: { readonly spotify?: string };
-    } | null)[];
-  };
-  readonly artists?: {
-    readonly items?: readonly ({
-      readonly name?: string;
-      readonly popularity?: number;
-      readonly external_urls?: { readonly spotify?: string };
-    } | null)[];
-  };
-  readonly playlists?: {
-    readonly items?: readonly ({
-      readonly name?: string;
-      readonly external_urls?: { readonly spotify?: string };
-    } | null)[];
-  };
-}
-
-/** Lowercase, punctuation to spaces, whitespace collapsed. */
-function normalise(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
-    .replace(/\s+/gu, ' ')
-    .trim();
-}
-
-/**
- * Identity of one search result for deduplication.
- *
- * Two layers, both checked: the Spotify URL (which embeds the stable Spotify
- * id — the same catalogue object surfacing through different result groups or
- * ranking paths), and a normalised name+artist key per kind, which catches the
- * same SONG published as several catalogue objects (single, album cut,
- * re-release). Bracketed asides are stripped for the song key — "(Remastered)"
- * and "(Official Video)" name the same recording — so search can never show
- * "Song — Artist" twice.
- */
-function resultIdentities(hit: SpotifySearchHit): readonly string[] {
-  const name = normalise(hit.name.replace(/[([{][^)\]}]*[)\]}]/gu, ' '));
-  const artist = hit.artist === null ? '' : normalise(hit.artist);
-  return [`url:${hit.url}`, `${hit.kind}:${name}|${artist}`];
-}
-
 /**
  * Match tiers, spaced far enough apart that no tiebreaker can cross tiers:
  * an exact name beats title+artist beats "all words present" beats a partial
  * overlap, no matter how popular the weaker match is.
  */
-const TIER_EXACT = 400;
-const TIER_TITLE_AND_ARTIST = 300;
-const TIER_ALL_WORDS = 200;
-const TIER_PARTIAL = 100;
-
-/**
- * Kind preference *within* a tier. A full album named exactly what was typed
- * outranks the identically-named track — "/play Parwana" queueing the album
- * (which contains its title track anyway) is the asked-for behaviour — while
- * everywhere below the exact tier a concrete track is the safer guess.
- * Playlists rank last throughout: they are the loosest match for a bare
- * phrase and should only win when nothing better exists.
- */
-function kindBonus(kind: SpotifySearchKind, albumType: string | undefined, exact: boolean): number {
-  switch (kind) {
-    case 'album':
-      return albumType === 'album' ? (exact ? 30 : 15) : 10;
-    case 'track':
-      return 20;
-    case 'artist':
-      return exact ? 25 : 5;
-    case 'playlist':
-      return 0;
-  }
-}
-
-interface ScoredHit extends SpotifySearchHit {
-  readonly score: number;
-}
-
-/**
- * Score one candidate's text against the query.
- *
- * @returns The tier score, or 0 when the candidate is not a credible match.
- */
-function textScore(query: string, name: string, artist: string | null): number {
-  const normalisedName = normalise(name);
-  if (normalisedName.length === 0) return 0;
-  if (normalisedName === query) return TIER_EXACT;
-
-  const normalisedArtist = artist === null ? '' : normalise(artist);
-
-  // "Parwana Arijit Singh": the name covers the query's head, the artist
-  // covers everything after it.
-  if (normalisedArtist.length > 0 && `${query} `.startsWith(`${normalisedName} `)) {
-    const rest = query.slice(normalisedName.length).trim().split(' ');
-    if (rest.every((word) => normalisedArtist.includes(word))) return TIER_TITLE_AND_ARTIST;
-  }
-
-  const haystack = `${normalisedName} ${normalisedArtist}`;
-  const words = query.split(' ');
-  const hits = words.filter((word) => haystack.includes(word)).length;
-  if (hits === words.length) return TIER_ALL_WORDS;
-  const overlap = hits / words.length;
-  return overlap >= 0.6 ? TIER_PARTIAL * overlap : 0;
-}
-
-/**
- * Every credible result across every kind Spotify returned, most relevant
- * first. Relevance is tiers of exactness first, kind and popularity only as
- * tiebreakers — never "blindly the first result".
- */
-export function rankSpotifyResults(
-  query: string,
-  page: SpotifySearchPage,
-): readonly SpotifySearchHit[] {
-  const normalisedQuery = normalise(query);
-  if (normalisedQuery.length === 0) return [];
-
-  const scored: ScoredHit[] = [];
-  const consider = (
-    kind: SpotifySearchKind,
-    name: string | undefined,
-    artist: string | null,
-    url: string | undefined,
-    popularity: number,
-    albumType?: string,
-  ): void => {
-    if (name === undefined || name.length === 0 || url === undefined) return;
-    const text = textScore(normalisedQuery, name, artist);
-    if (text === 0) return;
-    scored.push({
-      kind,
-      url,
-      name,
-      artist,
-      score:
-        text + kindBonus(kind, albumType, text === TIER_EXACT) + Math.min(popularity, 100) / 100,
-    });
-  };
-
-  for (const track of page.tracks?.items ?? []) {
-    if (track == null) continue;
-    consider(
-      'track',
-      track.name,
-      (track.artists ?? []).map((entry) => entry.name ?? '').join(', ') || null,
-      track.external_urls?.spotify,
-      track.popularity ?? 0,
-    );
-  }
-  for (const album of page.albums?.items ?? []) {
-    if (album == null) continue;
-    consider(
-      'album',
-      album.name,
-      (album.artists ?? []).map((entry) => entry.name ?? '').join(', ') || null,
-      album.external_urls?.spotify,
-      0,
-      album.album_type,
-    );
-  }
-  for (const artist of page.artists?.items ?? []) {
-    if (artist == null) continue;
-    consider('artist', artist.name, null, artist.external_urls?.spotify, artist.popularity ?? 0);
-  }
-  for (const playlist of page.playlists?.items ?? []) {
-    if (playlist == null) continue;
-    consider('playlist', playlist.name, null, playlist.external_urls?.spotify, 0);
-  }
-
-  scored.sort((a, b) => b.score - a.score);
-
-  // Deduplicate AFTER ranking, so the survivor of each duplicate group is the
-  // most relevant (and, via the popularity tiebreak, most official) version —
-  // never merely the first one the API happened to return.
-  const seen = new Set<string>();
-  const unique: SpotifySearchHit[] = [];
-  for (const { score: _score, ...hit } of scored) {
-    const identities = resultIdentities(hit);
-    if (identities.some((identity) => seen.has(identity))) continue;
-    for (const identity of identities) seen.add(identity);
-    unique.push(hit);
-  }
-  return unique;
-}
 
 /** The single most relevant result, or null when nothing credibly matches. */
 export function pickBestSpotifyResult(
@@ -883,17 +647,15 @@ export async function searchSpotifyBest(query: string): Promise<SpotifySearchHit
 }
 
 /**
- * Ranked Spotify suggestions for search-as-you-type. Empty on any failure —
- * autocomplete is decoration, and the command accepts the raw text anyway.
+ * Ranked Spotify suggestions for search-as-you-type.
+ *
+ * A thin wrapper over the shared search, which the command router also calls.
+ * One ranking, one dedupe, one opinion about what a good match is — the two
+ * must not drift, because a suggestion's value is what actually gets played.
  */
 export async function searchSpotifySuggestions(
   query: string,
 ): Promise<readonly SpotifySearchHit[]> {
   if (!isSpotifyConfigured()) return [];
-  try {
-    return rankSpotifyResults(query, await searchPage(query));
-  } catch (error) {
-    logger.debug({ err: error, query }, 'Spotify suggestion search failed');
-    return [];
-  }
+  return sharedSpotifySuggestions(spotifyCredentials(), query);
 }

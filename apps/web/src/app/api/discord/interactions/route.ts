@@ -112,14 +112,19 @@ export async function POST(request: Request): Promise<Response> {
       });
     }
 
-    case INTERACTION_TYPE.autocomplete:
+    case INTERACTION_TYPE.autocomplete: {
       /**
        * Answered here or not at all — there is no deferral for autocomplete,
-       * so a round trip to a bot cannot fit in the budget. Suggestions arrive
-       * in a later change; an empty list is what the command already falls back
-       * to when Spotify is unconfigured, and free text keeps working.
+       * so a round trip to a bot cannot fit inside the three seconds. Imported
+       * lazily, so the module graph on this path stays small: it is the one
+       * request with nowhere to hide a cold start.
        */
-      return NextResponse.json({ type: AUTOCOMPLETE_RESULT, data: { choices: [] } });
+      const { autocompleteChoices } = await import('@/lib/interactions/autocomplete');
+      return NextResponse.json({
+        type: AUTOCOMPLETE_RESULT,
+        data: { choices: await autocompleteChoices(interaction) },
+      });
+    }
 
     case INTERACTION_TYPE.component: {
       /**

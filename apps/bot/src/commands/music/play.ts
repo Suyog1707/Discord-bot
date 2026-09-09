@@ -1,15 +1,12 @@
 /** `/play` — resolve a URL or search query and queue the result. */
 import { EmbedBuilder, MessageFlags, PermissionFlagsBits } from 'discord.js';
+import { toAutocompleteChoices } from '@discord-music/shared';
 import { LoadType } from 'shoukaku';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import type { ResolveResult } from '../../music/music-manager.js';
-import {
-  isSpotifyConfigured,
-  searchSpotifySuggestions,
-  type SpotifySearchKind,
-} from '../../music/spotify-resolver.js';
+import { isSpotifyConfigured, searchSpotifySuggestions } from '../../music/spotify-resolver.js';
 import { formatTrackDuration, trackLink, type QueuedTrack } from '../../music/track.js';
 import { requireMusic, requireRouter, requireVoiceContext } from '../../music/voice-context.js';
 
@@ -113,27 +110,7 @@ export default defineCommand({
     }
 
     if (isSpotifyConfigured()) {
-      const KIND_LABEL: Record<SpotifySearchKind, string> = {
-        track: '🎵',
-        album: '💿',
-        artist: '👤',
-        playlist: '📃',
-      };
-      const hits = await searchSpotifySuggestions(query);
-      const suggestions = hits
-        // Only concrete playables are suggested: tracks, albums, playlists.
-        // An artist row is ambiguous about what would actually play, so it
-        // stays out of the list (typed free text can still resolve to one).
-        .filter((hit) => hit.kind !== 'artist' && hit.url.length <= 100)
-        .slice(0, 10)
-        .map((hit) => ({
-          name: clip(
-            `${KIND_LABEL[hit.kind]} ${hit.name}${hit.artist === null ? '' : ` — ${hit.artist}`}`,
-          ),
-          // The Spotify URL as the value: playing a suggestion goes through
-          // the Spotify pipeline exactly like a pasted link.
-          value: hit.url,
-        }));
+      const suggestions = toAutocompleteChoices(await searchSpotifySuggestions(query));
       // Cached even when empty — a query Spotify cannot answer would otherwise
       // re-query on every keystroke. No YouTube fallback here: suggesting
       // provider URLs is how tapped suggestions escaped the Spotify catalogue.
