@@ -25,7 +25,7 @@ import {
 } from '@discord-music/shared';
 
 import { getLogger } from '@/lib/logger';
-import { getRedis } from '@/lib/redis';
+import { getReadyRedis } from '@/lib/redis';
 
 /**
  * Cached for the life of the instance.
@@ -40,7 +40,11 @@ let cache: { readonly value: DeferralManifest; readonly expiresAt: number } | un
 async function loadManifest(): Promise<DeferralManifest> {
   if (cache !== undefined && cache.expiresAt > Date.now()) return cache.value;
 
-  const redis = getRedis();
+  // Waits for the connection: this runs before Discord is answered, and a
+  // cold instance falling back to the default would make `/play` reply
+  // privately — visibly wrong, and only on the first command after a quiet
+  // spell, which is the hardest kind of bug to be told about.
+  const redis = await getReadyRedis().catch(() => undefined);
   if (redis === undefined) return {};
 
   try {

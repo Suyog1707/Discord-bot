@@ -19,7 +19,7 @@ import { readLiveBots } from '@discord-music/shared/redis';
 
 import { getDb } from '@/lib/db';
 import { getLogger } from '@/lib/logger';
-import { getRedis } from '@/lib/redis';
+import { getReadyRedis } from '@/lib/redis';
 
 /**
  * Redis is unreachable, as distinct from "no bot is running".
@@ -53,7 +53,7 @@ export async function readFleet(
   guildId: string,
   voiceChannelId: string | null,
 ): Promise<FleetSnapshot> {
-  const redis = getRedis();
+  const redis = await getReadyRedis();
   if (redis === undefined) throw new FleetUnavailableError('REDIS_URL is not configured');
 
   const db = getDb();

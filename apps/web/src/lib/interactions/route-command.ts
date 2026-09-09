@@ -29,7 +29,7 @@ import {
 
 import { getEnv } from '@/lib/env';
 import { getLogger } from '@/lib/logger';
-import { getRedis } from '@/lib/redis';
+import { getReadyRedis } from '@/lib/redis';
 
 import { editOriginalResponse, fetchVoiceChannelId } from './discord-api';
 import { FleetUnavailableError, readFleet } from './fleet';
@@ -57,7 +57,7 @@ export async function routeCommand(input: RouteCommandInput): Promise<void> {
 
   try {
     const env = getEnv();
-    const redis = getRedis();
+    const redis = await getReadyRedis();
     const guildId = payload.guild_id ?? null;
     const userId = callerIdOf(payload);
 
@@ -199,7 +199,7 @@ async function confirmPickup(
   botId: string,
   deferral: DeferralMode,
 ): Promise<void> {
-  const redis = getRedis();
+  const redis = await getReadyRedis().catch(() => undefined);
   if (redis === undefined) return;
 
   const key = interactionAckKey(payload.id);
@@ -265,7 +265,7 @@ export async function routeComponent(payload: RawInteraction): Promise<void> {
   const authorId = messageAuthorIdOf(payload);
 
   try {
-    const redis = getRedis();
+    const redis = await getReadyRedis();
     if (redis === undefined || guildId === null || authorId === null) {
       logger.warn({ guildId, authorId }, 'Component interaction could not be routed');
       return;
