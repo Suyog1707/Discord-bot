@@ -286,6 +286,12 @@ export interface JoinOptions {
    * needs that line drawn to say whether the wait was ours or Discord's.
    */
   readonly onJoinStarted?: () => void;
+  /**
+   * The command router already chose this bot for this channel and reserved
+   * it. The room router then trusts that choice instead of re-reading the
+   * whole fleet to reach the same answer.
+   */
+  readonly routed?: boolean;
 }
 
 /** What a fresh join brought back with it, for the command to mention. */
@@ -709,7 +715,16 @@ export class MusicManager {
       throw new UpstreamError('The music server is not available right now. Try again shortly.');
     }
 
-    const settings = await this.#guilds.getSettings(options.guildId);
+    // Independent reads, so they go out together and the join waits for the
+    // slower of the two rather than their sum. The saved queue is read before
+    // the player is built so the listener it was following is known at
+    // construction rather than assigned a beat later.
+    const [settings, saved] = await Promise.all([
+      this.#guilds.getSettings(options.guildId),
+      options.resumeSavedQueue === false
+        ? Promise.resolve(null)
+        : this.#savedQueueFor(options.guildId, options.voiceChannelId),
+    ]);
 
     // Persistent controller: the voice channel's own text chat when Discord
     // exposes it to the bot, otherwise the configured music channel. When one
@@ -734,14 +749,6 @@ export class MusicManager {
       }
     }
     const controllerActive = this.#controllers.has(options.guildId);
-
-    // What this room was left with, if anything. Read before the player is
-    // built so the listener it was following is known at construction rather
-    // than assigned a beat later.
-    const saved =
-      options.resumeSavedQueue === false
-        ? null
-        : await this.#savedQueueFor(options.guildId, options.voiceChannelId);
 
     options.onJoinStarted?.();
     const player = await this.#joinVoiceChannel(

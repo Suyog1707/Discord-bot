@@ -3,6 +3,7 @@ import { EmbedBuilder } from 'discord.js';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
+import { routedReceiptOf } from '../../core/routed-interactions.js';
 import { requireRouter, requireVoiceContext } from '../../music/voice-context.js';
 
 export default defineCommand({
@@ -32,6 +33,8 @@ export default defineCommand({
       voiceChannelId: context.voiceChannelId,
       textChannelId: interaction.channelId,
       shardId: interaction.guild?.shardId ?? 0,
+      // Trusted only when the router chose for the channel this bot sees.
+      routed: routedReceiptOf(interaction)?.voiceChannelId === context.voiceChannelId,
     });
 
     const result = await router.runIntent({

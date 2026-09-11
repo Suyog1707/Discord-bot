@@ -286,6 +286,10 @@ export class PlayerRouter {
       };
     }
 
+    if (options.routed === true && this.#peers !== undefined) {
+      return this.#openRoutedRoom(options, this.#peers);
+    }
+
     const owner = await this.#peers?.ownerOf(options.guildId, options.voiceChannelId);
     if (owner !== undefined && owner.botId !== this.#peers?.selfBotId) {
       // Somebody else is already in that channel; joining is a no-op and the
@@ -299,6 +303,57 @@ export class PlayerRouter {
     }
 
     return this.#allocateRoom(options);
+  }
+
+  /**
+   * Join a room the command router has already given this bot.
+   *
+   * Being on this bot's queue with a channel attached *is* the allocation: the
+   * router read the fleet, chose, and reserved the room in one step before
+   * handing the command over. Reading the fleet again here — the roster, the
+   * guild's invitations, every presence entry and every claim — only to arrive
+   * at the same answer cost several round trips on every `/play`, all of them
+   * standing in front of the voice join.
+   *
+   * One read is kept, and only to refuse. If a different bot now holds the
+   * channel — it took the room between the router's decision and this moment —
+   * the command follows it rather than putting two bots in one room.
+   */
+  async #openRoutedRoom(options: JoinOptions, peers: PeerDirectory): Promise<RoomHandle> {
+    const holder = await peers.roomHolder(options.guildId, options.voiceChannelId);
+    if (holder !== undefined && holder !== peers.selfBotId) {
+      return {
+        botId: holder,
+        guildId: options.guildId,
+        voiceChannelId: options.voiceChannelId,
+        local: undefined,
+      };
+    }
+
+    const self = this.#bots.find((bot) => bot.botId === peers.selfBotId) ?? this.#bots[0];
+    if (self === undefined) {
+      throw new ValidationError('No player is available right now. Try again shortly.');
+    }
+
+    try {
+      const player = await self.music.getOrCreatePlayer(options);
+      return {
+        botId: self.botId,
+        guildId: options.guildId,
+        voiceChannelId: options.voiceChannelId,
+        local: {
+          botId: self.botId,
+          voiceChannelId: options.voiceChannelId,
+          player,
+          music: self.music,
+        },
+      };
+    } finally {
+      // Kept or broken, the promise is spent — see `#allocateRoom`.
+      void peers
+        .releaseClaim(self.botId, options.guildId, options.voiceChannelId)
+        .catch(() => undefined);
+    }
   }
 
   /**

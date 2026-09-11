@@ -154,9 +154,13 @@ export class InteractionSubscriber {
      * The router has already told Discord "thinking…", so a command that
      * nobody picks up leaves a reply nothing will ever finish. This is how the
      * router finds that out in time to say something useful instead — which
-     * means it has to be written first, not after the work.
+     * means it has to be sent first, not after the work.
+     *
+     * Sent, not waited for. The router's first look is 400ms after the push,
+     * and a round trip standing between picking the command up and running it
+     * was a round trip between the person and the music.
      */
-    await this.#writer
+    void this.#writer
       .set(
         interactionAckKey(envelope.payload.id),
         this.#client.identity.label,

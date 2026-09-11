@@ -226,12 +226,19 @@ function fakePeers(options: {
   owner?: { botId: string };
   live?: readonly BotPresence[];
   claims?: ReadonlyMap<string, string>;
-}): PeerDirectory & { releaseClaim: ReturnType<typeof vi.fn> } {
+  /** Who Redis says holds the room, for a routed join. */
+  holder?: string;
+}): PeerDirectory & {
+  releaseClaim: ReturnType<typeof vi.fn>;
+  liveBots: ReturnType<typeof vi.fn>;
+  claimedRooms: ReturnType<typeof vi.fn>;
+} {
   return {
     selfBotId: 'main',
     ownerOf: () => Promise.resolve(options.owner),
-    liveBots: () => Promise.resolve(options.live ?? []),
-    claimedRooms: () => Promise.resolve(options.claims ?? new Map<string, string>()),
+    roomHolder: vi.fn(() => Promise.resolve(options.holder)),
+    liveBots: vi.fn(() => Promise.resolve(options.live ?? [])),
+    claimedRooms: vi.fn(() => Promise.resolve(options.claims ?? new Map<string, string>())),
     releaseClaim: vi.fn(() => Promise.resolve()),
     announce: vi.fn(),
     announceSelf: vi.fn(),
@@ -312,5 +319,65 @@ describe('openRoom', () => {
     });
 
     await expect(router.openRoom(join('room-b'))).rejects.toThrow(/should be handling/iu);
+  });
+});
+
+describe('openRoom for a command the router already allocated', () => {
+  /**
+   * Being on this bot's queue with a channel attached is the allocation. The
+   * router read the fleet, chose and reserved in one step; reading it all again
+   * here to reach the same answer was several round trips in front of every
+   * voice join.
+   */
+  const routed = (voiceChannelId: string) => ({ ...join(voiceChannelId), routed: true });
+
+  it('joins without reading the fleet again', async () => {
+    const peers = fakePeers({ holder: 'main' });
+    const router = new PlayerRouter([fakeBot('main')], {
+      peers,
+      fleet: fleetOf('main', 'player-2'),
+    });
+
+    const handle = await router.openRoom(routed('room-a'));
+
+    expect(handle.local?.player.voiceChannelId).toBe('room-a');
+    expect(peers.liveBots).not.toHaveBeenCalled();
+    expect(peers.claimedRooms).not.toHaveBeenCalled();
+    expect(peers.releaseClaim).toHaveBeenCalledWith('main', GUILD, 'room-a');
+  });
+
+  it('goes ahead when Redis names nobody', async () => {
+    // A reservation that already expired, or Redis unable to answer: the
+    // router's decision still stands.
+    const router = new PlayerRouter([fakeBot('main')], { peers: fakePeers({}) });
+
+    const handle = await router.openRoom(routed('room-a'));
+
+    expect(handle.local?.botId).toBe('main');
+  });
+
+  it('follows a bot that took the channel in the meantime instead of joining it too', async () => {
+    const bot = fakeBot('main');
+    const router = new PlayerRouter([bot], { peers: fakePeers({ holder: 'player-2' }) });
+
+    const handle = await router.openRoom(routed('room-a'));
+
+    expect(handle).toMatchObject({ botId: 'player-2', local: undefined });
+    expect(bot.music.getPlayer(GUILD)).toBeUndefined();
+  });
+
+  it('lets the reservation go when the join fails', async () => {
+    let failJoin = (_error: Error): void => undefined;
+    const gate = new Promise<void>((_resolve, reject) => {
+      failJoin = reject;
+    });
+    const peers = fakePeers({ holder: 'main' });
+    const router = new PlayerRouter([fakeBot('main', { joinGate: gate })], { peers });
+
+    const opening = router.openRoom(routed('room-a'));
+    failJoin(new Error('Lavalink is down'));
+
+    await expect(opening).rejects.toThrow(/Lavalink/u);
+    expect(peers.releaseClaim).toHaveBeenCalledWith('main', GUILD, 'room-a');
   });
 });

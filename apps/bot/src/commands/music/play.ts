@@ -162,6 +162,7 @@ export default defineCommand({
     const client = interaction.client as BotClient;
     const music = requireMusic(client);
     const context = requireVoiceContext(interaction);
+    const receipt = routedReceiptOf(interaction);
 
     // Already acknowledged by the dispatcher (`deferral: 'public'`), so every
     // response below is an editReply/followUp.
@@ -207,6 +208,9 @@ export default defineCommand({
         voiceChannelId: context.voiceChannelId,
         textChannelId: interaction.channelId,
         shardId: interaction.guild?.shardId ?? 0,
+        // Only when the router chose for the channel this bot sees the caller
+        // in. If the two disagree, the room router decides afresh.
+        routed: receipt?.voiceChannelId === context.voiceChannelId,
         onJoinStarted: () => {
           marks.joinStartedAt = Date.now();
         },
@@ -269,7 +273,6 @@ export default defineCommand({
 
     const playRequestedAt = Date.now();
     const startedPlayback = queued.startedPlayback;
-    const receipt = routedReceiptOf(interaction);
     const logTimeline = (audioAt: number | undefined): void => {
       client.logger.info(
         {

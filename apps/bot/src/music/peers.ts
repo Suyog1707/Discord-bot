@@ -228,4 +228,27 @@ export class PeerDirectory {
       return undefined;
     }
   }
+
+  /**
+   * Who has this room right now: the bot serving it, or failing that the bot
+   * the command router last promised it to. Both in one round trip.
+   *
+   * Undefined when nobody does, or when Redis cannot say — a routed join then
+   * goes ahead, which is what the router decided.
+   */
+  async roomHolder(guildId: string, voiceChannelId: string): Promise<string | undefined> {
+    if (this.#redis === undefined) return undefined;
+    try {
+      const [owner, promised] = await this.#redis.mget(
+        playerRoomOwnerKey(guildId, voiceChannelId),
+        roomClaimKey(guildId, voiceChannelId),
+      );
+      const ownerId = owner == null ? undefined : (JSON.parse(owner) as Partial<RoomOwner>).botId;
+      if (typeof ownerId === 'string') return ownerId;
+      return promised ?? undefined;
+    } catch (error) {
+      logger.debug({ err: error, guildId, voiceChannelId }, 'Room holder lookup failed');
+      return undefined;
+    }
+  }
 }
