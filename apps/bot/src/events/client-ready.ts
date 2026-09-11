@@ -45,6 +45,10 @@ export default defineEvent({
       )
       .catch(() => undefined);
 
+    // The same list for the command router, which reads it on every command
+    // instead of asking Postgres — straight from the gateway cache.
+    void client.peers?.indexGuilds([...readyClient.guilds.cache.keys()]);
+
     readyClient.user.setPresence({
       status: 'online',
       activities: [{ name: '/play', type: ActivityType.Listening }],

@@ -188,6 +188,33 @@ export function playerBotIndexKey(): string {
 }
 
 /**
+ * The servers one container is in, as a set only that container writes.
+ *
+ * The command router needs "which of these bots is in this server?" for every
+ * command, and the only other place that knows is Postgres — a connection and
+ * a query, and on a serverless cold start a client to load, all before a bot
+ * has even been told there is work. Each bot already knows the answer from its
+ * own gateway cache, so it publishes it: rewritten whole when the bot becomes
+ * ready, and kept current as it joins and leaves servers.
+ *
+ * One key per bot rather than one per server, so a bot rewriting its list after
+ * a restart can never clobber another bot's entry, and a server it was removed
+ * from while it was down is simply absent from the new list.
+ */
+export function playerBotGuildsKey(botId: string): string {
+  return redisKey(REDIS_NAMESPACE.PLAYER, 'bot-guilds', botId);
+}
+
+/**
+ * Always a member of a written server list.
+ *
+ * Redis has no empty sets, so without it a bot in no servers would look the
+ * same as a bot that never wrote its list — and only the second should send
+ * the router back to Postgres.
+ */
+export const PLAYER_BOT_GUILDS_SENTINEL = '*';
+
+/**
  * How long a container's presence entry outlives its last heartbeat.
  *
  * Several heartbeats' worth, so one slow write or a brief Redis hiccup does

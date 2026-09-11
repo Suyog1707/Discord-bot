@@ -5,26 +5,24 @@ import 'server-only';
  *
  * Runs *after* Discord has already been told "thinking…", so nothing here is
  * racing the three-second acknowledgement window. That is the whole reason the
- * route answers first: this can take a Discord round trip, two Postgres reads
- * and a handful of Redis calls without anybody watching a spinner wonder
- * whether it worked.
+ * route answers first. Answering first does not make this free: the person is
+ * still waiting for a bot to join, so the work is kept to one Discord call and
+ * three Redis round trips, sent side by side wherever they do not depend on
+ * each other.
  *
  * The decision itself is `routeInteraction`, which is pure. Everything in this
  * file is the I/O around it — reading the facts, reserving the answer, and
  * handing the work over.
  */
 import {
-  botClaimKey,
   componentOwnerOf,
-  CLAIM_TTL_MS,
   encodeInteractionEnvelope,
   interactionAckKey,
-  interactionQueueKey,
-  INTERACTION_QUEUE_TTL_SECONDS,
-  roomClaimKey,
   routeInteraction,
   type DeferralMode,
+  type FleetView,
   type RawInteraction,
+  type RoutingDecision,
 } from '@discord-music/shared';
 
 import { getEnv } from '@/lib/env';
@@ -32,7 +30,8 @@ import { getLogger } from '@/lib/logger';
 import { getReadyRedis } from '@/lib/redis';
 
 import { editOriginalResponse, fetchVoiceChannelId } from './discord-api';
-import { FleetUnavailableError, readFleet } from './fleet';
+import { fleetFromDatabase, FleetUnavailableError, readFleet, readFleetIds } from './fleet';
+import { claimAndHandOver, handOver } from './hand-over';
 
 /** Discord's flag for a reply only the caller can see. */
 const EPHEMERAL = 64;
@@ -64,33 +63,55 @@ export async function routeCommand(input: RouteCommandInput): Promise<void> {
     if (redis === undefined) throw new FleetUnavailableError('REDIS_URL is not configured');
 
     /**
-     * Where is the caller standing?
+     * Where is the caller standing — asked at the same moment as the fleet
+     * index, because neither answer waits on the other.
      *
      * Only asked when there is a guild and a token to ask with. A lookup that
      * fails answers `unknown`, and the router carries on as though they were
      * in no channel — the command itself then produces whatever message it
      * always produces, which is a better failure than guessing at a room.
      */
-    let voiceChannelId: string | null = null;
-    if (guildId !== null && userId !== null && env.BOT_TOKEN !== undefined) {
-      const lookup = await fetchVoiceChannelId(env.BOT_TOKEN, guildId, userId);
-      if (lookup.kind === 'in-voice') voiceChannelId = lookup.voiceChannelId;
-    }
+    const [lookup, ids] = await Promise.all([
+      guildId !== null && userId !== null && env.BOT_TOKEN !== undefined
+        ? fetchVoiceChannelId(env.BOT_TOKEN, guildId, userId)
+        : Promise.resolve(null),
+      guildId === null ? Promise.resolve([]) : readFleetIds(),
+    ]);
+    const voiceChannelId = lookup?.kind === 'in-voice' ? lookup.voiceChannelId : null;
 
     if (guildId === null) {
       await reply(payload, 'This command can only be used in a server.', deferral);
       return;
     }
 
-    const { fleet, ownerBotId } = await readFleet(guildId, voiceChannelId);
-    const decision = routeInteraction({
-      guildId,
-      voiceChannelId,
-      ownerBotId,
-      fleet,
-      now: Date.now(),
-      reclaimGraceMs: env.ROOM_RECLAIM_GRACE_MS,
-    });
+    const snapshot = await readFleet(guildId, voiceChannelId, ids);
+    const decide = (fleet: FleetView): RoutingDecision =>
+      routeInteraction({
+        guildId,
+        voiceChannelId,
+        ownerBotId: snapshot.ownerBotId,
+        fleet,
+        now: Date.now(),
+        reclaimGraceMs: env.ROOM_RECLAIM_GRACE_MS,
+      });
+    let decision = decide(snapshot.fleet);
+
+    /**
+     * A refusal gets a second look, with the full roster.
+     *
+     * The fast read only sees bots that are running, which is all allocation
+     * can hand out — but "add another bot" may need to name one that is
+     * stopped, and only Postgres knows those. Refusals are rare, which is
+     * exactly why the query lives here and not on every command.
+     *
+     * Only the wording is taken from it. Postgres can lag the gateway on who
+     * is in a server, and dispatching on its word could send a command to a
+     * bot that has just been removed.
+     */
+    if (decision.kind === 'reply' && voiceChannelId !== null) {
+      const fuller = decide(await fleetFromDatabase(guildId, snapshot.presence));
+      if (fuller.kind === 'reply') decision = fuller;
+    }
 
     if (decision.kind === 'reply') {
       logger.info({ commandName, guildId, reason: 'refused' }, 'Command answered by the router');
@@ -99,7 +120,7 @@ export async function routeCommand(input: RouteCommandInput): Promise<void> {
     }
 
     /**
-     * Reserve the bot before handing the work over.
+     * Reserve the bot and hand the work over, in one round trip.
      *
      * Only when the decision actually promised a room — an owner already in
      * the channel, or a command with no room at all, has nothing to reserve.
@@ -108,18 +129,23 @@ export async function routeCommand(input: RouteCommandInput): Promise<void> {
      * answer for this channel too, so the command follows it rather than
      * allocating a second bot for the same room.
      */
+    const envelope = encodeInteractionEnvelope({
+      payload,
+      deferral,
+      voiceChannelId: decision.voiceChannelId,
+      routedAt: Date.now(),
+    });
+
     let botId = decision.botId;
     if (decision.claims && decision.voiceChannelId !== null) {
-      const won = await redis.set(
-        botClaimKey(botId),
-        decision.voiceChannelId,
-        'PX',
-        CLAIM_TTL_MS,
-        'NX',
-      );
-      if (won === null) {
-        const holder = await redis.get(roomClaimKey(guildId, decision.voiceChannelId));
-        if (holder === null) {
+      const claim = await claimAndHandOver(redis, {
+        botId,
+        guildId,
+        voiceChannelId: decision.voiceChannelId,
+        envelope,
+      });
+      if (claim.kind === 'lost') {
+        if (claim.holder === null) {
           logger.info({ commandName, guildId, botId }, 'Lost the race for a player');
           await reply(
             payload,
@@ -129,32 +155,12 @@ export async function routeCommand(input: RouteCommandInput): Promise<void> {
           return;
         }
         // Somebody claimed this very room a moment ago; follow them.
-        botId = holder;
-      } else {
-        await redis.set(roomClaimKey(guildId, decision.voiceChannelId), botId, 'PX', CLAIM_TTL_MS);
+        botId = claim.holder;
+        await handOver(redis, botId, envelope);
       }
+    } else {
+      await handOver(redis, botId, envelope);
     }
-
-    const envelope = encodeInteractionEnvelope({
-      payload,
-      deferral,
-      voiceChannelId: decision.voiceChannelId,
-      routedAt: Date.now(),
-    });
-
-    /**
-     * A list, not a channel.
-     *
-     * Publishing to a subscriber that is not there loses the message silently,
-     * and a lost slash command is not silent to the person who typed it — they
-     * watch "thinking…" until the interaction expires. A list holds the work
-     * across the second or two a container spends restarting. The expiry is
-     * there so a container that never comes back does not accumulate a queue
-     * of commands nobody wants answered any more.
-     */
-    const queue = interactionQueueKey(botId);
-    await redis.rpush(queue, envelope);
-    await redis.expire(queue, INTERACTION_QUEUE_TTL_SECONDS);
 
     logger.info(
       {
@@ -293,9 +299,9 @@ export async function routeComponent(payload: RawInteraction): Promise<void> {
       return;
     }
 
-    const queue = interactionQueueKey(botId);
-    await redis.rpush(
-      queue,
+    await handOver(
+      redis,
+      botId,
       encodeInteractionEnvelope({
         payload,
         // A component is answered with a deferred *update*; the mode is
@@ -305,7 +311,6 @@ export async function routeComponent(payload: RawInteraction): Promise<void> {
         routedAt: Date.now(),
       }),
     );
-    await redis.expire(queue, INTERACTION_QUEUE_TTL_SECONDS);
 
     logger.info({ botId, guildId, customId: customIdOf(payload) }, 'Component routed');
   } catch (error) {

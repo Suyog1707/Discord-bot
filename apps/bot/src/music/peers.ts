@@ -18,7 +18,9 @@
  */
 import {
   botClaimKey,
+  PLAYER_BOT_GUILDS_SENTINEL,
   PLAYER_BOT_TTL_SECONDS,
+  playerBotGuildsKey,
   playerBotIndexKey,
   playerBotKey,
   playerRoomOwnerKey,
@@ -87,6 +89,45 @@ export class PeerDirectory {
   async withdrawSelf(botId: string): Promise<void> {
     if (this.#redis === undefined) return;
     await this.#redis.del(playerBotKey(botId)).catch(() => undefined);
+  }
+
+  /**
+   * Publish the servers this container is in, replacing whatever was there.
+   *
+   * Read by the command router on every command, in place of a Postgres
+   * query. Replaced whole rather than patched, so a server this bot was removed
+   * from while it was down drops out without anybody having to notice. One
+   * transaction, so the router never reads the list half-written.
+   */
+  async indexGuilds(guildIds: readonly string[]): Promise<void> {
+    const redis = this.#redis;
+    if (redis === undefined) return;
+    const key = playerBotGuildsKey(this.#selfBotId);
+    await redis
+      .multi()
+      .del(key)
+      .sadd(key, PLAYER_BOT_GUILDS_SENTINEL, ...guildIds)
+      .exec()
+      .catch((error: unknown) => {
+        logger.warn({ err: error }, 'Could not publish this bot’s server list');
+      });
+  }
+
+  /**
+   * Joined a server while running.
+   *
+   * Deliberately no sentinel: before the ready-time list exists, a partial set
+   * must still read as "not published", so the router keeps asking Postgres.
+   */
+  async addGuild(guildId: string): Promise<void> {
+    if (this.#redis === undefined) return;
+    await this.#redis.sadd(playerBotGuildsKey(this.#selfBotId), guildId).catch(() => 0);
+  }
+
+  /** Removed from a server while running. */
+  async removeGuild(guildId: string): Promise<void> {
+    if (this.#redis === undefined) return;
+    await this.#redis.srem(playerBotGuildsKey(this.#selfBotId), guildId).catch(() => 0);
   }
 
   /**

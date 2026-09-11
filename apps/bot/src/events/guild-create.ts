@@ -28,6 +28,11 @@ export default defineEvent({
     // Every player records its own presence, primary included: "which players
     // does this server have?" is the question the invite prompt answers, and
     // only a row per player can answer it.
-    await client.services.guilds.setBotPresence(guild.id, client.identity.clientId, true);
+    await Promise.all([
+      client.services.guilds.setBotPresence(guild.id, client.identity.clientId, true),
+      // What the command router reads, so the new server can be routed to
+      // without waiting for a restart.
+      client.peers?.addGuild(guild.id),
+    ]);
   },
 });

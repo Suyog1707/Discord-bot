@@ -10,8 +10,8 @@
  * The shape of this file is the design. It does the least it possibly can
  * before answering, because Discord invalidates an interaction that is not
  * acknowledged within three seconds, and everything interesting — a Discord
- * round trip, two Postgres reads, several Redis calls — happens in `after()`
- * once the acknowledgement is already on its way.
+ * round trip and a few Redis calls — happens in `after()` once the
+ * acknowledgement is already on its way.
  *
  * Unauthenticated by session, deliberately: the Ed25519 signature over the
  * body is the only thing separating a real command from a forgery, which is

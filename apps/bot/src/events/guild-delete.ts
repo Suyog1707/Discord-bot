@@ -36,7 +36,11 @@ export default defineEvent({
       logger.warn({ err: error, guildId: guild.id }, 'Could not tear down the room on removal');
     });
 
-    await client.services.guilds.setBotPresence(guild.id, client.identity.clientId, false);
+    await Promise.all([
+      client.services.guilds.setBotPresence(guild.id, client.identity.clientId, false),
+      // First thing the router reads: stop sending this server's commands here.
+      client.peers?.removeGuild(guild.id),
+    ]);
     if (client.identity.role !== 'primary') return;
     await client.services.guilds.markGuildLeft(guild.id);
   },

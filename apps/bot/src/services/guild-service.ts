@@ -9,6 +9,7 @@
 import type { Guild as DiscordGuild } from 'discord.js';
 
 import type { GuildSettings, PrismaClient } from '@discord-music/database';
+import { compareRoster } from '@discord-music/shared';
 
 import { getLogger } from '../lib/logger.js';
 
@@ -202,10 +203,13 @@ export class GuildService {
 
     try {
       const rows = await this.#prisma.playerBot.findMany({
-        orderBy: { createdAt: 'asc' },
-        select: { label: true, clientId: true },
+        select: { label: true, clientId: true, role: true },
       });
-      const value = rows.map((row) => ({ botId: row.label, clientId: row.clientId }));
+      // The router's order, so the bot and the router hand out players alike.
+      const value = rows
+        .map((row) => ({ botId: row.label, clientId: row.clientId, role: row.role }))
+        .sort(compareRoster)
+        .map(({ botId, clientId }) => ({ botId, clientId }));
       this.#rosterCache = { value, expiresAt: Date.now() + ROSTER_CACHE_TTL_MS };
       return value;
     } catch (error) {

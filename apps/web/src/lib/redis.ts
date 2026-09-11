@@ -42,6 +42,10 @@ export function isRedisConfigured(): boolean {
 export async function getReadyRedis(): Promise<Redis | undefined> {
   const redis = getRedis();
   if (redis === undefined) return undefined;
+  // Connected already: no round trip. Only a new or dropped connection is
+  // opened and pinged — a routed command used to pay one PING for each of the
+  // three places that asked for a client.
+  if (redis.status === 'ready') return redis;
   await connectRedis(redis);
   return redis;
 }

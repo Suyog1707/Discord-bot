@@ -169,3 +169,37 @@ export function buildFleet(input: BuildFleetInput): FleetView {
 
   return { members, clientIds, uninvited, primaryBotId };
 }
+
+/**
+ * The order players are handed out in: the primary, then by label.
+ *
+ * Labels compare the way people read them — `player-2` before `player-10` —
+ * because the application names follow the labels ("Tesseract - 2",
+ * "Tesseract - 3"), and the second channel getting the second bot is what
+ * people expect to see. Creation order used to decide this, and creation order
+ * stops matching the names the moment two identities swap tokens.
+ */
+export function compareRoster(
+  a: { readonly botId: string; readonly role?: string },
+  b: { readonly botId: string; readonly role?: string },
+): number {
+  const rankA = a.role === 'primary' ? 0 : 1;
+  const rankB = b.role === 'primary' ? 0 : 1;
+  if (rankA !== rankB) return rankA - rankB;
+  return a.botId.localeCompare(b.botId, 'en', { numeric: true });
+}
+
+/**
+ * A roster built from the bots that are running, for a reader with no Postgres
+ * to hand.
+ *
+ * Only live identities appear, which is all allocation can hand out anyway.
+ * What it cannot answer is which *stopped* identities a server could still
+ * invite, so a caller about to say "add another bot" should read the full
+ * roster first.
+ */
+export function rosterFromPresence(presence: readonly BotPresence[]): readonly RosterEntry[] {
+  return [...presence]
+    .sort(compareRoster)
+    .map((entry) => ({ botId: entry.botId, clientId: entry.clientId }));
+}
