@@ -615,6 +615,41 @@ export function pickBestSpotifyResult(
   return rankSpotifyResults(query, page)[0] ?? null;
 }
 
+/**
+ * A search result, plus the track itself when the result is a track.
+ *
+ * `/search` answers with whole track objects — runtime, ISRC, album and art —
+ * so a free-text `/play` that lands on a track already holds everything
+ * `/tracks/{id}` would return. Fetching it again cost a Spotify round trip,
+ * and the linked-account database read in front of it, on every such `/play`.
+ */
+export interface SpotifySearchMatch extends SpotifySearchHit {
+  readonly track?: SpotifyTrackMeta;
+}
+
+/** Whether a search item is a whole track, not just the slice ranking reads. */
+function isWholeTrack(value: unknown): value is RawTrack {
+  if (typeof value !== 'object' || value === null) return false;
+  const candidate = value as { readonly name?: unknown; readonly duration_ms?: unknown };
+  return typeof candidate.name === 'string' && typeof candidate.duration_ms === 'number';
+}
+
+/** {@link pickBestSpotifyResult}, keeping the matched track's own details. */
+export function bestSpotifyMatch(
+  query: string,
+  page: SpotifySearchPage,
+): SpotifySearchMatch | null {
+  const best = pickBestSpotifyResult(query, page);
+  if (best?.kind !== 'track') return best;
+
+  const raw: unknown = page.tracks?.items?.find(
+    (item) => item?.external_urls?.spotify === best.url,
+  );
+  // Without a runtime there is nothing to match playback against; fetching the
+  // track properly beats guessing.
+  return isWholeTrack(raw) ? { ...best, track: toMeta(raw) } : best;
+}
+
 async function searchPage(query: string): Promise<SpotifySearchPage> {
   return catalogueGet<SpotifySearchPage>(
     `/search?type=track,album,artist,playlist&limit=10&q=${encodeURIComponent(query)}`,
@@ -628,11 +663,11 @@ async function searchPage(query: string): Promise<SpotifySearchPage> {
  * Returns null when Spotify is unconfigured, unreachable, or has no credible
  * match, so the caller can always fall back to a plain provider search.
  */
-export async function searchSpotifyBest(query: string): Promise<SpotifySearchHit | null> {
+export async function searchSpotifyBest(query: string): Promise<SpotifySearchMatch | null> {
   if (!isSpotifyConfigured()) return null;
 
   try {
-    const best = pickBestSpotifyResult(query, await searchPage(query));
+    const best = bestSpotifyMatch(query, await searchPage(query));
     logger.debug(
       best === null
         ? { query, matched: false }

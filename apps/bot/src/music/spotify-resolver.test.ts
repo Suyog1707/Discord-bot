@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { pickBestSpotifyResult, type SpotifySearchPage } from './spotify-resolver.js';
+import {
+  bestSpotifyMatch,
+  pickBestSpotifyResult,
+  type SpotifySearchPage,
+} from './spotify-resolver.js';
 
 const url = (kind: string, id: string): string => `https://open.spotify.com/${kind}/${id}`;
 
@@ -197,5 +201,64 @@ describe('pickBestSpotifyResult', () => {
     };
 
     expect(pickBestSpotifyResult('Parwana', page)?.url).toBe(url('track', 't1'));
+  });
+});
+
+describe('bestSpotifyMatch', () => {
+  /**
+   * `/search` answers with whole track objects, so a free-text /play that lands
+   * on a track already has what `/tracks/{id}` would return. Keeping it is a
+   * Spotify request, and the account lookup in front of it, not made.
+   */
+  it('keeps the matched track’s details so they need not be fetched again', () => {
+    const page = {
+      tracks: {
+        items: [
+          {
+            ...track('Blinding Lights', ['The Weeknd'], 95, 'bl'),
+            id: 'bl',
+            duration_ms: 200_040,
+            external_ids: { isrc: 'USUG11904206' },
+            album: { name: 'After Hours', images: [{ url: 'https://i.scdn.co/image/cover' }] },
+          },
+        ],
+      },
+      // The whole track object `/search` really returns, beyond the ranking slice.
+    } as unknown as SpotifySearchPage;
+
+    expect(bestSpotifyMatch('Blinding Lights', page)).toMatchObject({
+      kind: 'track',
+      url: url('track', 'bl'),
+      track: {
+        title: 'Blinding Lights',
+        artist: 'The Weeknd',
+        durationMs: 200_040,
+        isrc: 'USUG11904206',
+        album: 'After Hours',
+        artworkUrl: 'https://i.scdn.co/image/cover',
+        spotifyId: 'bl',
+        spotifyUrl: url('track', 'bl'),
+      },
+    });
+  });
+
+  it('attaches nothing when the best match is not a track', () => {
+    const page: SpotifySearchPage = {
+      albums: { items: [album('Parwana', ['Aditya Rikhari'], 'album', 'a1')] },
+    };
+
+    const match = bestSpotifyMatch('Parwana', page);
+
+    expect(match?.kind).toBe('album');
+    expect(match?.track).toBeUndefined();
+  });
+
+  it('leaves the track to be fetched when the response lacks its runtime', () => {
+    // Only the slice ranking reads — no runtime to match playback against.
+    const page: SpotifySearchPage = {
+      tracks: { items: [track('Parwana', ['Aditya Rikhari'], 50, 't1')] },
+    };
+
+    expect(bestSpotifyMatch('Parwana', page)?.track).toBeUndefined();
   });
 });

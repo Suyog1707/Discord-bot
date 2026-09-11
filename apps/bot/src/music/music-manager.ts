@@ -79,7 +79,7 @@ import { AUTOPLAY_WEIGHTS } from './match-config.js';
 import { identifyCanonicalTrack } from './metadata-providers.js';
 import { resolvePlayback, ResolutionCache, type ResolvedPlayback } from './playback-resolver.js';
 import { getResolutionSettings } from './resolution-settings.js';
-import type { SpotifyTrackMeta } from './spotify-resolver.js';
+import type { SpotifyResolution, SpotifyTrackMeta } from './spotify-resolver.js';
 import type { PersistedQueue, QueueStore, StayConnectedSession } from './queue-store.js';
 import { resolvePlatformLinks, type PlatformLinks } from './platform-links.js';
 import {
@@ -1639,18 +1639,21 @@ export class MusicManager {
     url: string,
     requestedBy: { readonly id: string; readonly name: string },
     preference: PlaybackPreference = 'auto',
+    /** The metadata, when a search already returned it; otherwise fetched. */
+    known?: SpotifyResolution,
   ): Promise<ResolveResult> {
     if (this.shoukaku.getIdealNode() === undefined) {
       throw new UpstreamError('The music server is not available right now. Try again shortly.');
     }
 
     const metadataStartedAt = Date.now();
-    const resolution = await resolveSpotifyUrl(url, requestedBy.id, this.#spotify);
+    const resolution = known ?? (await resolveSpotifyUrl(url, requestedBy.id, this.#spotify));
     logger.info(
       {
         firstPageTracks: resolution.tracks.length,
         paged: resolution.more !== undefined,
         durationMs: Date.now() - metadataStartedAt,
+        fromSearch: known !== undefined,
       },
       'Spotify metadata fetch complete',
     );
@@ -2394,7 +2397,10 @@ export class MusicManager {
     const hit = await searchSpotifyBest(input);
     if (hit !== null) {
       try {
-        return await this.#resolveSpotify(hit.url, requestedBy, source);
+        // A track hit already carries the track, so it is not fetched again.
+        const known: SpotifyResolution | undefined =
+          hit.track === undefined ? undefined : { tracks: [hit.track], collectionName: null };
+        return await this.#resolveSpotify(hit.url, requestedBy, source, known);
       } catch (error) {
         // The catalogue had a match but nothing playable came of it. The other
         // metadata providers still get their turn below.
