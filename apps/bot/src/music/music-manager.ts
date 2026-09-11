@@ -280,6 +280,12 @@ export interface JoinOptions {
    * restores the queue itself, with its own cursor handling.
    */
   readonly resumeSavedQueue?: boolean;
+  /**
+   * Called the moment the voice join is about to go out — only when this call
+   * actually joins. Everything before it is setup, and the `/play` timeline
+   * needs that line drawn to say whether the wait was ours or Discord's.
+   */
+  readonly onJoinStarted?: () => void;
 }
 
 /** What a fresh join brought back with it, for the command to mention. */
@@ -737,6 +743,7 @@ export class MusicManager {
         ? null
         : await this.#savedQueueFor(options.guildId, options.voiceChannelId);
 
+    options.onJoinStarted?.();
     const player = await this.#joinVoiceChannel(
       options.guildId,
       options.voiceChannelId,

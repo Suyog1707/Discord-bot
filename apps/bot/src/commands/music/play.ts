@@ -5,7 +5,9 @@ import { LoadType } from 'shoukaku';
 
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
+import { routedReceiptOf } from '../../core/routed-interactions.js';
 import type { ResolveResult } from '../../music/music-manager.js';
+import { playTimeline } from '../../music/play-timeline.js';
 import { isSpotifyConfigured, searchSpotifySuggestions } from '../../music/spotify-resolver.js';
 import { formatTrackDuration, trackLink, type QueuedTrack } from '../../music/track.js';
 import { requireMusic, requireRouter, requireVoiceContext } from '../../music/voice-context.js';
@@ -24,6 +26,13 @@ function clip(value: string, max = 100): string {
  * short-lived cache removes most of that traffic.
  */
 const SUGGESTION_TTL_MS = 60_000;
+
+/**
+ * How long the timeline waits for Lavalink to say the track started. Past this
+ * the line is written without it — a song that takes longer than this to start
+ * is its own log line already.
+ */
+const AUDIO_START_WAIT_MS = 15_000;
 const SUGGESTION_MAX_ENTRIES = 500;
 const suggestionCache = new Map<
   string,
@@ -149,6 +158,7 @@ export default defineCommand({
   },
 
   async execute({ interaction }) {
+    const executeAt = Date.now();
     const client = interaction.client as BotClient;
     const music = requireMusic(client);
     const context = requireVoiceContext(interaction);
@@ -174,23 +184,37 @@ export default defineCommand({
 
     // Track lookup and joining voice are independent — the gateway round-trip
     // for the voice connection is dead time if it waits for the search.
-    const resolving = music.resolve(
-      query,
-      {
-        id: interaction.user.id,
-        name:
-          interaction.member !== null && 'displayName' in interaction.member
-            ? interaction.member.displayName
-            : interaction.user.username,
-      },
-      source,
-    );
-    const joining = router.openRoom({
-      guildId: context.guildId,
-      voiceChannelId: context.voiceChannelId,
-      textChannelId: interaction.channelId,
-      shardId: interaction.guild?.shardId ?? 0,
-    });
+    const marks: { joinStartedAt?: number; joinedAt?: number; resolvedAt?: number } = {};
+    const resolving = music
+      .resolve(
+        query,
+        {
+          id: interaction.user.id,
+          name:
+            interaction.member !== null && 'displayName' in interaction.member
+              ? interaction.member.displayName
+              : interaction.user.username,
+        },
+        source,
+      )
+      .then((resolved) => {
+        marks.resolvedAt = Date.now();
+        return resolved;
+      });
+    const joining = router
+      .openRoom({
+        guildId: context.guildId,
+        voiceChannelId: context.voiceChannelId,
+        textChannelId: interaction.channelId,
+        shardId: interaction.guild?.shardId ?? 0,
+        onJoinStarted: () => {
+          marks.joinStartedAt = Date.now();
+        },
+      })
+      .then((opened) => {
+        marks.joinedAt = Date.now();
+        return opened;
+      });
     // Awaited below; this only stops a join failure from surfacing as an
     // unhandled rejection while the lookup is still running.
     joining.catch(() => undefined);
@@ -215,6 +239,9 @@ export default defineCommand({
     }
 
     const room = await joining;
+    // Subscribed before the play request goes out: Lavalink's start event can
+    // beat the REST reply that acknowledges the request.
+    const audioStarted = room.local?.player.whenTrackStarts(AUDIO_START_WAIT_MS);
 
     /**
      * Queue the tracks wherever the room turned out to be.
@@ -239,6 +266,37 @@ export default defineCommand({
       return;
     }
     if (queued.kind !== 'enqueued') return;
+
+    const playRequestedAt = Date.now();
+    const startedPlayback = queued.startedPlayback;
+    const receipt = routedReceiptOf(interaction);
+    const logTimeline = (audioAt: number | undefined): void => {
+      client.logger.info(
+        {
+          event: 'PLAY_TIMELINE',
+          guildId: context.guildId,
+          botId: room.botId,
+          routed: receipt !== undefined,
+          alreadyConnected,
+          startedPlayback,
+          ...playTimeline({
+            interactionId: interaction.id,
+            routedAt: receipt?.routedAt,
+            pickedUpAt: receipt?.pickedUpAt,
+            executeAt,
+            ...marks,
+            playRequestedAt,
+            audioAt,
+          }),
+        },
+        '/play timeline',
+      );
+    };
+    if (startedPlayback && audioStarted !== undefined) {
+      void audioStarted.then(logTimeline);
+    } else {
+      logTimeline(undefined);
+    }
 
     if (result.background !== undefined) {
       // Each resolved batch is queued as it lands, so the queue keeps growing

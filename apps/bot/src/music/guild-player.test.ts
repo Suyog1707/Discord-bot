@@ -1333,3 +1333,31 @@ describe('GuildPlayer empty-room playback', () => {
     expect(played(h.player).length).toBeGreaterThan(0);
   });
 });
+
+describe('GuildPlayer.whenTrackStarts', () => {
+  it('answers with the moment Lavalink reported the start', async () => {
+    const h = harness();
+    const started = h.gp.whenTrackStarts(1_000);
+
+    await h.gp.enqueue([track('t1', 'Song One')]);
+    const before = Date.now();
+    h.player.emit('start');
+
+    const at = await started;
+    expect(at).toBeGreaterThanOrEqual(before);
+    expect(at).toBeLessThanOrEqual(Date.now());
+  });
+
+  it('gives up quietly when nothing starts', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const h = harness();
+      const started = h.gp.whenTrackStarts(1_000);
+      vi.advanceTimersByTime(1_000);
+
+      await expect(started).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

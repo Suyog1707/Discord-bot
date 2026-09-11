@@ -37,6 +37,7 @@ import {
   rehydrateChatInputInteraction,
   rehydrateComponentInteraction,
 } from './interaction-rehydrate.js';
+import { markRouted } from './routed-interactions.js';
 
 const logger = getLogger('routed-commands');
 
@@ -105,6 +106,7 @@ export class InteractionSubscriber {
   }
 
   async #handle(raw: string): Promise<void> {
+    const pickedUpAt = Date.now();
     const envelope = decodeInteractionEnvelope(raw);
     if (envelope === null) {
       logger.warn({ raw: raw.slice(0, 200) }, 'Dropped malformed routed command');
@@ -219,6 +221,11 @@ export class InteractionSubscriber {
       envelope.payload as unknown as APIChatInputApplicationCommandInteraction,
       envelope.deferral,
     );
+    markRouted(interaction, {
+      routedAt: envelope.routedAt,
+      pickedUpAt,
+      voiceChannelId: envelope.voiceChannelId,
+    });
 
     this.#warnOnVoiceDrift(envelope, interaction.member);
 

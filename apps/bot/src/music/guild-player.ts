@@ -234,6 +234,8 @@ export class GuildPlayer {
   #trackStartedAt = 0;
   /** Whether a track is actually playing right now. See `isPlaying`. */
   #playing = false;
+  /** Callers waiting to hear when the next track actually starts. */
+  readonly #trackStartWaiters = new Set<(startedAt: number) => void>();
 
   /**
    * Whether anybody who is not a bot is in the voice channel.
@@ -552,6 +554,32 @@ export class GuildPlayer {
   /** The filter preset currently applied, or null for clean playback. */
   get activeFilter(): FilterPresetName | 'speed' | 'pitch' | null {
     return this.#activeFilter;
+  }
+
+  /**
+   * When Lavalink next reports a track starting, as epoch ms — or undefined if
+   * nothing starts within `timeoutMs`.
+   *
+   * Measurement only. The request to play returns when Lavalink has accepted
+   * it, not when audio is flowing; the gap between the two is the stream load
+   * and the voice handshake, and it is invisible without this.
+   */
+  whenTrackStarts(timeoutMs: number): Promise<number | undefined> {
+    return new Promise((resolve) => {
+      const waiter = {
+        timer: undefined as NodeJS.Timeout | undefined,
+        started: (startedAt: number): void => {
+          clearTimeout(waiter.timer);
+          resolve(startedAt);
+        },
+      };
+      waiter.timer = setTimeout(() => {
+        this.#trackStartWaiters.delete(waiter.started);
+        resolve(undefined);
+      }, timeoutMs);
+      waiter.timer.unref();
+      this.#trackStartWaiters.add(waiter.started);
+    });
   }
 
   /* ---------------------------------------------------------------- control */
@@ -874,6 +902,8 @@ export class GuildPlayer {
       this.#playing = true;
       this.#autoplayRetries = 0;
       this.#trackStartedAt = Date.now();
+      for (const started of this.#trackStartWaiters) started(this.#trackStartedAt);
+      this.#trackStartWaiters.clear();
       this.#clearIdleTimer();
       this.#emit('TRACK_START');
       const track = this.queue.current;
