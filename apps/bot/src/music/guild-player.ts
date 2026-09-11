@@ -474,12 +474,19 @@ export class GuildPlayer {
   /** 24/7 mode. Enabling cancels any pending idle disconnect immediately. */
   setStayConnected(enabled: boolean): void {
     this.#stayConnected = enabled;
-    if (enabled) {
-      this.#clearIdleTimer();
-    } else if (!this.isPlaying) {
-      this.#startIdleTimer();
-    }
+    this.#syncIdleTimer();
     this.#emit('STAY_CONNECTED_CHANGE');
+  }
+
+  /**
+   * How long nothing may play before the bot leaves. A changed setting reaches
+   * a room that is already idle, counted afresh from now — otherwise it would
+   * only apply to the next channel the bot joins.
+   */
+  setIdleTimeout(seconds: number): void {
+    this.#idleTimeoutSeconds = seconds;
+    this.#clearIdleTimer();
+    this.#syncIdleTimer();
   }
 
   /** Discord id of the primary listener, or null before anyone has requested. */
@@ -518,7 +525,7 @@ export class GuildPlayer {
     // An empty room gets no radio. Whoever walks in starts it.
     if (!this.#listenersPresent) return false;
     const outcome = await this.#tryAutoplay();
-    if (outcome === 'continued') this.#clearIdleTimer();
+    this.#syncIdleTimer();
     return outcome === 'continued';
   }
 
@@ -537,8 +544,8 @@ export class GuildPlayer {
     } else if (this.queue.upcoming.length === 0) {
       // The most likely moment to switch autoplay on is right after "queue
       // finished". A parked player has nothing to top up; it needs restarting.
-      void this.#tryAutoplay().then((outcome) => {
-        if (outcome === 'continued') this.#clearIdleTimer();
+      void this.#tryAutoplay().then(() => {
+        this.#syncIdleTimer();
       });
     }
   }
@@ -697,6 +704,8 @@ export class GuildPlayer {
     this.#pausedForEmptyRoom = false;
     await this.#player.setPaused(true);
     this.#persist();
+    // A pause is nothing playing. Forgotten, it would hold the bot forever.
+    this.#syncIdleTimer();
     this.#emit('TRACK_PAUSE');
   }
 
@@ -704,6 +713,7 @@ export class GuildPlayer {
     this.#pausedForEmptyRoom = false;
     await this.#player.setPaused(false);
     this.#persist();
+    this.#syncIdleTimer();
     this.#emit('TRACK_RESUME');
   }
 
@@ -786,7 +796,9 @@ export class GuildPlayer {
     this.#stopRequested = this.isPlaying;
     await this.#player.stopTrack();
     this.#persist();
-    this.#startIdleTimer();
+    // A stop on a playing track is finished by its end event, which clears
+    // `#playing` and syncs again; this covers a stop with nothing playing.
+    this.#syncIdleTimer();
     this.#emit('QUEUE_CLEAR');
   }
 
@@ -812,19 +824,20 @@ export class GuildPlayer {
   /**
    * Voice-state hook: the bot is alone (or not) in its channel.
    *
-   * Two separate consequences. The idle timer (unchanged) decides whether to
-   * LEAVE, and 24/7 mode switches it off. Playback is the new one and 24/7
-   * does not exempt it: an empty room hears nothing either way.
+   * Playback follows the room: an empty room is paused, and 24/7 does not
+   * exempt it, because an empty room hears nothing either way. Leaving does
+   * not follow the room directly — it follows whether anything is playing, and
+   * an emptied room gets there through that pause.
    *
-   * Called on every voice-state change in the guild, so the transition is
-   * what matters — repeating "still empty" must not re-pause or re-announce.
+   * Called on every voice-state change in the guild — a mute, a move in some
+   * other channel, another bot arriving — so the transition is what matters:
+   * repeating "still empty" must not re-pause, re-announce, or restart the
+   * countdown to leaving.
    */
   onOccupancyChange(listenersPresent: boolean): void {
-    if (listenersPresent) {
-      this.#clearIdleTimer();
-    } else {
-      this.#startIdleTimer();
-    }
+    // Makes sure a countdown exists when nothing is playing. Never restarts or
+    // cancels one — see `#syncIdleTimer` for why that is the whole fix.
+    this.#syncIdleTimer();
 
     if (this.#listenersPresent === listenersPresent) return;
     this.#listenersPresent = listenersPresent;
@@ -885,12 +898,12 @@ export class GuildPlayer {
     if (this.#awaitingRequest) return;
 
     if (await this.#startParked()) {
-      this.#clearIdleTimer();
+      this.#syncIdleTimer();
       return;
     }
     if (!this.#autoplayEnabled) return;
-    const outcome = await this.#tryAutoplay();
-    if (outcome === 'continued') this.#clearIdleTimer();
+    await this.#tryAutoplay();
+    this.#syncIdleTimer();
   }
 
   /* ----------------------------------------------------------------- events */
@@ -904,7 +917,7 @@ export class GuildPlayer {
       this.#trackStartedAt = Date.now();
       for (const started of this.#trackStartWaiters) started(this.#trackStartedAt);
       this.#trackStartWaiters.clear();
-      this.#clearIdleTimer();
+      this.#syncIdleTimer();
       this.#emit('TRACK_START');
       const track = this.queue.current;
       if (track === null) return;
@@ -1241,7 +1254,7 @@ export class GuildPlayer {
       const stopped = this.#stopRequested;
       this.#stopRequested = false;
       if (stopped) {
-        this.#startIdleTimer();
+        this.#syncIdleTimer();
         return;
       }
 
@@ -1250,7 +1263,7 @@ export class GuildPlayer {
       // a track nobody heard into this guild's listening history. Whoever
       // walks in next starts it again.
       if (!this.#listenersPresent) {
-        this.#startIdleTimer();
+        this.#syncIdleTimer();
         return;
       }
 
@@ -1264,7 +1277,7 @@ export class GuildPlayer {
       if (outcome === 'exhausted') {
         await this.#notify('✅ Queue finished. Add more with `/play`.');
       }
-      this.#startIdleTimer();
+      this.#syncIdleTimer();
       return;
     }
 
@@ -1463,10 +1476,8 @@ export class GuildPlayer {
       if (this.#destroyed || this.isPlaying || !this.#autoplayEnabled) return;
       if (!this.#listenersPresent) return;
       void this.#tryAutoplay().then(async (outcome) => {
-        if (outcome === 'continued') {
-          this.#clearIdleTimer();
-          return;
-        }
+        this.#syncIdleTimer();
+        if (outcome === 'continued') return;
         await this.#notify('✅ Queue finished. Add more with `/play`.');
       });
     }, AUTOPLAY_RETRY_DELAY_MS);
@@ -1561,7 +1572,7 @@ export class GuildPlayer {
       } else if ((await this.#tryAutoplay()) !== 'continued') {
         // The last track in the queue was unplayable: that is a drained
         // queue, and autoplay gets its say before the player parks.
-        this.#startIdleTimer();
+        this.#syncIdleTimer();
       }
     }
   }
@@ -1668,12 +1679,38 @@ export class GuildPlayer {
     });
   }
 
-  #startIdleTimer(): void {
-    // 24/7 mode: the whole point is to stay in the channel while idle.
-    if (this.#stayConnected) return;
+  /** In use: 24/7 is on, or a track is audibly playing. */
+  #isActive(): boolean {
+    return this.#stayConnected || (this.#playing && !this.paused);
+  }
 
-    this.#clearIdleTimer();
+  /**
+   * Make the countdown to leaving match whether anything is playing.
+   *
+   * One rule: with nothing playing, the bot leaves after the idle timeout. A
+   * finished queue, a stop, a pause somebody forgot, a join nobody followed
+   * with a song, a room everyone walked out of (which pauses first) — all the
+   * same. 24/7 is the only exemption.
+   *
+   * Idempotent, and it never restarts a countdown that is already running.
+   * That is the fix rather than a detail. The countdown used to be moved by
+   * voice-state events, which arrive for every mute and every move anywhere in
+   * the server: a listener unmuting cancelled it outright, and an empty room
+   * had its five minutes reset by each event, so in practice the bot never
+   * left. Now only a change in whether music plays can move it.
+   */
+  #syncIdleTimer(): void {
+    if (this.#destroyed || this.#isActive()) {
+      this.#clearIdleTimer();
+      return;
+    }
+    if (this.#idleTimer !== undefined) return;
+
     const timer = setTimeout(() => {
+      this.#idleTimer = undefined;
+      // A path that started music without syncing must not be torn down
+      // mid-song; the next idle moment starts a fresh countdown.
+      if (this.#isActive()) return;
       void this.#onSelfDestruct(this.guildId, 'idle-timeout');
     }, this.#idleTimeoutSeconds * 1000);
     timer.unref();

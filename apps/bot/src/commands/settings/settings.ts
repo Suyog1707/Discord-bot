@@ -199,6 +199,11 @@ export default defineCommand({
           interaction.options.getInteger('seconds', true),
         );
         await guilds.updateSettings(guildId, { leaveOnEmptyAfter: seconds });
+        // Like 24/7: rooms already open take the new value now, not on their
+        // next join.
+        for (const room of client.router?.roomsIn(guildId) ?? []) {
+          room.player.setIdleTimeout(seconds);
+        }
         await interaction.editReply({
           content: `I'll leave voice after **${String(seconds)}s** of inactivity.`,
         });

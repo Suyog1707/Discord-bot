@@ -13,7 +13,7 @@
  */
 import type { Client } from 'discord.js';
 import type { Player } from 'shoukaku';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { GuildPlayer } from './guild-player.js';
 import type { QueueStore } from './queue-store.js';
@@ -162,6 +162,7 @@ interface HarnessOptions {
   readonly targetQueueSize?: number;
   readonly autoplay?: AutoplayRequest;
   readonly announce?: boolean;
+  readonly stayConnected?: boolean;
 }
 
 interface Harness {
@@ -205,7 +206,7 @@ function harness(options: HarnessOptions = {}): Harness {
     initialVolume: 100,
     // Long enough that the idle timer never fires inside a test.
     idleTimeoutSeconds: 300,
-    stayConnected: false,
+    stayConnected: options.stayConnected ?? false,
     autoplayEnabled: options.autoplayEnabled ?? false,
     autoplayLowWaterMark: options.lowWaterMark ?? 2,
     autoplayTargetQueueSize: options.targetQueueSize ?? 4,
@@ -1359,5 +1360,128 @@ describe('GuildPlayer.whenTrackStarts', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('GuildPlayer leaving when nothing plays', () => {
+  /**
+   * The rule under test: nothing playing for the idle timeout means the bot
+   * leaves. Voice-state events — which arrive for every mute and every move
+   * anywhere in the server — must neither cancel that countdown nor restart it.
+   *
+   * Only timeouts are faked; `settle` needs real `setImmediate` to let the
+   * player's own promise chains finish.
+   */
+  const IDLE_MS = 300_000;
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function finishOnlyTrack(h: Harness): Promise<void> {
+    await h.gp.enqueue([track('t1', 'Song One')]);
+    h.player.emit('start');
+    endNaturally(h.player);
+    await settle();
+  }
+
+  it('leaves after the queue finishes, even when someone unmutes in the meantime', async () => {
+    const h = harness();
+    h.gp.onOccupancyChange(true);
+    await finishOnlyTrack(h);
+
+    vi.advanceTimersByTime(120_000);
+    // A mute toggle: people are still there, nothing changed about the music.
+    h.gp.onOccupancyChange(true);
+    vi.advanceTimersByTime(IDLE_MS - 120_000);
+
+    expect(h.selfDestruct).toHaveBeenCalledWith('guild-1', 'idle-timeout');
+  });
+
+  it('does not push the leave back on every voice event in an empty room', async () => {
+    const h = harness();
+    h.gp.onOccupancyChange(false);
+    await settle();
+
+    vi.advanceTimersByTime(200_000);
+    h.gp.onOccupancyChange(false);
+    vi.advanceTimersByTime(IDLE_MS - 200_000);
+
+    expect(h.selfDestruct).toHaveBeenCalledWith('guild-1', 'idle-timeout');
+  });
+
+  it('leaves when joined and never given a song', () => {
+    const h = harness();
+    h.gp.onOccupancyChange(true);
+
+    vi.advanceTimersByTime(IDLE_MS);
+
+    expect(h.selfDestruct).toHaveBeenCalledWith('guild-1', 'idle-timeout');
+  });
+
+  it('counts a forgotten pause as nothing playing', async () => {
+    const h = harness();
+    h.gp.onOccupancyChange(true);
+    await h.gp.enqueue([track('t1', 'Song One')]);
+    h.player.emit('start');
+    await h.gp.pause();
+
+    vi.advanceTimersByTime(IDLE_MS);
+
+    expect(h.selfDestruct).toHaveBeenCalledWith('guild-1', 'idle-timeout');
+  });
+
+  it('stays when the pause is lifted in time', async () => {
+    const h = harness();
+    h.gp.onOccupancyChange(true);
+    await h.gp.enqueue([track('t1', 'Song One')]);
+    h.player.emit('start');
+    await h.gp.pause();
+
+    vi.advanceTimersByTime(IDLE_MS - 1_000);
+    await h.gp.resume();
+    vi.advanceTimersByTime(IDLE_MS * 4);
+
+    expect(h.selfDestruct).not.toHaveBeenCalled();
+  });
+
+  it('never leaves while music plays, whatever the room does', async () => {
+    const h = harness();
+    h.gp.onOccupancyChange(true);
+    await h.gp.enqueue([track('t1', 'Song One')]);
+    h.player.emit('start');
+
+    for (let minute = 0; minute < 60; minute += 1) {
+      h.gp.onOccupancyChange(true);
+      vi.advanceTimersByTime(60_000);
+    }
+
+    expect(h.selfDestruct).not.toHaveBeenCalled();
+  });
+
+  it('never leaves in 24/7 mode, and starts counting the moment it is switched off', () => {
+    const h = harness({ stayConnected: true });
+    h.gp.onOccupancyChange(false);
+    vi.advanceTimersByTime(IDLE_MS * 12);
+    expect(h.selfDestruct).not.toHaveBeenCalled();
+
+    h.gp.setStayConnected(false);
+    vi.advanceTimersByTime(IDLE_MS);
+
+    expect(h.selfDestruct).toHaveBeenCalledWith('guild-1', 'idle-timeout');
+  });
+
+  it('applies a changed auto-leave to a room that is already idle', () => {
+    const h = harness();
+    h.gp.onOccupancyChange(true);
+
+    h.gp.setIdleTimeout(60);
+    vi.advanceTimersByTime(60_000);
+
+    expect(h.selfDestruct).toHaveBeenCalledWith('guild-1', 'idle-timeout');
   });
 });
