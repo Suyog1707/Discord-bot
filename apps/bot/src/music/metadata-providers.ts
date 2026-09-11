@@ -346,18 +346,21 @@ export async function identifyCanonicalTrack(query: string): Promise<CanonicalTr
   const trimmed = query.trim();
   if (trimmed.length === 0) return null;
 
-  // Deezer first of the two: it is the only one that returns an ISRC, so when
-  // both would match, the identification that comes back is the stronger one.
+  // Both asked at once, Deezer's answer preferred: it is the only one that
+  // returns an ISRC, so when both match, the identification that comes back is
+  // the stronger one. Asking Apple only once Deezer had come back empty put two
+  // catalogue round trips in a row in front of somebody waiting on `/play`.
+  const applePending = lookupAppleMusic(trimmed).catch((error: unknown) => {
+    logger.debug({ err: error, query: trimmed }, 'Apple Music identification failed');
+    return null;
+  });
   const deezer = await lookupDeezer(trimmed).catch((error: unknown) => {
     logger.debug({ err: error, query: trimmed }, 'Deezer identification failed');
     return null;
   });
   if (deezer !== null) return deezer;
 
-  const apple = await lookupAppleMusic(trimmed).catch((error: unknown) => {
-    logger.debug({ err: error, query: trimmed }, 'Apple Music identification failed');
-    return null;
-  });
+  const apple = await applePending;
   if (apple !== null) return await enrichIsrc(apple);
 
   return null;

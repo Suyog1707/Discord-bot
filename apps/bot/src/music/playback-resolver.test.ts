@@ -354,3 +354,106 @@ describe('cache and provider pinning', () => {
     expect(recovery.trace.cached).toBe(false);
   });
 });
+
+describe('searching providers side by side', () => {
+  /**
+   * SoundCloud still decides first: a confident answer there never touches
+   * YouTube, and YouTube's answer is used only once SoundCloud has given up.
+   * What changed is *when* YouTube starts — as soon as SoundCloud is unsure,
+   * rather than after it has run every query it has.
+   */
+  const delay = async (ms: number): Promise<void> =>
+    new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  const bootleg = (): MatchCandidate =>
+    upload('Blinding Lights (Sped Up)', 'nightcorezone', 150_000);
+  const scOriginal = (): MatchCandidate => upload('Blinding Lights', 'The Weeknd', 200_000);
+  const ytOfficial = (): MatchCandidate =>
+    upload('Blinding Lights (Official Audio)', 'The Weeknd - Topic', 200_000);
+
+  it('starts YouTube while SoundCloud is still unsure, not after it gives up', async () => {
+    const events: string[] = [];
+    const search: ProviderSearch<MatchCandidate> = async (_query, provider) => {
+      events.push(`${provider}:start`);
+      await delay(15);
+      events.push(`${provider}:end`);
+      return provider === 'soundcloud' ? [bootleg()] : [ytOfficial()];
+    };
+
+    const { result } = await resolvePlayback(wanted, search);
+
+    expect(result?.provider).toBe('youtube');
+    expect(events.indexOf('youtube:start')).toBeLessThan(events.lastIndexOf('soundcloud:end'));
+  });
+
+  it('still takes SoundCloud when it comes good, even after YouTube has answered', async () => {
+    let soundcloudQueries = 0;
+    const search: ProviderSearch<MatchCandidate> = async (_query, provider) => {
+      if (provider === 'youtube') return [ytOfficial()];
+      soundcloudQueries += 1;
+      await delay(10);
+      return soundcloudQueries === 1 ? [bootleg()] : [scOriginal()];
+    };
+
+    const { result } = await resolvePlayback(wanted, search);
+
+    expect(result?.provider).toBe('soundcloud');
+  });
+
+  it('stops the other provider once the answer is in', async () => {
+    const calls = { soundcloud: 0, youtube: 0 };
+    const search: ProviderSearch<MatchCandidate> = async (_query, provider) => {
+      calls[provider] += 1;
+      if (provider === 'soundcloud') {
+        await delay(5);
+        return calls.soundcloud === 1 ? [bootleg()] : [scOriginal()];
+      }
+      await delay(40);
+      // Never confident, so without the stop YouTube would run its whole plan.
+      return [bootleg()];
+    };
+
+    const { result } = await resolvePlayback(wanted, search);
+    await delay(150);
+
+    expect(result?.provider).toBe('soundcloud');
+    expect(calls.youtube).toBeLessThanOrEqual(1);
+  });
+
+  it('starts YouTube alongside a SoundCloud search that is slow to answer', async () => {
+    const calls: PlaybackProvider[] = [];
+    const search: ProviderSearch<MatchCandidate> = async (_query, provider) => {
+      calls.push(provider);
+      if (provider === 'soundcloud') {
+        await delay(60);
+        return [scOriginal()];
+      }
+      return [ytOfficial()];
+    };
+
+    const { result } = await resolvePlayback(wanted, search, { headStartMs: 10 });
+
+    // The head start ran out, so YouTube was asked — and SoundCloud still won.
+    expect(calls).toContain('youtube');
+    expect(result?.provider).toBe('soundcloud');
+  });
+
+  it('runs the searches after the first in pairs', async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const search: ProviderSearch<MatchCandidate> = async () => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await delay(5);
+      inFlight -= 1;
+      return [bootleg()];
+    };
+
+    const { trace } = await resolvePlayback(wanted, search, { order: ['youtube'] });
+
+    expect(peak).toBe(2);
+    // Every query in the plan still ran: pairing changes the timing, not the plan.
+    expect(trace.attempts[0]?.queriesRun).toBeGreaterThan(2);
+  });
+});

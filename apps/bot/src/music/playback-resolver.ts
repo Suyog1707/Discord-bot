@@ -16,6 +16,11 @@
  * for the tracks the quiet one genuinely does not have, and it is consulted
  * under stricter rules when it is.
  *
+ * "First" is about whose answer wins, not about waiting in line. The quieter
+ * catalogue gets a head start and the final say; the noisier one is started
+ * alongside it as soon as the quiet one is unsure, so a fall-through no longer
+ * pays for every SoundCloud query before YouTube has even been asked.
+ *
  * Falling through both is a legitimate outcome. Nothing here will play a
  * low-confidence match because something had to be played: a wrong song is a
  * worse answer than an honest "no reliable version found", and it is also a
@@ -45,6 +50,19 @@ const logger = getLogger('resolver');
 
 /** The architecture's default priority. Overridable per call and by configuration. */
 export const DEFAULT_PROVIDER_ORDER: readonly PlaybackProvider[] = ['soundcloud', 'youtube'];
+
+/**
+ * How long a provider searches alone before the next one is started alongside
+ * it, even if it has not said it is unsure yet.
+ *
+ * About one upstream search's worth. Shorter, and YouTube would be asked for
+ * nearly every track SoundCloud answers perfectly well; longer, and a slow
+ * SoundCloud answer becomes a wait nobody needed to have.
+ */
+export const PROVIDER_HEAD_START_MS = 700;
+
+/** How many of a provider's queries run together after its first. */
+const QUERY_BATCH_SIZE = 2;
 
 /**
  * Search one playback provider.
@@ -112,6 +130,11 @@ export interface ResolveOptions<T extends MatchCandidate = MatchCandidate> {
   /** Overrides both profiles' accept threshold. Used by autoplay, which has no runtime to match. */
   readonly acceptScore?: number | undefined;
   readonly cache?: ResolutionCache<T> | undefined;
+  /**
+   * How long a provider searches alone before the next starts alongside it.
+   * Defaults to {@link PROVIDER_HEAD_START_MS}.
+   */
+  readonly headStartMs?: number | undefined;
 }
 
 const DEFAULT_WEIGHTS: Record<PlaybackProvider, MatchWeights> = {
@@ -184,12 +207,38 @@ function withAcceptScore(weights: MatchWeights, acceptScore: number | undefined)
   };
 }
 
-/** Search one provider through its query plan, stopping once a winner is certain. */
+/** How the provider walk steers one provider's search. */
+interface SearchControl {
+  /** Not confident yet: the next provider should start alongside this one. */
+  readonly onUnsure: () => void;
+  /** An answer has already been chosen; searching further buys nothing. */
+  readonly isStopped: () => boolean;
+}
+
+type ProviderOutcome<T extends MatchCandidate> =
+  | {
+      readonly kind: 'searched';
+      readonly ranked: readonly ScoredCandidate<T>[];
+      readonly queriesRun: number;
+      readonly pooled: number;
+    }
+  | { readonly kind: 'failed'; readonly error: unknown };
+
+/**
+ * Search one provider through its query plan, stopping once a winner is certain.
+ *
+ * The first query runs alone: for an unambiguous track it is the only one ever
+ * needed, and a second alongside it would be load for nothing. What follows
+ * runs in pairs. Those are the tracks the first query got wrong — soundtracks,
+ * collaborations, titles that are also films — where the plan is long and
+ * waiting on each search in turn was most of the delay.
+ */
 async function searchProvider<T extends MatchCandidate>(
   wanted: CanonicalTrack,
   provider: PlaybackProvider,
   search: ProviderSearch<T>,
   matchOptions: MatchOptions,
+  control: SearchControl,
 ): Promise<{
   readonly ranked: readonly ScoredCandidate<T>[];
   readonly queriesRun: number;
@@ -200,21 +249,32 @@ async function searchProvider<T extends MatchCandidate>(
   let ranked: readonly ScoredCandidate<T>[] = [];
   let queriesRun = 0;
 
-  for (const query of queryPlan(wanted, provider)) {
-    queriesRun += 1;
-    const results = await search(query, provider);
-    for (const result of results) {
+  const plan = queryPlan(wanted, provider);
+  let next = 0;
+  while (next < plan.length && !control.isStopped()) {
+    const batch = plan.slice(next, next + (next === 0 ? 1 : QUERY_BATCH_SIZE));
+    next += batch.length;
+    queriesRun += batch.length;
+
+    // Merged in plan order, so the pool — and any tie in the ranking — is the
+    // same whichever search in the batch happens to answer first.
+    const answers = await Promise.all(batch.map(async (query) => search(query, provider)));
+    for (const result of answers.flat()) {
       if (seen.has(result.identifier)) continue;
       seen.add(result.identifier);
       pool.push(result);
     }
-    if (pool.length === 0) continue;
+    if (pool.length === 0) {
+      control.onUnsure();
+      continue;
+    }
 
     // Re-ranked over the whole accumulated pool rather than per query: a result
     // that appears in three searches is scored once, and each extra query only
     // widens the field it is judged against.
     ranked = rankCandidates(wanted, pool, matchOptions);
     if (isConfident(ranked[0], matchOptions.weights)) break;
+    control.onUnsure();
   }
 
   return { ranked, queriesRun, pooled: pool.length };
@@ -283,45 +343,100 @@ export async function resolvePlayback<T extends MatchCandidate>(
 
   const attempts: ProviderAttempt[] = [];
 
-  for (const provider of order) {
-    const weights = withAcceptScore(
-      options.weights?.[provider] ?? DEFAULT_WEIGHTS[provider],
-      options.acceptScore,
-    );
-    const matchOptions: MatchOptions = {
+  /**
+   * Providers in order of preference — but not one after another.
+   *
+   * Each provider gets a head start, and the next begins alongside it the
+   * moment it is unsure (a search that came back without a confident winner)
+   * or when the head start runs out, whichever is first. Decisions are still
+   * taken strictly in order: a later provider's answer is used only once every
+   * earlier provider has given up, so the quieter catalogue keeps its priority.
+   * What changes is that falling through no longer waits for the whole of the
+   * earlier provider's query plan before the next one has even been asked.
+   *
+   * Once an answer is chosen, providers still searching stop before their next
+   * query.
+   */
+  const stopped = { value: false };
+  const headStartMs = options.headStartMs ?? PROVIDER_HEAD_START_MS;
+
+  const runs = order.map((provider) => {
+    let open = (): void => undefined;
+    const started = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    return {
       provider,
-      weights,
+      weights: withAcceptScore(
+        options.weights?.[provider] ?? DEFAULT_WEIGHTS[provider],
+        options.acceptScore,
+      ),
+      start: (): void => {
+        open();
+      },
+      started,
+    };
+  });
+
+  const outcomes = runs.map(async (run, index): Promise<ProviderOutcome<T>> => {
+    await run.started;
+    const startNext = (): void => {
+      runs[index + 1]?.start();
+    };
+    const headStart = setTimeout(startNext, headStartMs);
+    headStart.unref();
+
+    const matchOptions: MatchOptions = {
+      provider: run.provider,
+      weights: run.weights,
       duration,
       requestedVariants: options.requestedVariants,
       officialChannelTokens: options.officialChannelTokens,
     };
-
-    let ranked: readonly ScoredCandidate<T>[] = [];
-    let queriesRun = 0;
-    let pooled = 0;
     try {
-      const outcome = await searchProvider(wanted, provider, search, matchOptions);
-      ranked = outcome.ranked;
-      queriesRun = outcome.queriesRun;
-      pooled = outcome.pooled;
+      const searched = await searchProvider(wanted, run.provider, search, matchOptions, {
+        onUnsure: startNext,
+        isStopped: () => stopped.value,
+      });
+      return { kind: 'searched', ...searched };
     } catch (error) {
+      // An outage is as unsure as a provider gets: the next one should not
+      // sit out the rest of the head start.
+      startNext();
+      return { kind: 'failed', error };
+    } finally {
+      clearTimeout(headStart);
+    }
+  });
+  runs[0]?.start();
+
+  for (const [index, run] of runs.entries()) {
+    const { provider, weights } = run;
+    // Normally running already. This covers a provider whose predecessor ended
+    // without ever saying it was unsure — an empty query plan, say.
+    run.start();
+    const outcome = await outcomes[index];
+    if (outcome === undefined) continue;
+
+    if (outcome.kind === 'failed') {
       // A provider outage is not a resolution failure. Record it and move on to
       // the next one; only exhausting the whole order is a failure.
       attempts.push({
         provider,
-        queriesRun,
-        considered: pooled,
+        queriesRun: 0,
+        considered: 0,
         rejected: [],
         best: null,
         decision: 'provider-error',
-        error: error instanceof Error ? error.message : String(error),
+        error: outcome.error instanceof Error ? outcome.error.message : String(outcome.error),
       });
       logger.warn(
-        { err: error, provider, track: describeCanonical(wanted) },
+        { err: outcome.error, provider, track: describeCanonical(wanted) },
         'Playback provider failed',
       );
       continue;
     }
+    const { ranked, queriesRun, pooled } = outcome;
 
     const best = ranked.find((entry) => entry.rejected === null);
     const attempt: ProviderAttempt = {
@@ -347,6 +462,8 @@ export async function resolvePlayback<T extends MatchCandidate>(
     attempts.push(attempt);
 
     if (attempt.decision === 'play' && best !== undefined) {
+      // Anything still searching stops before its next query.
+      stopped.value = true;
       const result: ResolvedPlayback<T> = {
         candidate: best.candidate,
         provider,
