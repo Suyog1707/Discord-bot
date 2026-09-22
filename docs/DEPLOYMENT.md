@@ -1,16 +1,19 @@
 # Deployment
 
-Targets: Web → Vercel · Bot + PostgreSQL + Redis + Lavalink → VPS.
+Targets: Web → Vercel · Bot + Lavalink → VPS · PostgreSQL → managed · Redis → Upstash.
 
 ## Checklist
 
 1. **Secrets** — set all variables from `.env.example`. Verify with
    `pnpm run check:env:prod` (Redis + Lavalink are mandatory in production).
-2. **Database and Redis** — `pnpm run docker:up` creates both services and their
-   persistent named volumes. The one-shot `postgres-migrate` service applies
-   committed migrations before the bots start. Back up
-   `postgres-data-self-hosted`; Redis also persists its append-only log in
-   `redis-data`.
+2. **Database** — `pnpm run db:deploy` applies committed migrations. It connects
+   through `DIRECT_URL`, not `DATABASE_URL`: migrations need DDL, advisory locks
+   and a shadow database, none of which survive a transaction pooler. On
+   Supabase that is the direct connection (`db.<ref>.supabase.co:5432`) or the
+   session pooler (`…pooler.supabase.com:5432`) — prefer the session pooler,
+   since the direct host is IPv6-only unless the IPv4 add-on is enabled.
+   `DATABASE_URL` stays on the transaction pooler (`:6543?pgbouncer=true`) and
+   serves every runtime query.
 3. **Web (Vercel)** — root directory `apps/web`. The build command lives in
    `apps/web/vercel.json` and must stay a workspace build, not a bare
    `next build`: the app imports `@discord-music/shared` and
@@ -21,11 +24,7 @@ Targets: Web → Vercel · Bot + PostgreSQL + Redis + Lavalink → VPS.
    (`--filter=@discord-music/web...`, where the trailing `...` means "and its
    dependencies"), which is also what runs `prisma generate`, so the client
    cannot go stale behind Vercel's dependency cache.
-   Set every `NEXT*`, `DISCORD_*`, `DATABASE_URL`, `REDIS_URL` variable. A web
-   deployment outside the VPS cannot use the Compose-only hostnames; expose
-   PostgreSQL and Redis through a secured private network/tunnel, or run the web
-   app on the same Docker network. The default Compose port bindings are
-   intentionally localhost-only.
+   Set every `NEXT*`, `DISCORD_*`, `DATABASE_URL`, `REDIS_URL` variable.
    `DIRECT_URL` is only needed where migrations run; the build itself only
    generates the client and falls back to `DATABASE_URL` without it.
    Add the production callback URL in the Discord developer portal:

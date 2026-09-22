@@ -1,5 +1,9 @@
-# Self-hosted application stack: PostgreSQL, Redis, Lavalink, its cipher
-# sidecar, and the Discord bot pool.
+# Local development infrastructure: Lavalink and its cipher sidecar.
+#
+# PostgreSQL and Redis are not here: this project uses Supabase and Upstash, so
+# DATABASE_URL and REDIS_URL point at those and a local copy would only be a
+# second, divergent database to keep straight. Audio is the one dependency that
+# still has to run locally.
 #
 #   pnpm run docker:up     # start
 #   pnpm run docker:logs   # follow logs
@@ -24,80 +28,7 @@
 
 name: discord-music
 
-# Every bot must use Compose service names rather than the host-facing URLs in
-# .env. Keep these overrides in one anchor so a new player cannot accidentally
-# connect to a retired external provider.
-x-bot-infrastructure-environment: &bot-infrastructure-environment
-  DATABASE_URL: postgresql://${POSTGRES_USER:-discord_music}:${POSTGRES_PASSWORD:-discord_music}@postgres:5432/${POSTGRES_DB:-discord_music}
-  REDIS_URL: redis://redis:6379
-
-x-bot-dependencies: &bot-dependencies
-  postgres-migrate:
-    condition: service_completed_successfully
-  redis:
-    condition: service_healthy
-  lavalink:
-    condition: service_healthy
-
 services:
-  postgres:
-    image: postgres:17-alpine
-    container_name: dmp-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-discord_music}
-      POSTGRES_USER: ${POSTGRES_USER:-discord_music}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-discord_music}
-    ports:
-      # Host tools (Prisma Studio, db:* scripts) use localhost; other machines
-      # cannot reach the database through this binding.
-      - '127.0.0.1:${POSTGRES_PORT:-5432}:5432'
-    volumes:
-      # Keep this isolated from an older local Postgres experiment whose
-      # cluster was initialized with different roles and credentials.
-      - postgres-data-self-hosted:/var/lib/postgresql/data
-    healthcheck:
-      test:
-        ['CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
-
-  # Apply every committed Prisma migration before any bot starts. This makes a
-  # fresh volume ready on the first `pnpm docker:up` and is safe on later runs:
-  # `prisma migrate deploy` skips migrations already recorded in _prisma_migrations.
-  postgres-migrate:
-    build:
-      context: ..
-      dockerfile: apps/bot/Dockerfile
-      target: builder
-    container_name: dmp-postgres-migrate
-    restart: 'no'
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-discord_music}:${POSTGRES_PASSWORD:-discord_music}@postgres:5432/${POSTGRES_DB:-discord_music}
-      DIRECT_URL: postgresql://${POSTGRES_USER:-discord_music}:${POSTGRES_PASSWORD:-discord_music}@postgres:5432/${POSTGRES_DB:-discord_music}
-    command: ['pnpm', '--filter', '@discord-music/database', 'run', 'deploy']
-
-  redis:
-    image: redis:7-alpine
-    container_name: dmp-redis
-    restart: unless-stopped
-    command: ['redis-server', '--appendonly', 'yes']
-    ports:
-      - '127.0.0.1:${REDIS_PORT:-6379}:6379'
-    volumes:
-      - redis-data:/data
-    healthcheck:
-      test: ['CMD', 'redis-cli', 'ping']
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 5s
-
   # The Lavalink image ships no /opt/Lavalink/plugins directory, so Docker
   # creates the named volume's mountpoint owned by root while the server runs as
   # uid 322. Plugin downloads then fail with "Permission denied" and the server
@@ -233,14 +164,15 @@ services:
     # `always`, not `unless-stopped`: the pool is meant to be up, including
     # after the host reboots.
     restart: always
-    depends_on: *bot-dependencies
+    depends_on:
+      lavalink:
+        condition: service_healthy
     # Real configuration (DATABASE_URL, REDIS_URL, …) comes from the repo-root
     # .env; the entries below override it where the container's view of the
     # world differs from the host's, and give this container its identity.
     env_file:
       - ../.env
     environment:
-      <<: *bot-infrastructure-environment
       NODE_ENV: production
       # Inside the compose network Lavalink is reached by service name on its
       # internal port — not the localhost:${LAVALINK_PORT} that .env points at
@@ -279,11 +211,12 @@ services:
       dockerfile: apps/bot/Dockerfile
     container_name: dmp-bot-player-2
     restart: always
-    depends_on: *bot-dependencies
+    depends_on:
+      lavalink:
+        condition: service_healthy
     env_file:
       - ../.env
     environment:
-      <<: *bot-infrastructure-environment
       NODE_ENV: production
       LAVALINK_HOST: lavalink
       LAVALINK_PORT: 2333
@@ -303,11 +236,12 @@ services:
       dockerfile: apps/bot/Dockerfile
     container_name: dmp-bot-player-3
     restart: always
-    depends_on: *bot-dependencies
+    depends_on:
+      lavalink:
+        condition: service_healthy
     env_file:
       - ../.env
     environment:
-      <<: *bot-infrastructure-environment
       NODE_ENV: production
       LAVALINK_HOST: lavalink
       LAVALINK_PORT: 2333
@@ -327,11 +261,12 @@ services:
       dockerfile: apps/bot/Dockerfile
     container_name: dmp-bot-player-4
     restart: always
-    depends_on: *bot-dependencies
+    depends_on:
+      lavalink:
+        condition: service_healthy
     env_file:
       - ../.env
     environment:
-      <<: *bot-infrastructure-environment
       NODE_ENV: production
       LAVALINK_HOST: lavalink
       LAVALINK_PORT: 2333
@@ -351,11 +286,12 @@ services:
       dockerfile: apps/bot/Dockerfile
     container_name: dmp-bot-player-5
     restart: always
-    depends_on: *bot-dependencies
+    depends_on:
+      lavalink:
+        condition: service_healthy
     env_file:
       - ../.env
     environment:
-      <<: *bot-infrastructure-environment
       NODE_ENV: production
       LAVALINK_HOST: lavalink
       LAVALINK_PORT: 2333
@@ -375,11 +311,12 @@ services:
       dockerfile: apps/bot/Dockerfile
     container_name: dmp-bot-player-6
     restart: always
-    depends_on: *bot-dependencies
+    depends_on:
+      lavalink:
+        condition: service_healthy
     env_file:
       - ../.env
     environment:
-      <<: *bot-infrastructure-environment
       NODE_ENV: production
       LAVALINK_HOST: lavalink
       LAVALINK_PORT: 2333
@@ -399,11 +336,12 @@ services:
       dockerfile: apps/bot/Dockerfile
     container_name: dmp-bot-player-7
     restart: always
-    depends_on: *bot-dependencies
+    depends_on:
+      lavalink:
+        condition: service_healthy
     env_file:
       - ../.env
     environment:
-      <<: *bot-infrastructure-environment
       NODE_ENV: production
       LAVALINK_HOST: lavalink
       LAVALINK_PORT: 2333
@@ -418,5 +356,3 @@ services:
 
 volumes:
   lavalink-plugins:
-  postgres-data-self-hosted:
-  redis-data:
