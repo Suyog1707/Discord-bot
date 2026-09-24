@@ -18,7 +18,7 @@ export function middleware(request: NextRequest): NextResponse {
   // Opt-in until the local Funnel hostname and gateway secret are configured
   // in Vercel. A partially configured proxy fails closed instead of letting
   // Vercel execute its old direct database-backed routes.
-  if (process.env.VERCEL === '1' && process.env.BACKEND_PROXY_ENABLED === 'true') {
+  if (process.env.BACKEND_PROXY_ENABLED === 'true') {
     const backendUrl = process.env.BACKEND_PROXY_URL;
     const secret = process.env.ORIGIN_SECRET;
     if (!backendUrl || !secret) {

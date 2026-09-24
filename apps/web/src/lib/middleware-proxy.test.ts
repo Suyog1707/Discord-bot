@@ -7,7 +7,6 @@ afterEach(() => vi.unstubAllEnvs());
 
 describe('Vercel backend proxy', () => {
   it('keeps the original routes when the proxy is disabled', () => {
-    vi.stubEnv('VERCEL', '1');
     vi.stubEnv('BACKEND_PROXY_ENABLED', '');
     expect(
       middleware(new NextRequest('https://music.example.com/api/health')).headers.get(
@@ -20,7 +19,6 @@ describe('Vercel backend proxy', () => {
   });
 
   it('fails closed when enabled without a valid backend or secret', () => {
-    vi.stubEnv('VERCEL', '1');
     vi.stubEnv('BACKEND_PROXY_ENABLED', 'true');
     vi.stubEnv('BACKEND_PROXY_URL', 'https://device.tailnet.ts.net');
     vi.stubEnv('ORIGIN_SECRET', '');
@@ -34,7 +32,6 @@ describe('Vercel backend proxy', () => {
   });
 
   it('rewrites all paths with trusted gateway headers', () => {
-    vi.stubEnv('VERCEL', '1');
     vi.stubEnv('BACKEND_PROXY_ENABLED', 'true');
     vi.stubEnv('BACKEND_PROXY_URL', 'https://device.tailnet.ts.net');
     vi.stubEnv('ORIGIN_SECRET', 'server-secret');
