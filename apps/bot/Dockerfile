@@ -17,7 +17,7 @@ COPY packages/database/package.json ./packages/database/
 RUN pnpm install --frozen-lockfile
 
 # --- Stage 2: build ----------------------------------------------------------
-FROM node:22-alpine AS builder
+FROM node:22-alpine AS migration
 RUN corepack enable
 WORKDIR /app
 
@@ -29,6 +29,11 @@ COPY . .
 
 RUN pnpm --filter @discord-music/database run generate \
  && pnpm --filter @discord-music/bot... run build
+
+# The one-shot database migration service needs Prisma and the schema, not the
+# production deploy tree below. Keep this as a separate build target so every
+# `docker:up --build` does not package the full bot just to apply migrations.
+FROM migration AS builder
 
 # Drop dev dependencies from the tree that ships. `deploy` accepts exactly one
 # project — its workspace dependencies are bundled in automatically, so the

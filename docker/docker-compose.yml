@@ -1,9 +1,6 @@
-# Local development infrastructure: Lavalink and its cipher sidecar.
-#
-# PostgreSQL and Redis are not here: this project uses Supabase and Upstash, so
-# DATABASE_URL and REDIS_URL point at those and a local copy would only be a
-# second, divergent database to keep straight. Audio is the one dependency that
-# still has to run locally.
+# Local PostgreSQL and Redis are started alongside the bot infrastructure.
+# Bot containers keep using the URLs in .env until data migration is verified;
+# switching every bot to the Docker-internal URLs is a separate checkpoint.
 #
 #   pnpm run docker:up     # start
 #   pnpm run docker:logs   # follow logs
@@ -29,6 +26,61 @@
 name: discord-music
 
 services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-discord_music}
+      POSTGRES_USER: ${POSTGRES_USER:-discord_music}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - '127.0.0.1:${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      - postgres-data-2026:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        ['CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  postgres-migrate:
+    build:
+      context: ..
+      dockerfile: apps/bot/Dockerfile
+      target: migration
+    restart: 'no'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-discord_music}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-discord_music}
+      DIRECT_URL: postgresql://${POSTGRES_USER:-discord_music}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-discord_music}
+    command: ['pnpm', '--filter', '@discord-music/database', 'run', 'deploy']
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    command:
+      [
+        'sh',
+        '-c',
+        'exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"',
+      ]
+    ports:
+      - '127.0.0.1:${REDIS_PORT:-6379}:6379'
+    volumes:
+      - redis-data-2026:/data
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli -a "$$REDIS_PASSWORD" ping | grep -q PONG']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
   # The Lavalink image ships no /opt/Lavalink/plugins directory, so Docker
   # creates the named volume's mountpoint owned by root while the server runs as
   # uid 322. Plugin downloads then fail with "Permission denied" and the server
@@ -102,7 +154,7 @@ services:
       YT_OAUTH_ENABLED: ${YT_OAUTH_ENABLED:-false}
       YT_OAUTH_REFRESH_TOKEN: ${YT_OAUTH_REFRESH_TOKEN:-}
     ports:
-      - '${LAVALINK_PORT:-2333}:2333'
+      - '127.0.0.1:${LAVALINK_PORT:-2333}:2333'
     volumes:
       - ./lavalink/application.yml:/opt/Lavalink/application.yml:ro
       - lavalink-plugins:/opt/Lavalink/plugins
@@ -356,3 +408,5 @@ services:
 
 volumes:
   lavalink-plugins:
+  postgres-data-2026:
+  redis-data-2026:
