@@ -6,8 +6,9 @@ import { middleware } from '../middleware';
 afterEach(() => vi.unstubAllEnvs());
 
 describe('Vercel backend proxy', () => {
-  it('keeps the original routes when the proxy is disabled', () => {
+  it('keeps the original routes only on the explicitly local backend', () => {
     vi.stubEnv('BACKEND_PROXY_ENABLED', '');
+    vi.stubEnv('WEB_BACKEND_LOCAL', 'true');
     const response = middleware(new NextRequest('https://music.example.com/api/health'));
     expect(response.headers.get('x-middleware-next')).toBe('1');
     expect(response.headers.get('x-music-proxy-mode')).toBe('off');
@@ -16,8 +17,19 @@ describe('Vercel backend proxy', () => {
     ).toContain('/login?callbackUrl=%2Fdashboard');
   });
 
+  it('fails closed on Vercel when proxy mode is absent or conflicts', () => {
+    vi.stubEnv('BACKEND_PROXY_ENABLED', '');
+    vi.stubEnv('WEB_BACKEND_LOCAL', '');
+    expect(middleware(new NextRequest('https://music.example.com/api/health')).status).toBe(503);
+
+    vi.stubEnv('BACKEND_PROXY_ENABLED', 'true');
+    vi.stubEnv('WEB_BACKEND_LOCAL', 'true');
+    expect(middleware(new NextRequest('https://music.example.com/api/health')).status).toBe(503);
+  });
+
   it('fails closed when enabled without a valid backend or secret', () => {
     vi.stubEnv('BACKEND_PROXY_ENABLED', 'true');
+    vi.stubEnv('WEB_BACKEND_LOCAL', '');
     vi.stubEnv('BACKEND_PROXY_URL', 'https://device.tailnet.ts.net');
     vi.stubEnv('ORIGIN_SECRET', '');
     expect(middleware(new NextRequest('https://music.example.com/')).status).toBe(503);
@@ -33,6 +45,7 @@ describe('Vercel backend proxy', () => {
 
   it('rewrites all paths with trusted gateway headers', () => {
     vi.stubEnv('BACKEND_PROXY_ENABLED', 'true');
+    vi.stubEnv('WEB_BACKEND_LOCAL', '');
     vi.stubEnv('BACKEND_PROXY_URL', 'https://device.tailnet.ts.net/copied/path?unused=1#fragment');
     vi.stubEnv('ORIGIN_SECRET', 'server-secret');
 

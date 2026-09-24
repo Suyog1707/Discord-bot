@@ -27,8 +27,8 @@ required even while Tailscale is running.
 3. In Vercel → Project → Settings → Environment Variables, set Production
    `BACKEND_PROXY_URL` to that HTTPS URL, `ORIGIN_SECRET` to the same private
    value in the PC's ignored `.env`, and `BACKEND_PROXY_ENABLED=true`. Do not
-   prefix the secret with `NEXT_PUBLIC_`. Redeploy Production: environment
-   changes do not modify existing deployments.
+   add `WEB_BACKEND_LOCAL` to Vercel or prefix the secret with `NEXT_PUBLIC_`.
+   Redeploy Production: environment changes do not modify existing deployments.
 4. The middleware forwards **all** routes to the local web backend only when
    that flag is true on Vercel. Missing URL or secret returns 503. Test the
    public Vercel website, OAuth, `/api/health`, and Discord interactions.
@@ -42,9 +42,10 @@ required even while Tailscale is running.
    must remain a workspace build; Prisma client generation does not require a
    working database. The PC's backend retains the runtime secrets.
 
-To roll back routing temporarily, set `BACKEND_PROXY_ENABLED=false` in Vercel
-and redeploy. That restores the old Vercel execution path, which requires the
-old external providers; do not use it after those providers are retired.
+If Vercel's proxy flag or secret is missing, requests fail with 503 instead of
+falling back to Supabase or Upstash. To roll back to the PC from the VPS, stop
+VPS bots and writes, point `BACKEND_PROXY_URL` at the PC Funnel URL, and
+redeploy; do not disable the proxy flag.
 
 ## Checklist
 

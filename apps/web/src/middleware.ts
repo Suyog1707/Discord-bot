@@ -15,10 +15,16 @@ import { NextResponse, type NextRequest } from 'next/server';
 const SESSION_COOKIES = ['authjs.session-token', '__Secure-authjs.session-token'];
 
 export function middleware(request: NextRequest): NextResponse {
+  const localBackend = process.env.WEB_BACKEND_LOCAL === 'true';
+  const proxyEnabled = process.env.BACKEND_PROXY_ENABLED === 'true';
+  if (localBackend && proxyEnabled) {
+    return NextResponse.json({ error: 'Conflicting web backend modes.' }, { status: 503 });
+  }
+
   // Opt-in until the local Funnel hostname and gateway secret are configured
   // in Vercel. A partially configured proxy fails closed instead of letting
   // Vercel execute its old direct database-backed routes.
-  if (process.env.BACKEND_PROXY_ENABLED === 'true') {
+  if (proxyEnabled) {
     const backendUrl = process.env.BACKEND_PROXY_URL;
     const secret = process.env.ORIGIN_SECRET;
     if (!backendUrl || !secret) {
@@ -58,6 +64,12 @@ export function middleware(request: NextRequest): NextResponse {
     const response = NextResponse.rewrite(destination, { request: { headers } });
     response.headers.set('X-Music-Proxy-Mode', 'forward');
     return response;
+  }
+
+  // Once cut over, Vercel must never fall back to its legacy direct database
+  // routes if an environment variable disappears or a deployment is mis-set.
+  if (!localBackend) {
+    return NextResponse.json({ error: 'Backend proxy is disabled.' }, { status: 503 });
   }
 
   // The matcher also covers non-dashboard paths so the optional Vercel proxy
