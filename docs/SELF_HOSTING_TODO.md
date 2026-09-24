@@ -6,15 +6,17 @@ Redis data, Funnel credentials, or backup encryption keys.
 
 - [x] 1. Start isolated local PostgreSQL and Redis; apply Prisma migrations.
 - [x] 2. Run the production web app and secret-gated gateway in Docker.
-- [ ] 3. Add opt-in Vercel forwarding through Tailscale Funnel. Proxy code and
-      local gateway are ready; enabling Funnel and Vercel Production variables
-      remains an operator checkpoint.
-- [ ] 4. Restore and verify data, then switch every bot to local infrastructure.
-      Supabase data is restored with matching counts and history samples; all
-      bot Compose services now resolve `postgres` and `redis`. The primary bot
-      stays stopped until Vercel is routed to this same local backend, avoiding
-      simultaneous writes to different databases.
-- [ ] 5. Complete PC acceptance tests, including multi-bot playback.
+- [x] 3. Vercel forwards through authenticated Tailscale Funnel. Its public
+      health response matches the PC backend; direct Funnel access returns 403.
+      Remove the now-unused live Supabase and Upstash variables from Vercel
+      when account access is available, then redeploy and recheck.
+- [x] 4. Supabase data is restored with matching counts and history samples;
+      all seven bot containers use local `postgres` and `redis` and report
+      their dependencies healthy.
+- [ ] 5. Complete PC acceptance tests, including multi-bot playback. Public
+      pages/assets, unsigned interaction denial, and service restart recovery
+      passed. Interactive OAuth, slash commands, buttons, and voice playback
+      remain to be checked with a Discord account.
 - [ ] 6. Document and rehearse the PC-to-VPS cutover.
 - [ ] 7. Add backups, retention checks, and a restore drill.
 
