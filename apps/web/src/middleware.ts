@@ -31,17 +31,24 @@ export function middleware(request: NextRequest): NextResponse {
     } catch {
       return NextResponse.json({ error: 'Backend proxy URL is invalid.' }, { status: 503 });
     }
+    if (backend.protocol !== 'https:') {
+      return NextResponse.json({ error: 'Backend proxy URL must use HTTPS.' }, { status: 503 });
+    }
     if (
-      backend.protocol !== 'https:' ||
       backend.username ||
       backend.password ||
       backend.search ||
       backend.hash ||
-      backend.pathname !== '/' ||
-      backend.host === request.nextUrl.host
+      backend.pathname !== '/'
     ) {
       return NextResponse.json(
-        { error: 'Backend proxy requires a separate HTTPS origin.' },
+        { error: 'Backend proxy URL must contain only the HTTPS origin.' },
+        { status: 503 },
+      );
+    }
+    if (backend.host === request.nextUrl.host) {
+      return NextResponse.json(
+        { error: 'Backend proxy URL must differ from the public website host.' },
         { status: 503 },
       );
     }
