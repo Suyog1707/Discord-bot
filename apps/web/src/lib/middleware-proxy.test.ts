@@ -27,11 +27,13 @@ describe('Vercel backend proxy', () => {
     expect(middleware(new NextRequest('https://music.example.com/')).status).toBe(503);
     vi.stubEnv('BACKEND_PROXY_URL', 'https://music.example.com');
     expect(middleware(new NextRequest('https://music.example.com/')).status).toBe(503);
+    vi.stubEnv('BACKEND_PROXY_URL', 'https://user:pass@device.tailnet.ts.net');
+    expect(middleware(new NextRequest('https://music.example.com/')).status).toBe(503);
   });
 
   it('rewrites all paths with trusted gateway headers', () => {
     vi.stubEnv('BACKEND_PROXY_ENABLED', 'true');
-    vi.stubEnv('BACKEND_PROXY_URL', 'https://device.tailnet.ts.net');
+    vi.stubEnv('BACKEND_PROXY_URL', 'https://device.tailnet.ts.net/copied/path?unused=1#fragment');
     vi.stubEnv('ORIGIN_SECRET', 'server-secret');
 
     const response = middleware(

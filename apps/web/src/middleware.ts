@@ -34,15 +34,9 @@ export function middleware(request: NextRequest): NextResponse {
     if (backend.protocol !== 'https:') {
       return NextResponse.json({ error: 'Backend proxy URL must use HTTPS.' }, { status: 503 });
     }
-    if (
-      backend.username ||
-      backend.password ||
-      backend.search ||
-      backend.hash ||
-      backend.pathname !== '/'
-    ) {
+    if (backend.username || backend.password) {
       return NextResponse.json(
-        { error: 'Backend proxy URL must contain only the HTTPS origin.' },
+        { error: 'Backend proxy URL cannot contain credentials.' },
         { status: 503 },
       );
     }
@@ -53,7 +47,9 @@ export function middleware(request: NextRequest): NextResponse {
       );
     }
 
-    const destination = new URL(request.nextUrl.pathname + request.nextUrl.search, backend);
+    // Use only the HTTPS origin. A pasted path/query/fragment is ignored rather
+    // than becoming a prefix for every public route or leaking into requests.
+    const destination = new URL(request.nextUrl.pathname + request.nextUrl.search, backend.origin);
     const headers = new Headers(request.headers);
     headers.delete('x-origin-secret');
     headers.delete('x-public-host');
