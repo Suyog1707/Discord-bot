@@ -5,7 +5,7 @@ to `origin/main` before the next one begins. Never commit `.env`, database dumps
 Redis data, Funnel credentials, or backup encryption keys.
 
 - [x] 1. Start isolated local PostgreSQL and Redis; apply Prisma migrations.
-- [ ] 2. Run the production web app and secret-gated gateway in Docker.
+- [x] 2. Run the production web app and secret-gated gateway in Docker.
 - [ ] 3. Add opt-in Vercel forwarding through Tailscale Funnel.
 - [ ] 4. Restore and verify data, then switch every bot to local infrastructure.
 - [ ] 5. Complete PC acceptance tests, including multi-bot playback.

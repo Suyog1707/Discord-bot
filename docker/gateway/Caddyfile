@@ -1,0 +1,13 @@
+:8080 {
+	@authorized header X-Origin-Secret {$ORIGIN_SECRET}
+
+	handle @authorized {
+		reverse_proxy web-backend:3000 {
+			header_up -X-Origin-Secret
+		}
+	}
+
+	handle {
+		respond "Forbidden" 403
+	}
+}

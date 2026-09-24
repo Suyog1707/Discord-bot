@@ -21,3 +21,14 @@ Check startup with `docker compose --env-file .env -f docker/docker-compose.yml
 ps`. A successful `postgres-migrate` container exits with status 0; the
 PostgreSQL and Redis containers remain healthy. Never run
 `docker compose down --volumes` unless you intend to delete local data.
+
+## Local web backend (migration checkpoint 2)
+
+The same Compose stack runs a production Next.js `web-backend` with local
+PostgreSQL and Redis URLs. It has no published port. A Caddy `web-gateway`
+listens only on `127.0.0.1:20900` and requires `X-Origin-Secret` to match the
+ignored `.env` value `ORIGIN_SECRET` before proxying any path. Generate this
+with `openssl rand -hex 32`; never put it in a browser-visible variable. A
+direct request to the gateway without that header must return 403. Tailscale
+Funnel will expose this gateway in a later checkpoint, not the database,
+Redis, or raw web server.

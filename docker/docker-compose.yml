@@ -81,6 +81,52 @@ services:
       retries: 10
       start_period: 5s
 
+  web-backend:
+    build:
+      context: ..
+      dockerfile: apps/web/Dockerfile
+      args:
+        NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL}
+    restart: unless-stopped
+    depends_on:
+      postgres-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    env_file:
+      - ../.env
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-discord_music}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-discord_music}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}@redis:6379
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:3000/api/health',{redirect:'manual'}).then(r=>process.exit(r.status===200?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Funnel points only at this loopback port. Even a direct Funnel visitor
+  # needs the secret that Vercel injects; the raw Next.js port is unpublished.
+  web-gateway:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      web-backend:
+        condition: service_healthy
+    environment:
+      ORIGIN_SECRET: ${ORIGIN_SECRET:?Set ORIGIN_SECRET in .env}
+    ports:
+      - '127.0.0.1:20900:8080'
+    volumes:
+      - ./gateway/Caddyfile:/etc/caddy/Caddyfile:ro
+
   # The Lavalink image ships no /opt/Lavalink/plugins directory, so Docker
   # creates the named volume's mountpoint owned by root while the server runs as
   # uid 322. Plugin downloads then fail with "Permission denied" and the server
