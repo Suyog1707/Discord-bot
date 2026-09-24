@@ -1,6 +1,43 @@
 # Deployment
 
-Targets: Web → Vercel · Bot + Lavalink → VPS · PostgreSQL → managed · Redis → Upstash.
+Current public route: Vercel still handles web requests directly until the
+local Funnel proxy is explicitly enabled. The PC now has a private web backend,
+PostgreSQL, and Redis; the same stack can later move to a VPS.
+
+## Domain-free PC-to-Vercel proxy (staged, opt-in)
+
+The PC's Docker gateway listens only at `127.0.0.1:20900`. Requests without
+its `X-Origin-Secret` header return 403; raw Next.js, PostgreSQL, and Redis
+have no public ports. Tailscale Funnel provides the HTTPS hostname without
+router port forwarding. Funnel itself is public, so the gateway secret is
+required even while Tailscale is running.
+
+1. Check the local gateway: `pnpm docker:up`, then
+   `curl -i http://127.0.0.1:20900/api/health` must return 403. The protected
+   health check must report both database and Redis up.
+2. On the **PC host**, start and sign in to Tailscale if needed. Enable HTTPS
+   and Funnel in the tailnet admin console, then run
+   `sudo tailscale funnel --bg 20900`. Run `tailscale funnel status` and copy
+   the HTTPS `*.ts.net` URL. Do not forward port 20900 on your router.
+3. In Vercel → Project → Settings → Environment Variables, set Production
+   `BACKEND_PROXY_URL` to that HTTPS URL, `ORIGIN_SECRET` to the same private
+   value in the PC's ignored `.env`, and `BACKEND_PROXY_ENABLED=true`. Do not
+   prefix the secret with `NEXT_PUBLIC_`. Redeploy Production: environment
+   changes do not modify existing deployments.
+4. The middleware forwards **all** routes to the local web backend only when
+   that flag is true on Vercel. Missing URL or secret returns 503. Test the
+   public Vercel website, OAuth, `/api/health`, and Discord interactions.
+   A direct visit to the Funnel hostname without the secret must return 403.
+   Keep `NEXTAUTH_URL`, `NEXT_PUBLIC_APP_URL`, Discord's Interactions Endpoint
+   URL, and OAuth callback on the public Vercel domain.
+5. Once the proxy is verified, remove live `DATABASE_URL`, `DIRECT_URL`,
+   `REDIS_URL`, and bot/OAuth secrets from Vercel and redeploy. The Vercel build
+   must remain a workspace build; Prisma client generation does not require a
+   working database. The PC's backend retains the runtime secrets.
+
+To roll back routing temporarily, set `BACKEND_PROXY_ENABLED=false` in Vercel
+and redeploy. That restores the old Vercel execution path, which requires the
+old external providers; do not use it after those providers are retired.
 
 ## Checklist
 

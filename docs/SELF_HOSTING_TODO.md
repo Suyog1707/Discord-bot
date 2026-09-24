@@ -6,7 +6,9 @@ Redis data, Funnel credentials, or backup encryption keys.
 
 - [x] 1. Start isolated local PostgreSQL and Redis; apply Prisma migrations.
 - [x] 2. Run the production web app and secret-gated gateway in Docker.
-- [ ] 3. Add opt-in Vercel forwarding through Tailscale Funnel.
+- [ ] 3. Add opt-in Vercel forwarding through Tailscale Funnel. Proxy code and
+      local gateway are ready; enabling Funnel and Vercel Production variables
+      remains an operator checkpoint.
 - [ ] 4. Restore and verify data, then switch every bot to local infrastructure.
 - [ ] 5. Complete PC acceptance tests, including multi-bot playback.
 - [ ] 6. Document and rehearse the PC-to-VPS cutover.

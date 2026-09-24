@@ -4,6 +4,10 @@
 	handle @authorized {
 		reverse_proxy web-backend:3000 {
 			header_up -X-Origin-Secret
+			header_up -X-Public-Host
+			header_up Host {http.request.header.X-Public-Host}
+			header_up X-Forwarded-Host {http.request.header.X-Public-Host}
+			header_up X-Forwarded-Proto https
 		}
 	}
 
