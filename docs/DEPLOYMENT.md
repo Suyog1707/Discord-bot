@@ -43,14 +43,10 @@ old external providers; do not use it after those providers are retired.
 
 1. **Secrets** — set all variables from `.env.example`. Verify with
    `pnpm run check:env:prod` (Redis + Lavalink are mandatory in production).
-2. **Database** — `pnpm run db:deploy` applies committed migrations. It connects
-   through `DIRECT_URL`, not `DATABASE_URL`: migrations need DDL, advisory locks
-   and a shadow database, none of which survive a transaction pooler. On
-   Supabase that is the direct connection (`db.<ref>.supabase.co:5432`) or the
-   session pooler (`…pooler.supabase.com:5432`) — prefer the session pooler,
-   since the direct host is IPv6-only unless the IPv4 add-on is enabled.
-   `DATABASE_URL` stays on the transaction pooler (`:6543?pgbouncer=true`) and
-   serves every runtime query.
+2. **Database** — `pnpm docker:up` starts local PostgreSQL and runs committed
+   Prisma migrations before the web backend or bots start. For host-side CLI
+   commands, `DATABASE_URL` and `DIRECT_URL` both point to the loopback Docker
+   port. Keep the private database dump until the VPS restore is verified.
 3. **Web (Vercel)** — root directory `apps/web`. The build command lives in
    `apps/web/vercel.json` and must stay a workspace build, not a bare
    `next build`: the app imports `@discord-music/shared` and
@@ -61,43 +57,41 @@ old external providers; do not use it after those providers are retired.
    (`--filter=@discord-music/web...`, where the trailing `...` means "and its
    dependencies"), which is also what runs `prisma generate`, so the client
    cannot go stale behind Vercel's dependency cache.
-   Set every `NEXT*`, `DISCORD_*`, `DATABASE_URL`, `REDIS_URL` variable.
-   `DIRECT_URL` is only needed where migrations run; the build itself only
-   generates the client and falls back to `DATABASE_URL` without it.
+   The Vercel runtime should hold only the Funnel proxy URL and origin secret,
+   plus public build-time values. Do not put live database, Redis, bot, or OAuth
+   credentials there after the proxy is active.
    Add the production callback URL in the Discord developer portal:
    `https://<domain>/api/auth/callback/discord`.
 
-   The web app also hosts the **command router** — Discord posts every slash
-   command to `POST /api/discord/interactions` rather than sending it down a
-   bot's gateway connection — so it needs two variables that used to belong
-   only to the bot:
+   The Docker web backend hosts the **command router** — Discord posts every
+   slash command to `POST /api/discord/interactions` via the public Vercel URL.
+   The backend, not Vercel, needs:
 
    - `BOT_PUBLIC_KEY` — the command application's public key. Without it the
      route refuses to serve at all (503), because an endpoint that cannot check
      signatures is one anybody can drive.
-   - `BOT_TOKEN` — used for exactly one call, asking Discord which voice
-     channel the caller is standing in. The interaction payload does not carry
-     it and there is no other way to find out. This is a real widening of what
-     a Vercel compromise would reach; see docs/SECURITY.md.
+   - `BOT_TOKEN` — used to ask Discord which voice channel the caller is in.
 
    Turn on **Fluid compute** for the project. Autocomplete is the one path with
    no deferral to hide behind — it must answer inside three seconds — and cold
    starts are what threaten it.
 
-4. **Lavalink (VPS)** — run `docker/lavalink/application.yml` with a strong
-   `LAVALINK_PASSWORD`; keep port 2333 firewalled to the bot host only. Deploy
+4. **Lavalink (PC, then VPS)** — use a strong `LAVALINK_PASSWORD`; port 2333
+   binds to loopback only and must not be forwarded. Deploy
    the `yt-cipher` sidecar alongside it (it is in `docker/docker-compose.yml`)
    and leave it unpublished — Lavalink reaches it as `http://yt-cipher:8001` to
    decipher YouTube stream signatures. Without it, YouTube playback fails with
    `Must find sig function from script`. Keep the `youtube-plugin` version in
    `application.yml` current: the startup log prints a notice when a newer
    release exists, and YouTube regularly breaks older ones.
-5. **Bot (VPS)** — build `apps/bot/Dockerfile` from the repo root; run with
-   `NODE_ENV=production` and the full env. Deploy slash commands once:
+5. **Bots (PC, then VPS)** — Compose builds and runs the primary bot and any
+   configured player profiles with Docker-internal PostgreSQL and Redis URLs.
+   Deploy slash commands once:
    `pnpm --filter @discord-music/bot run commands:deploy` (unset
    `BOT_DEV_GUILD_ID` for global registration).
-6. **Monitoring** — point uptime checks at `/api/health` (503 = required
-   dependency down); ship pino JSON logs from the bot host.
+6. **Monitoring** — check `/api/health` through Vercel (503 = required
+   dependency down); ship pino JSON logs from the bot host. Never publish the
+   origin secret in a public uptime-check configuration.
 
 7. **Recommendations (optional)** — `GROQ_API_KEY` enables natural-language
    `/ask` parsing (without it a keyword parser handles it), and
@@ -111,10 +105,8 @@ old external providers; do not use it after those providers are retired.
 
 ## Notes
 
-- Web and bot share one `DATABASE_URL`/`REDIS_URL` so live control and queue
-  views line up. Neither ever opens `DIRECT_URL` — the Prisma client is
-  constructed with `DATABASE_URL` explicitly, and only the `db:*` CLI scripts
-  use the direct connection.
+- Web and bots share the private Docker PostgreSQL and Redis services so live
+  control and queue views line up. `DIRECT_URL` is for migration CLI commands.
 - The bot refuses to boot in production if any dependency is unreachable —
   fix the dependency rather than downgrading NODE_ENV.
 

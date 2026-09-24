@@ -1,6 +1,5 @@
 # Local PostgreSQL and Redis are started alongside the bot infrastructure.
-# Bot containers keep using the URLs in .env until data migration is verified;
-# switching every bot to the Docker-internal URLs is a separate checkpoint.
+# Bots, web, and migrations use the Docker-internal PostgreSQL and Redis URLs.
 #
 #   pnpm run docker:up     # start
 #   pnpm run docker:logs   # follow logs
@@ -20,8 +19,8 @@
 # For fast hot-reload development, stop them (`docker compose stop bot-main
 # bot-player-2 ...`, or just `bot-main`) and run `pnpm dev` on the host instead:
 # that runs one identity in-process, which is the whole bot minus the extra
-# rooms, and talks to this same Lavalink. The web app runs on the host / Vercel
-# per docs/DEPLOYMENT.md.
+# rooms, and talks to this same Lavalink. The web backend runs in this stack;
+# Vercel can proxy to its gated gateway (see docs/DEPLOYMENT.md).
 
 name: discord-music
 
@@ -265,13 +264,18 @@ services:
     depends_on:
       lavalink:
         condition: service_healthy
-    # Real configuration (DATABASE_URL, REDIS_URL, …) comes from the repo-root
-    # .env; the entries below override it where the container's view of the
-    # world differs from the host's, and give this container its identity.
+      postgres-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    # Secrets come from .env; service URLs below always stay on this network.
     env_file:
       - ../.env
     environment:
       NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-discord_music}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-discord_music}
+      DIRECT_URL: postgresql://${POSTGRES_USER:-discord_music}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-discord_music}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}@redis:6379
       # Inside the compose network Lavalink is reached by service name on its
       # internal port — not the localhost:${LAVALINK_PORT} that .env points at
       # for host-side `pnpm dev`.
@@ -312,10 +316,17 @@ services:
     depends_on:
       lavalink:
         condition: service_healthy
+      postgres-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     env_file:
       - ../.env
     environment:
       NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-discord_music}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-discord_music}
+      DIRECT_URL: postgresql://${POSTGRES_USER:-discord_music}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-discord_music}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}@redis:6379
       LAVALINK_HOST: lavalink
       LAVALINK_PORT: 2333
       LAVALINK_SECURE: 'false'
@@ -337,10 +348,17 @@ services:
     depends_on:
       lavalink:
         condition: service_healthy
+      postgres-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     env_file:
       - ../.env
     environment:
       NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-discord_music}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-discord_music}
+      DIRECT_URL: postgresql://${POSTGRES_USER:-discord_music}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-discord_music}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}@redis:6379
       LAVALINK_HOST: lavalink
       LAVALINK_PORT: 2333
       LAVALINK_SECURE: 'false'
@@ -362,10 +380,17 @@ services:
     depends_on:
       lavalink:
         condition: service_healthy
+      postgres-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     env_file:
       - ../.env
     environment:
       NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-discord_music}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-discord_music}
+      DIRECT_URL: postgresql://${POSTGRES_USER:-discord_music}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-discord_music}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}@redis:6379
       LAVALINK_HOST: lavalink
       LAVALINK_PORT: 2333
       LAVALINK_SECURE: 'false'
@@ -387,10 +412,17 @@ services:
     depends_on:
       lavalink:
         condition: service_healthy
+      postgres-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     env_file:
       - ../.env
     environment:
       NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-discord_music}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-discord_music}
+      DIRECT_URL: postgresql://${POSTGRES_USER:-discord_music}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-discord_music}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}@redis:6379
       LAVALINK_HOST: lavalink
       LAVALINK_PORT: 2333
       LAVALINK_SECURE: 'false'
@@ -412,10 +444,17 @@ services:
     depends_on:
       lavalink:
         condition: service_healthy
+      postgres-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     env_file:
       - ../.env
     environment:
       NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-discord_music}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-discord_music}
+      DIRECT_URL: postgresql://${POSTGRES_USER:-discord_music}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-discord_music}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}@redis:6379
       LAVALINK_HOST: lavalink
       LAVALINK_PORT: 2333
       LAVALINK_SECURE: 'false'
@@ -437,10 +476,17 @@ services:
     depends_on:
       lavalink:
         condition: service_healthy
+      postgres-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     env_file:
       - ../.env
     environment:
       NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-discord_music}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-discord_music}
+      DIRECT_URL: postgresql://${POSTGRES_USER:-discord_music}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-discord_music}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}@redis:6379
       LAVALINK_HOST: lavalink
       LAVALINK_PORT: 2333
       LAVALINK_SECURE: 'false'
