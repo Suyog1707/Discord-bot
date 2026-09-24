@@ -15,6 +15,11 @@ required even while Tailscale is running.
 1. Check the local gateway: `pnpm docker:up`, then
    `curl -i http://127.0.0.1:20900/api/health` must return 403. The protected
    health check must report both database and Redis up.
+   During migration, stop the primary bot with
+   `docker compose --env-file .env -f docker/docker-compose.yml stop bot-main`
+   until the Vercel proxy is live. `pnpm docker:up` starts it again, so repeat
+   the stop if you rerun that command before cutover. This prevents Discord
+   activity writing to local PostgreSQL while Vercel still uses the old one.
 2. On the **PC host**, start and sign in to Tailscale if needed. Enable HTTPS
    and Funnel in the tailnet admin console, then run
    `sudo tailscale funnel --bg 20900`. Run `tailscale funnel status` and copy
@@ -30,6 +35,8 @@ required even while Tailscale is running.
    A direct visit to the Funnel hostname without the secret must return 403.
    Keep `NEXTAUTH_URL`, `NEXT_PUBLIC_APP_URL`, Discord's Interactions Endpoint
    URL, and OAuth callback on the public Vercel domain.
+   Only after that verification, start the primary bot with
+   `docker compose --env-file .env -f docker/docker-compose.yml start bot-main`.
 5. Once the proxy is verified, remove live `DATABASE_URL`, `DIRECT_URL`,
    `REDIS_URL`, and bot/OAuth secrets from Vercel and redeploy. The Vercel build
    must remain a workspace build; Prisma client generation does not require a
