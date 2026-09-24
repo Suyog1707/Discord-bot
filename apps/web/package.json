@@ -6,7 +6,7 @@
   "description": "Next.js 15 dashboard: overview, servers, player, queue, settings, premium.",
   "scripts": {
     "dev": "next dev --turbopack --port 3000",
-    "build": "next build",
+    "build": "next build && node ../../scripts/check-web-middleware.mjs",
     "start": "next start --port 3000",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
