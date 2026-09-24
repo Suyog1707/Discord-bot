@@ -1,6 +1,6 @@
 /* eslint-disable no-restricted-syntax -- Edge middleware cannot import the Node-only env loader. */
 /**
- * Edge middleware guarding the dashboard.
+ * Edge middleware guarding the dashboard and forwarding Vercel traffic.
  *
  * Database sessions cannot be verified here — the edge runtime has no Prisma —
  * so this performs only a fast cookie-presence check to bounce obviously
