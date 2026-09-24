@@ -1,0 +1,9 @@
+[Unit]
+Description=Back up Discord Music PostgreSQL to this PC
+Documentation=file:%h/Projects/Discord-Bot/docs/BACKUPS.md
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/discord-music/backup.env
+ExecStart=/usr/bin/bash %h/Projects/Discord-Bot/scripts/backup-postgres.sh
+ExecStartPost=/usr/bin/bash %h/Projects/Discord-Bot/scripts/check-backups.sh

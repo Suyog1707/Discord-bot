@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Discord Music PostgreSQL backup
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+RandomizedDelaySec=15m
+Unit=discord-music-backup.service
+
+[Install]
+WantedBy=timers.target

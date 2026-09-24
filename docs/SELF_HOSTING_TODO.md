@@ -17,8 +17,12 @@ Redis data, Funnel credentials, or backup encryption keys.
       pages/assets, unsigned interaction denial, and service restart recovery
       passed. Interactive OAuth, slash commands, buttons, and voice playback
       remain to be checked with a Discord account.
-- [ ] 6. Document and rehearse the PC-to-VPS cutover.
-- [ ] 7. Add backups, retention checks, and a restore drill.
+- [ ] 6. Document and rehearse the PC-to-VPS cutover. The procedure is in
+      `docs/VPS_CUTOVER.md`; the actual VPS has not been provisioned or
+      migrated, so the final cutover cannot be marked complete.
+- [ ] 7. Add backups, retention checks, and a restore drill. Local backup and
+      disposable restore drill passed. The user systemd timer and post-cutover
+      Tailscale SSH pull still need activation on the actual PC/VPS.
 
 The public Discord interactions and OAuth URLs remain on Vercel. Tailscale
 Funnel exposes only the gateway; PostgreSQL, Redis, Lavalink, and raw Next.js
