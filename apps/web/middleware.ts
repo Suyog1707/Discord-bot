@@ -52,7 +52,9 @@ export function middleware(request: NextRequest): NextResponse {
     headers.delete('x-public-host');
     headers.set('X-Origin-Secret', secret);
     headers.set('X-Public-Host', request.nextUrl.host);
-    return NextResponse.rewrite(destination, { request: { headers } });
+    const response = NextResponse.rewrite(destination, { request: { headers } });
+    response.headers.set('X-Music-Proxy-Mode', 'forward');
+    return response;
   }
 
   // The matcher also covers non-dashboard paths so the optional Vercel proxy
@@ -61,7 +63,9 @@ export function middleware(request: NextRequest): NextResponse {
     request.nextUrl.pathname !== '/dashboard' &&
     !request.nextUrl.pathname.startsWith('/dashboard/')
   ) {
-    return NextResponse.next();
+    const response = NextResponse.next();
+    response.headers.set('X-Music-Proxy-Mode', 'off');
+    return response;
   }
 
   const hasSessionCookie = SESSION_COOKIES.some((name) => request.cookies.has(name));

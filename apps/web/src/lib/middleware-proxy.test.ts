@@ -8,11 +8,9 @@ afterEach(() => vi.unstubAllEnvs());
 describe('Vercel backend proxy', () => {
   it('keeps the original routes when the proxy is disabled', () => {
     vi.stubEnv('BACKEND_PROXY_ENABLED', '');
-    expect(
-      middleware(new NextRequest('https://music.example.com/api/health')).headers.get(
-        'x-middleware-next',
-      ),
-    ).toBe('1');
+    const response = middleware(new NextRequest('https://music.example.com/api/health'));
+    expect(response.headers.get('x-middleware-next')).toBe('1');
+    expect(response.headers.get('x-music-proxy-mode')).toBe('off');
     expect(
       middleware(new NextRequest('https://music.example.com/dashboard')).headers.get('location'),
     ).toContain('/login?callbackUrl=%2Fdashboard');
@@ -44,6 +42,7 @@ describe('Vercel backend proxy', () => {
     expect(response.headers.get('x-middleware-rewrite')).toBe(
       'https://device.tailnet.ts.net/api/health?probe=1',
     );
+    expect(response.headers.get('x-music-proxy-mode')).toBe('forward');
     expect(response.headers.get('x-middleware-request-x-origin-secret')).toBe('server-secret');
     expect(response.headers.get('x-middleware-request-x-public-host')).toBe('music.example.com');
     expect(response.headers.get('x-origin-secret')).toBeNull();
