@@ -33,7 +33,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-discord_music}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     ports:
-      - '127.0.0.1:${POSTGRES_PORT:-5432}:5432'
+      - '127.0.0.1:${POSTGRES_PORT:-20001}:5432'
     volumes:
       - postgres-data-2026:/var/lib/postgresql/data
     healthcheck:
@@ -70,7 +70,7 @@ services:
         'exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"',
       ]
     ports:
-      - '127.0.0.1:${REDIS_PORT:-6379}:6379'
+      - '127.0.0.1:${REDIS_PORT:-20002}:6379'
     volumes:
       - redis-data-2026:/data
     healthcheck:
@@ -200,7 +200,7 @@ services:
       YT_OAUTH_ENABLED: ${YT_OAUTH_ENABLED:-false}
       YT_OAUTH_REFRESH_TOKEN: ${YT_OAUTH_REFRESH_TOKEN:-}
     ports:
-      - '127.0.0.1:${LAVALINK_PORT:-2333}:2333'
+      - '127.0.0.1:${LAVALINK_PORT:-20003}:2333'
     volumes:
       - ./lavalink/application.yml:/opt/Lavalink/application.yml:ro
       - lavalink-plugins:/opt/Lavalink/plugins

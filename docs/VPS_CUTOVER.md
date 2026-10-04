@@ -11,10 +11,18 @@ Use an Ubuntu/Debian VPS with enough memory for seven bots, PostgreSQL, Redis,
 Next.js, and Lavalink. Add an SSH key at provisioning. Apply security updates,
 create a non-root deploy user, and disable password SSH after confirming key
 login works in a second terminal. Allow only the actual SSH port in the VPS
-provider firewall and UFW. Do **not** open or forward 20900, 3000, 2333, 5432,
-or 6379. Funnel makes an outbound connection; the gateway binds to loopback.
+provider firewall and UFW. Do **not** open or forward 20001, 20002, 20003,
+or 20900. Funnel makes an outbound connection; the gateway binds to loopback.
 Docker-published ports can bypass some UFW rules, so verify the Compose
 `host_ip` values are `127.0.0.1` before starting.
+
+The bot publishes PostgreSQL on 20001, Redis on 20002, Lavalink on 20003,
+and the authenticated gateway on 20900, all loopback-only. Set
+`POSTGRES_PORT=20001`, `REDIS_PORT=20002`, and `LAVALINK_PORT=20003` in an
+existing private `.env`; update host-side database/Redis URLs to those ports.
+Check `sudo ss -ltnp` before starting: other VPS applications can still occupy
+these ports. Internal Docker ports remain unchanged and do not conflict with
+host services. Do not change the VPS SSH port as part of this deployment.
 
 Install Docker Engine and the Compose plugin from the [official Docker apt
 instructions](https://docs.docker.com/engine/install/ubuntu/) (use the

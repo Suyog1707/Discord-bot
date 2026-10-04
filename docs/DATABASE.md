@@ -18,6 +18,11 @@ the host-side URLs in `.env`. For host-side `pnpm dev`, set `DATABASE_URL` and
 and `REDIS_URL` to `redis://:<REDIS_PASSWORD>@127.0.0.1:<REDIS_PORT>`.
 Never commit these values.
 
+Host ports are PostgreSQL `20001`, Redis `20002`, Lavalink `20003`, and
+the web gateway `20900`. All bind to loopback only. Container-internal
+ports remain unchanged; Next.js and bot health endpoints are not published.
+Check for existing listeners before deploying to a shared VPS.
+
 Check startup with `docker compose --env-file .env -f docker/docker-compose.yml
 ps`. A successful `postgres-migrate` container exits with status 0; the
 PostgreSQL and Redis containers remain healthy. Never run

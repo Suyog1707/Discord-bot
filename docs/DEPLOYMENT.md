@@ -84,7 +84,7 @@ redeploy; do not disable the proxy flag.
    no deferral to hide behind — it must answer inside three seconds — and cold
    starts are what threaten it.
 
-4. **Lavalink (PC, then VPS)** — use a strong `LAVALINK_PASSWORD`; port 2333
+4. **Lavalink (PC, then VPS)** — use a strong `LAVALINK_PASSWORD`; host port 20003
    binds to loopback only and must not be forwarded. Deploy
    the `yt-cipher` sidecar alongside it (it is in `docker/docker-compose.yml`)
    and leave it unpublished — Lavalink reaches it as `http://yt-cipher:8001` to
