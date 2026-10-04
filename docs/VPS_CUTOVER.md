@@ -24,6 +24,10 @@ Check `sudo ss -ltnp` before starting: other VPS applications can still occupy
 these ports. Internal Docker ports remain unchanged and do not conflict with
 host services. Do not change the VPS SSH port as part of this deployment.
 
+`pnpm pot:refresh` temporarily publishes the YouTube token generator on
+`127.0.0.1:20004` (container port 4416). The `yt-cipher` service stays
+Docker-internal on 8001; it requires no host port or firewall rule.
+
 Install Docker Engine and the Compose plugin from the [official Docker apt
 instructions](https://docs.docker.com/engine/install/ubuntu/) (use the
 [Debian variant](https://docs.docker.com/engine/install/debian/) on Debian).

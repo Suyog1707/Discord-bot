@@ -36,7 +36,8 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const ENV_PATH = resolve(ROOT, '.env');
 const IMAGE = 'brainicism/bgutil-ytdlp-pot-provider';
 const CONTAINER = 'dmp-pot-oneshot';
-const PORT = 4416;
+const PORT = 20004;
+const CONTAINER_PORT = 4416;
 
 const clear = process.argv.includes('--clear');
 
@@ -59,7 +60,7 @@ async function mint() {
   }
 
   console.log(`Starting ${IMAGE} …`);
-  docker('run', '--name', CONTAINER, '-d', '-p', `${PORT}:${PORT}`, IMAGE);
+  docker('run', '--name', CONTAINER, '-d', '-p', `127.0.0.1:${PORT}:${CONTAINER_PORT}`, IMAGE);
 
   try {
     // The provider answers /ping within a second or two of the port opening,
