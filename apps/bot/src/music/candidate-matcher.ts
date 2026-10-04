@@ -841,11 +841,11 @@ export function queryPlan(wanted: CanonicalTrack, provider: PlaybackProvider): r
   const plans: string[] = [];
 
   if (provider === 'soundcloud') {
-    // SoundCloud's index is thinner and its titles are plainer, so decorating
-    // the query mostly returns nothing. Widening — dropping to the lead artist,
-    // then to the bare title — is what finds the track there. No lyrics tier:
-    // SoundCloud hosts audio, so every result is already "clean audio".
-    plans.push(plain, `${wanted.title} ${lead}`, wanted.title);
+    // Keep known recordings artist-qualified rather than broadening to an
+    // ambiguous title alone. Collaborations may be uploaded under any credit.
+    // An unidentified free-text query still works when no artist is available.
+    plans.push(`${wanted.title} ${lead}`, plain, `${lead} ${wanted.title}`);
+    for (const artist of wanted.artists) plans.push(`${wanted.title} ${artist}`);
     return dedupe(plans);
   }
 

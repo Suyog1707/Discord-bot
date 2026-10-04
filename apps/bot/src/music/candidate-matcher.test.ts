@@ -370,11 +370,30 @@ describe('queryPlan', () => {
     expect(queryPlan(wanted, 'youtube')[0]).toBe('USUM71900028');
   });
 
-  it('widens rather than decorates on SoundCloud', () => {
+  it('keeps SoundCloud searches qualified by the known artist', () => {
     const plan = queryPlan(wanted, 'soundcloud');
     expect(plan[0]).toBe('Blinding Lights The Weeknd');
-    expect(plan).toContain('Blinding Lights');
+    expect(plan).toEqual(['Blinding Lights The Weeknd', 'The Weeknd Blinding Lights']);
     expect(plan.some((query) => query.includes('topic'))).toBe(false);
+  });
+
+  it('tries the lead artist, full credits, and other collaborators on SoundCloud', () => {
+    const collaboration = canonicalTrack({
+      title: 'Inner Light',
+      artist: 'Elderbrook, Bob Moses',
+      provider: 'spotify',
+    });
+    expect(queryPlan(collaboration, 'soundcloud')).toEqual([
+      'Inner Light Elderbrook',
+      'Inner Light Elderbrook, Bob Moses',
+      'Elderbrook Inner Light',
+      'Inner Light Bob Moses',
+    ]);
+  });
+
+  it('preserves a free-text SoundCloud query when the artist is unknown', () => {
+    const unidentified = canonicalTrack({ title: 'Sahiba', artist: '', provider: 'query' });
+    expect(queryPlan(unidentified, 'soundcloud')).toEqual(['Sahiba']);
   });
 
   it('leads with lyrics queries on YouTube, before any broadening', () => {
