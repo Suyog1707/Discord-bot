@@ -165,7 +165,7 @@ plugins:
       enabled: ${YT_OAUTH_ENABLED:false}
       # Left unset rather than empty: an empty string is a value, and a blank
       # token is not the same as "no token" to the plugin.
-      # refreshToken: '${YT_OAUTH_REFRESH_TOKEN:}'
+      refreshToken: '${YT_OAUTH_REFRESH_TOKEN:}'
 
   lavasrc:
     # Only reached when LavaSrc itself resolves something — an Apple Music link,
