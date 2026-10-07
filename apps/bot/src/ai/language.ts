@@ -112,6 +112,20 @@ export function languageFromTags(tags: readonly string[]): string | null {
   return null;
 }
 
+/** A strict recording-language tag, not a regional genre or nationality.
+ * Multiple named languages are ambiguous/bilingual and cannot fill an
+ * exclusively single-language radio slot. */
+export function recordingLanguageFromTags(tags: readonly string[]): string | null {
+  const names = new Set(LANGUAGE_TOKENS.map((entry) => entry.language));
+  const found = new Set<string>();
+  for (const tag of tags) {
+    for (const word of tag.toLowerCase().split(/[^a-z]+/u)) {
+      if (names.has(word)) found.add(word);
+    }
+  }
+  return found.size === 1 ? ([...found][0] ?? null) : null;
+}
+
 /**
  * Writing systems that pin a language on their own. A Devanagari title is a
  * Hindi song no matter what the tags say — and unlike tags, the title is

@@ -229,7 +229,7 @@ function harness(options: {
     familiar: familiarService,
     recommender,
     ...(options.dislikes === undefined ? {} : { dislikes: options.dislikes }),
-    ...(options.config === undefined ? {} : { config: options.config }),
+    config: { languageSpecific: false, ...options.config },
   });
   planner.setResolvers({
     resolveKnown: options.resolvers?.resolveKnown ?? resolveKnown,

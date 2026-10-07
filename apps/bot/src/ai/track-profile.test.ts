@@ -13,6 +13,50 @@ function fakeTags(tags: readonly string[] = [], country: string | null = null) {
 
 const SONG = { title: 'Kesariya', artist: 'Arijit Singh' };
 
+describe('strict autoplay recording language', () => {
+  it('rejects ambiguous bilingual or genre-only tags', async () => {
+    for (const tags of [['english', 'hindi'], ['bollywood'], ['indian'], ['british']]) {
+      const resolver = new TrackProfileResolver(
+        { artistTags: () => Promise.resolve([]), trackTags: () => Promise.resolve(tags) },
+        new CacheService(),
+      );
+      expect(await resolver.autoplayLanguage(SONG)).toBeNull();
+    }
+  });
+  it('uses Marathi track evidence even when the artist is tagged Hindi', async () => {
+    const resolver = new TrackProfileResolver(
+      {
+        artistTags: () => Promise.resolve(['hindi']),
+        trackTags: () => Promise.resolve(['marathi']),
+      },
+      new CacheService(),
+    );
+    expect(await resolver.autoplayLanguage({ title: 'मराठी गाणे', artist: 'Singer' })).toBe(
+      'marathi',
+    );
+  });
+  it('does not use nationality or artist repertoire as a recording language', async () => {
+    const resolver = new TrackProfileResolver(
+      {
+        artistTags: () => Promise.resolve(['english']),
+        trackTags: () => Promise.resolve(['american']),
+      },
+      new CacheService(),
+    );
+    expect(await resolver.autoplayLanguage({ title: 'Some Song', artist: 'Singer' })).toBeNull();
+  });
+  it('fails closed when recording metadata is unavailable', async () => {
+    const resolver = new TrackProfileResolver(
+      {
+        artistTags: () => Promise.resolve([]),
+        trackTags: () => Promise.reject(new Error('offline')),
+      },
+      new CacheService(),
+    );
+    expect(await resolver.autoplayLanguage(SONG)).toBeNull();
+  });
+});
+
 describe('TrackProfileResolver.fromMetadata', () => {
   // The whole point of the static entry point: it is safe on the hot path
   // because it cannot reach the network, and that has to stay true.

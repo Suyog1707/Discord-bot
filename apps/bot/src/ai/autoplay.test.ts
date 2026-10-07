@@ -214,7 +214,9 @@ describe('AutoplayEngine — seed drift invalidates the buffer', () => {
     const { generator, calls } = makeFakeGenerator(session, () => offered);
     const engine = new AutoplayEngine(generator, session, { prefetchSize: 1 });
     const seedS1: readonly TrackSeed[] = [{ title: 'Song S1', artist: 'Artist S1' }];
-    const seedS2: readonly TrackSeed[] = [{ title: 'Song S2', artist: 'Artist S2' }];
+    // Old seed remains in history: switching the newest user song still
+    // invalidates its buffer rather than leaking the previous language.
+    const seedS2: readonly TrackSeed[] = [{ title: 'Song S2', artist: 'Artist S2' }, ...seedS1];
 
     engine.prefetch(ROOM, seedS1);
     await waitUntil(() => calls.length >= 1);

@@ -1275,7 +1275,11 @@ export class GuildPlayer {
       // 'failed' already told the channel and scheduled its retry; only a
       // genuine exhaustion is the end of the queue.
       if (outcome === 'exhausted') {
-        await this.#notify('✅ Queue finished. Add more with `/play`.');
+        await this.#notify(
+          this.#autoplayEnabled
+            ? '✅ Queue finished. Autoplay found no available tracks with a verified matching language. The song language may be unknown or matching tracks unavailable. Add another song with `/play`.'
+            : '✅ Queue finished. Add more with `/play`.',
+        );
       }
       this.#syncIdleTimer();
       return;
@@ -1478,7 +1482,9 @@ export class GuildPlayer {
       void this.#tryAutoplay().then(async (outcome) => {
         this.#syncIdleTimer();
         if (outcome === 'continued') return;
-        await this.#notify('✅ Queue finished. Add more with `/play`.');
+        await this.#notify(
+          '✅ Queue finished. Autoplay could not find an available same-language match. Add another song with `/play`.',
+        );
       });
     }, AUTOPLAY_RETRY_DELAY_MS);
     timer.unref();

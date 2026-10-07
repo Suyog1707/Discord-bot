@@ -27,6 +27,7 @@ import type { CacheService } from './cache.js';
 import { normaliseTags } from './genre-taxonomy.js';
 import { identityOf, type TrackIdentity } from './identity.js';
 import {
+  recordingLanguageFromTags,
   type LanguageConfidence,
   type LanguageSource,
   resolveLanguage,
@@ -256,6 +257,25 @@ export class TrackProfileResolver {
    */
   static fromMetadata(input: TrackProfileInput): TrackProfile {
     return buildProfile(input, identityOf(input.artist, input.title), NO_ENRICHMENT);
+  }
+
+  /** Strict radio language: recording tags, not the artist's nationality or
+   * repertoire. Devanagari alone cannot distinguish Hindi from Marathi. */
+  async autoplayLanguage(input: TrackProfileInput): Promise<string | null> {
+    const identity = identityOf(input.artist, input.title);
+    const trackTags = await this.#trackTags(identity.key, input.artist, input.title);
+    if (trackTags.length > 0 && input.providerLanguage == null) {
+      return recordingLanguageFromTags(trackTags);
+    }
+    const resolved = resolveLanguage({
+      providerLanguage: input.providerLanguage ?? null,
+      trackTags,
+      title: input.title,
+      artist: '',
+    });
+    if (resolved.confidence === 'high') return resolved.language;
+    if (resolved.source === 'script' && resolved.language !== 'hindi') return resolved.language;
+    return null;
   }
 
   /** Enriched: adds artist tags/country via `TagSource` (cached 7d under `profile:${key}`). */

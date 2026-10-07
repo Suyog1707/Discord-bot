@@ -99,22 +99,17 @@ export class AutoplayEngine {
     const { roomId } = room;
     if (seeds.length === 0) return;
 
-    // A buffer that still holds at least half its target and follows a track
-    // in the CURRENT seed window is good enough — regenerating it would cost a
+    // A buffer that still holds at least half its target and follows the same
+    // NEWEST user seed is good enough — regenerating it would cost a
     // full Last.fm sweep plus Lavalink searches on every single track start,
     // for picks that were fine.
     const existing = this.#buffers.get(roomId);
     if (
       existing !== undefined &&
       existing.tracks.length >= Math.ceil(this.#options.prefetchSize / 2) &&
-      seedWindowOf(seeds).has(existing.seedKey) &&
+      seedKeyOf(seeds) === existing.seedKey &&
       Date.now() - existing.generatedAt < BUFFER_TTL_MS
     ) {
-      // Roll the seed identity forward so the buffer travels with the session
-      // instead of "drifting" out of a 4-track window while still perfectly
-      // relevant. Staleness stays bounded by the TTL, whose clock is anchored
-      // at generation and never reset.
-      this.#buffers.set(roomId, { ...existing, seedKey: seedKeyOf(seeds) });
       return;
     }
 
@@ -232,12 +227,10 @@ export class AutoplayEngine {
     const buffer = this.#buffers.get(roomId);
     if (buffer === undefined) return [];
 
-    // Valid while its seed is anywhere in the current seed window — a buffer
-    // built following the PREVIOUS track is still following this session.
-    // (The original compared two differently-shaped seed lists for equality,
-    // which never matched, so the buffer never served at all.)
+    // A new user anchor may switch language. Old history still containing the
+    // previous seed must not keep that previous language's buffer alive.
     const stale =
-      Date.now() - buffer.generatedAt > BUFFER_TTL_MS || !seedWindowOf(seeds).has(buffer.seedKey);
+      Date.now() - buffer.generatedAt > BUFFER_TTL_MS || seedKeyOf(seeds) !== buffer.seedKey;
     if (stale) {
       this.clear(roomId);
       return [];
@@ -272,8 +265,7 @@ export class AutoplayEngine {
       // forgotten, the Redis DEL could land after the SET NX of the very next
       // generation pass and delete a live reservation.
       const existing = this.#buffers.get(roomId);
-      const survivors =
-        existing !== undefined && seedWindowOf(seeds).has(existing.seedKey) ? existing.tracks : [];
+      const survivors = seedKeyOf(seeds) === existing?.seedKey ? existing.tracks : [];
       if (existing !== undefined && survivors.length === 0) {
         this.#buffers.delete(roomId);
         if (existing.tracks.length > 0) {
@@ -360,16 +352,4 @@ export class AutoplayEngine {
 function seedKeyOf(seeds: readonly TrackSeed[]): string {
   const newest = seeds[0];
   return newest === undefined ? '' : trackKeyOf(newest.artist, newest.title);
-}
-
-/**
- * Every canonical key in the caller's seed window.
- *
- * Buffer validity is judged against the WINDOW, not just the newest seed: a
- * buffer generated while the previous track played is following this same
- * session and must not be torn down (with a full regeneration and a batch of
- * orphaned reservations) merely because one more track has started since.
- */
-function seedWindowOf(seeds: readonly TrackSeed[]): ReadonlySet<string> {
-  return new Set(seeds.slice(0, 4).map((seed) => trackKeyOf(seed.artist, seed.title)));
 }

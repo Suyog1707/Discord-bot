@@ -116,6 +116,8 @@ export interface PlannerResolvers {
 }
 
 export interface PlannerConfig {
+  /** Hard language isolation; never relaxed by cooldown or pool fallback. */
+  readonly languageSpecific: boolean;
   readonly interleave: InterleaveConfig;
   /** Known songs scoring below this are not played merely to fill a slot. */
   readonly familiarMinScore: number;
@@ -147,6 +149,7 @@ export interface PlannerConfig {
 }
 
 export const DEFAULT_PLANNER_CONFIG: PlannerConfig = {
+  languageSpecific: true,
   interleave: DEFAULT_INTERLEAVE,
   familiarMinScore: 0.35,
   familiarStrongScore: 0.6,
@@ -326,7 +329,19 @@ export class AutoplayPlanner implements AutoplayGenerator {
     const dislikedArtists = dislikes.artistCounts;
 
     const seedArtists = seeds.map((seed) => identityOf(seed.artist, seed.title).artistKey);
-    const sessionLanguage = seedLanguageOf(seeds);
+    const lead = seeds[0];
+    const sessionLanguage = this.#config.languageSpecific
+      ? lead === undefined
+        ? null
+        : ((await this.#services.profiles?.autoplayLanguage(lead).catch(() => null)) ?? null)
+      : seedLanguageOf(seeds);
+    if (this.#config.languageSpecific && sessionLanguage === null) {
+      logger.info(
+        { event: 'AUTOPLAY_LANGUAGE_UNKNOWN', roomId },
+        'Cannot establish the requested recording language; not guessing',
+      );
+      return [];
+    }
     const now = Date.now();
     const scoringContext: FamiliarScoringContext = {
       profile,
@@ -390,7 +405,31 @@ export class AutoplayPlanner implements AutoplayGenerator {
       );
       pools = await this.#buildPools(passInput, relaxed);
     }
-    const { exclusions, familiarRanked, familiarStrong, discoveryRanked } = pools;
+    const { exclusions } = pools;
+    let { familiarRanked, familiarStrong, discoveryRanked } = pools;
+    if (this.#config.languageSpecific) {
+      const sameLanguage = async (candidate: { title: string; artist: string }): Promise<boolean> =>
+        (await this.#services.profiles?.autoplayLanguage(candidate).catch(() => null)) ===
+        sessionLanguage;
+      // Keep metadata concurrency bounded; a large library must not produce
+      // hundreds of simultaneous Last.fm requests.
+      const matches = async (candidates: readonly { title: string; artist: string }[]) => {
+        const flags: boolean[] = [];
+        for (let offset = 0; offset < candidates.length; offset += 8) {
+          flags.push(
+            ...(await Promise.all(candidates.slice(offset, offset + 8).map(sameLanguage))),
+          );
+        }
+        return flags;
+      };
+      const familiarMatches = await matches(familiarRanked.map((entry) => entry.candidate));
+      const discoveryMatches = await matches(discoveryRanked.map((entry) => entry.candidate));
+      familiarRanked = familiarRanked.filter((_entry, index) => familiarMatches[index]);
+      discoveryRanked = discoveryRanked.filter((_entry, index) => discoveryMatches[index]);
+      familiarStrong = familiarRanked.filter(
+        (entry) => entry.score >= this.#config.familiarStrongScore,
+      ).length;
+    }
 
     logger.info(
       {
@@ -468,14 +507,14 @@ export class AutoplayPlanner implements AutoplayGenerator {
         const primary = kind === 'familiar' ? familiarQueue : discoveryQueue;
         const secondary = kind === 'familiar' ? discoveryQueue : familiarQueue;
 
-        let filled = await this.#fillSlot(room, primary, cycle, resolvers);
+        let filled = await this.#fillSlot(room, primary, cycle, resolvers, sessionLanguage);
         blocked += filled.blocked;
         // The plan asked for a kind the pool could not deliver (every candidate
         // failed to resolve, or lost its reservation). The other pool is a
         // better outcome than a hole — but only one swap, so a dead discovery
         // pool cannot turn the whole batch into discoveries.
         if (filled.entry === null && secondary.length > 0) {
-          filled = await this.#fillSlot(room, secondary, cycle, resolvers);
+          filled = await this.#fillSlot(room, secondary, cycle, resolvers, sessionLanguage);
           blocked += filled.blocked;
         }
         if (filled.entry !== null) results.push(filled.entry);
@@ -622,6 +661,7 @@ export class AutoplayPlanner implements AutoplayGenerator {
     queue: SlotCandidate[],
     cycle: CycleState,
     resolvers: PlannerResolvers,
+    sessionLanguage: string | null,
   ): Promise<{ readonly entry: GeneratedTrack | null; readonly blocked: number }> {
     // Reservations and the resolvers are the room's; the logs name it too, so
     // two channels in one server can be told apart in a trace.
@@ -658,6 +698,22 @@ export class AutoplayPlanner implements AutoplayGenerator {
       }
 
       // The resolved upload speaks its own vocabulary; check it again.
+      if (
+        this.#config.languageSpecific &&
+        (await this.#services.profiles
+          ?.autoplayLanguage({
+            title: track.title,
+            artist: candidate.familiar?.artist ?? candidate.discovery?.artist ?? track.author,
+          })
+          .catch(() => null)) !== sessionLanguage
+      ) {
+        await this.#services.session.release(roomId, [candidate.key]).catch(() => undefined);
+        logger.debug(
+          { event: 'AUTOPLAY_LANGUAGE_REJECTED', roomId, sessionLanguage },
+          'Resolved recording language differs or cannot be established',
+        );
+        continue;
+      }
       const resolvedKey = identityOf(track.author, track.title).key;
       if (cycle.isDuplicate(track.identifier, resolvedKey)) {
         blocked += 1;
@@ -902,6 +958,7 @@ export class AutoplayPlanner implements AutoplayGenerator {
             knownKeys,
             snapshot,
             input.options,
+            this.#config.languageSpecific ? (input.scoringContext.sessionLanguage ?? null) : null,
           )
         ).flatMap((entry) => {
           const penalty = this.#artistPenaltyFor(entry.artistKey, input.dislikedArtists);
@@ -1019,6 +1076,7 @@ export class AutoplayPlanner implements AutoplayGenerator {
     knownKeys: ReadonlySet<string>,
     snapshot: SessionSnapshot,
     options: { readonly background: boolean },
+    sessionLanguage: string | null,
   ): Promise<ScoredCandidate[]> {
     try {
       const result = await this.#services.recommender.rank({
@@ -1028,7 +1086,10 @@ export class AutoplayPlanner implements AutoplayGenerator {
         count: Math.max(count, 6),
         profile,
         recent,
-        intent: MusicOrchestrator.continuationIntent(count),
+        intent: {
+          ...MusicOrchestrator.continuationIntent(count),
+          ...(sessionLanguage === null ? {} : { language: sessionLanguage }),
+        },
         exclusions,
         knownKeys,
         session: { recentArtists: snapshot.recentArtists, artistFatigue: snapshot.artistFatigue },

@@ -78,7 +78,7 @@ export default defineCommand({
 
     await interaction.editReply({
       content: enabled
-        ? '📻 **Autoplay on** — when the queue ends I will continue with songs you like, plus the occasional discovery.'
+        ? '📻 **Autoplay on** — recommendations stay in the language of your latest requested song. If the language is unknown or no matching tracks are available, playback stops instead of switching languages.'
         : '📻 **Autoplay off** — playback stops when the queue ends.',
     });
   },

@@ -209,7 +209,7 @@ function harness(options: {
           } as unknown as CooccurrenceService,
         }),
     ...(options.profiles === undefined ? {} : { profiles: options.profiles }),
-    ...(options.config === undefined ? {} : { config: options.config }),
+    config: { languageSpecific: false, ...options.config },
   });
   planner.setResolvers({
     resolveKnown: options.resolvers?.resolveKnown ?? resolveKnown,
@@ -225,6 +225,91 @@ function harness(options: {
 }
 
 const seeds: readonly TrackSeed[] = [{ title: 'Seed Song', artist: 'Seed Artist' }];
+
+describe('strict language-specific autoplay', () => {
+  it('rejects a resolved upload in a different language and releases its reservation', async () => {
+    const profiles = new TrackProfileResolver(
+      {
+        artistTags: () => Promise.resolve([]),
+        trackTags: (_artist, title) =>
+          Promise.resolve([title === 'Wrong upload' ? 'hindi' : 'english']),
+      },
+      new CacheService(),
+    );
+    const h = harness({
+      profiles,
+      config: { languageSpecific: true },
+      pool: [familiar('Singer', 'English song', ['library'])],
+      resolvers: { resolveKnown: () => Promise.resolve(playable('Other singer', 'Wrong upload')) },
+    });
+    expect(await h.planner.generate(ROOM, seeds, 1, { background: false })).toEqual([]);
+    expect((await h.session.snapshot(ROOM.roomId)).reservedKeys.size).toBe(0);
+  });
+  it.each(['english', 'hindi', 'marathi'])(
+    'keeps both pools in %s even when other languages score higher',
+    async (language) => {
+      const profiles = new TrackProfileResolver(
+        {
+          artistTags: () => Promise.resolve(['indian']),
+          trackTags: (_artist, title) =>
+            Promise.resolve(
+              title === 'Seed Song' ? [language] : title === 'Unknown' ? [] : [title],
+            ),
+        },
+        new CacheService(),
+      );
+      const h = harness({
+        profiles,
+        config: { languageSpecific: true },
+        pool: ['english', 'hindi', 'marathi', 'Unknown'].map((title) =>
+          familiar(`Singer ${title}`, title, ['library']),
+        ),
+        discoveries: ['english', 'hindi', 'marathi', 'Unknown'].map((title) =>
+          scored(discovery(`Discovery ${title}`, title), 0.99),
+        ),
+      });
+      const generated = await h.planner.generate(ROOM, seeds, 3, { background: false });
+      expect(generated.length).toBeGreaterThan(0);
+      expect(generated.every((entry) => entry.track.title === language)).toBe(true);
+      expect(h.rank).toHaveBeenCalledWith(
+        expect.objectContaining({ intent: expect.objectContaining({ language }) }),
+      );
+    },
+  );
+  it('does not fall back to another language when no matching songs exist', async () => {
+    const profiles = new TrackProfileResolver(
+      {
+        artistTags: () => Promise.resolve([]),
+        trackTags: (_artist, title) =>
+          Promise.resolve([title === 'Seed Song' ? 'marathi' : 'hindi']),
+      },
+      new CacheService(),
+    );
+    const h = harness({
+      profiles,
+      config: { languageSpecific: true },
+      pool: [familiar('Singer', 'Hindi track', ['library'])],
+    });
+    expect(await h.planner.generate(ROOM, seeds, 3, { background: false })).toEqual([]);
+    expect(h.resolveKnown).not.toHaveBeenCalled();
+  });
+  it('does not guess English from Latin text or Hindi from shared Devanagari', async () => {
+    const profiles = new TrackProfileResolver(
+      { artistTags: () => Promise.resolve(['american']), trackTags: () => Promise.resolve([]) },
+      new CacheService(),
+    );
+    const h = harness({
+      profiles,
+      config: { languageSpecific: true },
+      pool: [familiar('Singer', 'Song', ['library'])],
+    });
+    for (const title of ['Seed Song', 'मराठी गाणे']) {
+      expect(
+        await h.planner.generate(ROOM, [{ title, artist: 'Singer' }], 2, { background: false }),
+      ).toEqual([]);
+    }
+  });
+});
 
 /** Generate `batches` × `count` tracks, recording each as played so the cadence carries. */
 async function playThrough(
