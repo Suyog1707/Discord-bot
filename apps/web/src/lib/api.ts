@@ -5,7 +5,7 @@
  * routes its errors through `handleApiError`, so clients parse one shape and no
  * handler re-invents error mapping (docs/API.md, PROJECT_RULES.md).
  */
-import { toAppError, type ApiResponse } from '@discord-music/shared';
+import { toAppError, userErrorMessage, type ApiResponse } from '@discord-music/shared';
 import { NextResponse } from 'next/server';
 
 import { getLogger } from './logger';
@@ -59,7 +59,12 @@ export function handleApiError(error: unknown, route: string): NextResponse<ApiR
   }
 
   return NextResponse.json<ApiResponse<never>>(
-    { success: false, error: appError.toJSON() },
+    {
+      success: false,
+      error: appError.expected
+        ? appError.toJSON()
+        : { code: appError.code, message: userErrorMessage(error) },
+    },
     { status: appError.statusCode, headers },
   );
 }

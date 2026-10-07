@@ -12,7 +12,7 @@
  * sent, and even that is expressed by the interaction saying so rather than by
  * a flag this function branches on.
  */
-import { isAppError, toAppError } from '@discord-music/shared';
+import { userErrorMessage, toAppError } from '@discord-music/shared';
 import type { ChatInputCommandInteraction } from 'discord.js';
 
 import type { Logger } from '../lib/logger.js';
@@ -109,7 +109,7 @@ export async function dispatchChatInputCommand(
     commandLogger.error({ err: error }, 'Guard evaluation failed');
     await replyWithError(
       interaction,
-      'Something went wrong checking permissions. Try again.',
+      `Unable to check command permissions: ${userErrorMessage(error)}`,
       commandLogger,
     );
     return;
@@ -140,12 +140,6 @@ export async function dispatchChatInputCommand(
 
     // replyWithError never throws: a dead interaction is logged and dropped
     // rather than retried into a second Unknown interaction.
-    await replyWithError(
-      interaction,
-      isAppError(appError) && appError.expected
-        ? appError.message
-        : 'Something went wrong while running that command. Please try again.',
-      commandLogger,
-    );
+    await replyWithError(interaction, userErrorMessage(error), commandLogger);
   }
 }

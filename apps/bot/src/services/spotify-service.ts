@@ -14,7 +14,16 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 
 import type { PrismaClient, SpotifyAccount } from '@discord-music/database';
-import { ConflictError, LIMITS, NotFoundError, UpstreamError } from '@discord-music/shared';
+import {
+  ConflictError,
+  LIMITS,
+  NotFoundError,
+  UpstreamError,
+  spotifyTrack,
+  spotifyPlaylistCount,
+  spotifyApiUrl,
+  spotifyRequestError,
+} from '@discord-music/shared';
 
 import { getEnv } from '../config/env.js';
 import { getLogger } from '../lib/logger.js';
@@ -23,7 +32,6 @@ import type { SpotifyTrackMeta } from '../music/spotify-resolver.js';
 const logger = getLogger('spotify-account');
 
 const ACCOUNTS_BASE = 'https://accounts.spotify.com';
-const API_BASE = 'https://api.spotify.com/v1';
 const TIMEOUT_MS = 10_000;
 const EXPIRY_SKEW_MS = 60_000;
 
@@ -133,11 +141,13 @@ export class SpotifyService {
   /**
    * Decrypted access tokens, held until shortly before Spotify expires them.
    *
-   * Without this every Spotify `/play` pays a database read plus an AES
-   * decrypt before the first byte of metadata is requested; the token is valid
-   * for an hour, so re-deriving it per command is pure latency.
+   * Recheck the database link so dashboard unlink/relink takes effect across
+   * players, but avoid repeating AES decryption while its stored token matches.
    */
-  readonly #tokenCache = new Map<string, { value: string; expiresAt: number }>();
+  readonly #tokenCache = new Map<
+    string,
+    { value: string; expiresAt: number; storedAccessToken: string }
+  >();
 
   constructor(prisma: PrismaClient) {
     this.#prisma = prisma;
@@ -164,9 +174,6 @@ export class SpotifyService {
    */
   async accessTokenForPlayback(discordId: string): Promise<string | null> {
     if (!this.canReadTokens()) return null;
-    const cached = this.#tokenCache.get(discordId);
-    if (cached !== undefined && cached.expiresAt - Date.now() > EXPIRY_SKEW_MS) return cached.value;
-
     const account = await this.status(discordId);
     // No link is normal for `/play`: the caller falls back to public metadata.
     return account === null ? null : this.#validAccessToken(discordId, account);
@@ -186,15 +193,22 @@ export class SpotifyService {
    * re-reading it here would double the database cost of every Spotify command.
    */
   async #validAccessToken(discordId: string, known?: SpotifyAccount): Promise<string> {
-    const cached = this.#tokenCache.get(discordId);
-    if (cached !== undefined && cached.expiresAt - Date.now() > EXPIRY_SKEW_MS) return cached.value;
-
     const account = known ?? (await this.status(discordId));
     if (account === null) {
+      this.#tokenCache.delete(discordId);
       throw new NotFoundError(
         'No Spotify account linked — connect one with `/spotify connect` first.',
       );
     }
+
+    // The dashboard or another player may unlink/relink the account. A local
+    // cache must never override the current database link or its new token.
+    const cached = this.#tokenCache.get(discordId);
+    if (
+      cached?.storedAccessToken === account.accessToken &&
+      cached.expiresAt - Date.now() > EXPIRY_SKEW_MS
+    )
+      return cached.value;
 
     const accessToken = decryptToken(account.accessToken);
     const refreshToken = decryptToken(account.refreshToken);
@@ -208,6 +222,7 @@ export class SpotifyService {
       this.#tokenCache.set(discordId, {
         value: accessToken,
         expiresAt: account.expiresAt.getTime(),
+        storedAccessToken: account.accessToken,
       });
       return accessToken;
     }
@@ -250,17 +265,17 @@ export class SpotifyService {
     };
 
     const expiresAt = Date.now() + data.expires_in * 1000;
-    this.#tokenCache.set(discordId, { value: data.access_token, expiresAt });
-
+    const storedAccessToken = encryptToken(data.access_token);
     await this.#prisma.spotifyAccount.update({
       where: { id: account.id },
       data: {
-        accessToken: encryptToken(data.access_token),
+        accessToken: storedAccessToken,
         // Spotify usually keeps the refresh token; rotate when it sends a new one.
         refreshToken: encryptToken(data.refresh_token ?? refreshToken),
         expiresAt: new Date(expiresAt),
       },
     });
+    this.#tokenCache.set(discordId, { value: data.access_token, expiresAt, storedAccessToken });
     return data.access_token;
   }
 
@@ -268,7 +283,7 @@ export class SpotifyService {
     const token = await this.#validAccessToken(discordId);
     let response: Response;
     try {
-      response = await fetch(path.startsWith('https://') ? path : `${API_BASE}${path}`, {
+      response = await fetch(spotifyApiUrl(path.startsWith('/') ? `/v1${path}` : path), {
         headers: { Authorization: `Bearer ${token}` },
         signal: AbortSignal.timeout(TIMEOUT_MS),
       });
@@ -277,14 +292,8 @@ export class SpotifyService {
         cause: error,
       });
     }
-    if (response.status === 401 || response.status === 403) {
-      throw new UpstreamError('Spotify denied that request. Reconnect your account and try again.');
-    }
-    if (response.status === 404) throw new NotFoundError('That Spotify item no longer exists.');
-    if (response.status === 429) {
-      throw new UpstreamError('Spotify is rate limiting requests. Try again shortly.');
-    }
-    if (!response.ok) throw new UpstreamError('Spotify request failed. Try again shortly.');
+    if (!response.ok)
+      throw spotifyRequestError(response.status, response.headers.get('retry-after'));
     return (await response.json()) as T;
   }
 
@@ -299,8 +308,9 @@ export class SpotifyService {
         id: string;
         name: string;
         snapshot_id: string;
-        /** Spotify names this `tracks`, not `items`. */
+        /** Legacy and current Spotify playlist count fields. */
         tracks: { total: number } | null;
+        items?: { total: number } | null;
         owner: { display_name: string | null } | null;
         images?: { url: string }[] | null;
         public: boolean | null;
@@ -320,7 +330,10 @@ export class SpotifyService {
       },
     ];
     let url: string | null = '/me/playlists?limit=50';
+    const seen = new Set<string>();
     while (url !== null && collected.length < 200) {
+      if (seen.has(url)) throw new UpstreamError('Spotify returned repeated playlist pages.');
+      seen.add(url);
       const page: Page = await this.#apiGet(discordId, url);
       collected.push(
         ...page.items
@@ -328,7 +341,7 @@ export class SpotifyService {
           .map((item) => ({
             spotifyId: item.id,
             name: item.name,
-            trackCount: item.tracks?.total ?? 0,
+            trackCount: spotifyPlaylistCount(item),
             owner: item.owner?.display_name ?? null,
             artworkUrl: item.images?.[0]?.url ?? null,
             isPublic: item.public,
@@ -337,31 +350,39 @@ export class SpotifyService {
       );
       url = page.next;
     }
-    return collected;
+    return collected.slice(0, 200);
   }
 
   /** Tracks of a playlist (or Liked Songs), local files skipped. */
   async playlistTracks(discordId: string, spotifyId: string, limit: number): Promise<UserTrack[]> {
     const collected: UserTrack[] = [];
-    /**
-     * "Get Playlist Items" is `/tracks`. It was `/items`, which Spotify does
-     * not publish — the same mistake `spotify-resolver.ts` records fixing on
-     * its own path. Neither route had ever run, because no account had been
-     * linked, so nothing caught it.
-     */
+    // Playlist items use the 2026 endpoint; Liked Songs retains /me/tracks.
     let url: string | null =
       spotifyId === LIKED_SONGS_ID
         ? '/me/tracks?limit=50'
-        : `/playlists/${spotifyId}/tracks?limit=100`;
-
+        : `/playlists/${encodeURIComponent(spotifyId)}/items?limit=50`;
+    const seen = new Set<string>();
     while (url !== null && collected.length < limit) {
-      // Both routes wrap each entry as `{ track }`; it is null for a removed
-      // or region-unavailable song.
-      const page: { items: ({ track: RawTrack | null } | null)[]; next: string | null } =
-        await this.#apiGet(discordId, url);
+      if (seen.has(url)) throw new UpstreamError('Spotify returned repeated track pages.');
+      seen.add(url);
+      // Support current and legacy keys; unavailable tracks are null.
+      const page: {
+        items: ({ track?: RawTrack | null; item?: RawTrack | null } | null)[];
+        next: string | null;
+      } = await this.#apiGet(discordId, url);
+      if (!Array.isArray(page.items)) {
+        throw new UpstreamError(
+          'Spotify did not provide playlist tracks. In Development Mode, you must own or collaborate on the playlist.',
+        );
+      }
       for (const item of page.items) {
-        const track = item?.track;
-        if (track != null && track.is_local !== true) {
+        const track = spotifyTrack(item);
+        if (
+          track != null &&
+          track.is_local !== true &&
+          Array.isArray(track.artists) &&
+          typeof track.duration_ms === 'number'
+        ) {
           collected.push(toUserTrack(track));
         }
       }

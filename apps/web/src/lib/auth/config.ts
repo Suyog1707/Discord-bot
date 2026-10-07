@@ -13,7 +13,6 @@ import 'server-only';
  * - Discord access/refresh tokens land in the Account row via the adapter;
  *   `lib/discord` refreshes them on demand when calling the Discord API.
  */
-import { PrismaAdapter } from '@auth/prisma-adapter';
 import type { NextAuthConfig } from 'next-auth';
 import Discord, { type DiscordProfile } from 'next-auth/providers/discord';
 
@@ -22,6 +21,7 @@ import { getDb } from '@/lib/db';
 import { getEnv, isProduction } from '@/lib/env';
 import { getLogger } from '@/lib/logger';
 import { omitUndefined } from '@/lib/object';
+import { discordAdapter } from './adapter';
 
 /** OAuth scopes: identity + email for the profile, guilds for the server list. */
 const DISCORD_SCOPES = ['identify', 'email', 'guilds'].join(' ');
@@ -36,7 +36,7 @@ export function buildAuthConfig(): NextAuthConfig {
   const logger = getLogger('auth');
 
   return {
-    adapter: PrismaAdapter(getDb()),
+    adapter: discordAdapter(getDb()),
     session: {
       strategy: 'database',
       maxAge: 30 * 24 * 60 * 60, // 30 days

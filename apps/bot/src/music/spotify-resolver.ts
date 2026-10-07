@@ -15,6 +15,7 @@ import {
   searchSpotifySuggestions as sharedSpotifySuggestions,
   spotifyApiGet,
   spotifyAppToken,
+  spotifyTrack,
   UpstreamError,
   ValidationError,
   type SpotifyCredentials,
@@ -79,7 +80,7 @@ export interface SpotifyResolution {
 }
 
 /** First-page size for paged collections; also Spotify's own page maximum. */
-const PLAYLIST_PAGE_SIZE = 100;
+const PLAYLIST_PAGE_SIZE = 50;
 const ALBUM_PAGE_SIZE = 50;
 /** Parallel page fetches when expanding the tail of a collection. */
 const PAGE_CONCURRENCY = 4;
@@ -202,16 +203,13 @@ interface PlaylistPage {
    * earlier revision of this file asked for that key and it costs nothing to
    * accept both rather than silently drop every row if it ever comes back.
    */
-  readonly items?: readonly {
+  readonly items?: readonly ({
     readonly track?: RawTrack | null;
     readonly item?: RawTrack | null;
-  }[];
+  } | null)[];
   readonly next: string | null;
   readonly total?: number;
 }
-
-const PLAYLIST_ITEM_FIELDS =
-  'items(track(id,name,duration_ms,artists(name),album(name,images),external_ids,external_urls,is_local)),next,total';
 
 function playablePlaylistTracks(page: PlaylistPage): RawTrack[] {
   if (page.items === undefined) {
@@ -220,7 +218,7 @@ function playablePlaylistTracks(page: PlaylistPage): RawTrack[] {
     throw new ValidationError('Spotify did not provide items for that playlist.');
   }
   return page.items.flatMap((entry) => {
-    const track = entry.track ?? entry.item;
+    const track = spotifyTrack(entry);
     // A playlist may hold podcast episodes and local files. Neither carries the
     // artist list `toMeta` needs, and neither is playable from a search.
     if (track == null || track.is_local === true || track.artists === undefined) return [];
@@ -230,12 +228,9 @@ function playablePlaylistTracks(page: PlaylistPage): RawTrack[] {
 
 async function linkedPlaylist(id: string, token: string): Promise<SpotifyResolution> {
   const limit = playlistTrackLimit();
-  // `/tracks` is the documented "Get Playlist Items" route. It was `/items`,
-  // which is not an endpoint Spotify publishes — the linked path had never run
-  // (no account had been connected), so nothing caught it.
+  // Current Development Mode playlist endpoint; responses tolerate legacy keys.
   const itemsPath = (offset: number): string =>
-    `/playlists/${id}/tracks?limit=${String(PLAYLIST_PAGE_SIZE)}&offset=${String(offset)}` +
-    `&fields=${PLAYLIST_ITEM_FIELDS}`;
+    `/playlists/${id}/items?limit=${String(PLAYLIST_PAGE_SIZE)}&offset=${String(offset)}`;
 
   // Name and first page are independent lookups — no reason to serialise them.
   const [playlist, firstPage] = await Promise.all([

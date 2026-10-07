@@ -10,7 +10,7 @@
 import {
   baseCustomId,
   NotFoundError,
-  toAppError,
+  userErrorMessage,
   UpstreamError,
   withComponentOwner,
 } from '@discord-music/shared';
@@ -203,7 +203,8 @@ async function browsePlaylists(
           const [value] = component.values;
           selected = items.find((item) => item.spotifyId === value) ?? null;
           if (selected === null) return;
-          await component.update(detailView(selected, botId));
+          if (!component.deferred && !component.replied) await component.deferUpdate();
+          await component.editReply(detailView(selected, botId));
           return;
         }
         if (!component.isButton()) return;
@@ -211,23 +212,25 @@ async function browsePlaylists(
         switch (baseCustomId(component.customId)) {
           case 'spl:prev':
           case 'spl:next': {
-            page += component.customId === 'spl:next' ? 1 : -1;
+            page += baseCustomId(component.customId) === 'spl:next' ? 1 : -1;
             page = Math.max(0, Math.min(page, Math.ceil(items.length / PAGE_SIZE) - 1));
-            await component.update(pageView(items, page, botId));
+            if (!component.deferred && !component.replied) await component.deferUpdate();
+            await component.editReply(pageView(items, page, botId));
             return;
           }
           case 'spl:back':
             selected = null;
-            await component.update(pageView(items, page, botId));
+            if (!component.deferred && !component.replied) await component.deferUpdate();
+            await component.editReply(pageView(items, page, botId));
             return;
           case 'spl:import':
           case 'spl:sync': {
             if (selected === null) return;
-            await component.deferUpdate();
+            if (!component.deferred && !component.replied) await component.deferUpdate();
             const result = await spotify.importItem(interaction.user.id, selected);
             await component.followUp({
               content: result.changed
-                ? `📥 ${component.customId === 'spl:sync' ? 'Synced' : 'Imported'} **${result.name}** — ${String(result.trackCount)} track(s). Play it with \`/playlist play\`.`
+                ? `📥 ${baseCustomId(component.customId) === 'spl:sync' ? 'Synced' : 'Imported'} **${result.name}** — ${String(result.trackCount)} track(s). Play it with \`/playlist play\`.`
                 : `**${result.name}** is already up to date.`,
               flags: MessageFlags.Ephemeral,
             });
@@ -238,7 +241,7 @@ async function browsePlaylists(
             if (selected === null) return;
             const music = requireMusic(client);
             const context = requireVoiceContext(interaction);
-            await component.deferUpdate();
+            if (!component.deferred && !component.replied) await component.deferUpdate();
 
             // The whole playlist, bounded only by SPOTIFY_PLAYLIST_MAX_TRACKS —
             // which is itself capped at the queue's capacity. This used to be a
@@ -249,6 +252,11 @@ async function browsePlaylists(
               selected.spotifyId,
               getEnv().SPOTIFY_PLAYLIST_MAX_TRACKS,
             );
+            if (tracks.length === 0) {
+              throw new NotFoundError(
+                'This Spotify playlist contains no available music tracks. It may be empty or contain only unavailable tracks, local files, or podcasts.',
+              );
+            }
             const player = await requireRouter(client).joinRoom({
               guildId: context.guildId,
               voiceChannelId: context.voiceChannelId,
@@ -286,7 +294,7 @@ async function browsePlaylists(
             }
 
             const requester = { id: interaction.user.id, name: interaction.user.username };
-            const playNow = component.customId === 'spl:play';
+            const playNow = baseCustomId(component.customId) === 'spl:play';
             // Searches run in parallel batches; each finished batch is appended
             // in original order, so playback starts on the first few tracks
             // instead of after every one has been looked up.
@@ -329,10 +337,10 @@ async function browsePlaylists(
           default:
         }
       } catch (error) {
-        const appError = toAppError(error);
+        client.logger.error({ err: error }, 'Spotify playlist action failed');
         await component
           .followUp({
-            content: appError.expected ? appError.message : 'That action failed. Try again.',
+            content: `Spotify playlist action failed: ${userErrorMessage(error)}`,
             flags: MessageFlags.Ephemeral,
           })
           .catch(() => undefined);

@@ -6,6 +6,8 @@ export default defineConfig({
     'src/scripts/deploy-commands.ts',
     'src/commands/**/*.ts',
     'src/events/**/*.ts',
+    '!src/**/*.test.ts',
+    '!src/**/*.spec.ts',
   ],
   format: ['esm'],
   target: 'node20',

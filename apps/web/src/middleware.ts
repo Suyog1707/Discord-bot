@@ -86,7 +86,26 @@ export function middleware(request: NextRequest): NextResponse {
   const hasSessionCookie = SESSION_COOKIES.some((name) => request.cookies.has(name));
 
   if (!hasSessionCookie) {
-    const login = new URL('/login', request.url);
+    // Docker's request URL can be 0.0.0.0:3000 even with a public Host.
+    // Production redirects must use the configured website, not that address.
+    const configured = process.env.NEXTAUTH_URL;
+    if (!configured && process.env.NODE_ENV === 'production') {
+      return NextResponse.json({ error: 'Public website URL is not configured.' }, { status: 503 });
+    }
+    let login: URL;
+    try {
+      login = new URL('/login', configured ?? request.url);
+      if (
+        login.username ||
+        login.password ||
+        login.hostname === '0.0.0.0' ||
+        (process.env.NODE_ENV === 'production' && login.protocol !== 'https:')
+      ) {
+        return NextResponse.json({ error: 'Public website URL is invalid.' }, { status: 503 });
+      }
+    } catch {
+      return NextResponse.json({ error: 'Public website URL is invalid.' }, { status: 503 });
+    }
     login.searchParams.set('callbackUrl', request.nextUrl.pathname + request.nextUrl.search);
     return NextResponse.redirect(login);
   }

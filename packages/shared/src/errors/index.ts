@@ -179,3 +179,20 @@ export function toAppError(error: unknown): AppError {
   if (error instanceof Error) return new InternalError(undefined, { cause: error });
   return new InternalError(undefined, { cause: new Error(String(error)) });
 }
+
+/** Classify only known failure codes; never expose arbitrary exception text. */
+export function userErrorMessage(error: unknown): string {
+  if (isAppError(error) && error.expected) return error.message;
+  let current = error;
+  for (let depth = 0; depth < 4 && current instanceof Error; depth++) {
+    const code = (current as Error & { code?: unknown }).code;
+    if (code === 'P1001' || code === 'P1002' || code === 'P1017')
+      return 'The database is unavailable. Please try again shortly.';
+    if (code === 50013 || code === 50001)
+      return 'The bot is missing Discord permissions or channel access. Ask a server administrator to check its permissions.';
+    if (current.name === 'TimeoutError' || current.name === 'AbortError')
+      return 'The request timed out. Please try again shortly.';
+    current = current.cause;
+  }
+  return 'An unexpected error prevented this action. Please try again; if it persists, contact the bot administrator.';
+}

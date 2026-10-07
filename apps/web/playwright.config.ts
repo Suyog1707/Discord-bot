@@ -32,7 +32,7 @@ export default defineConfig({
   webServer: {
     command: isCI ? 'pnpm run start' : 'pnpm run dev',
     url: BASE_URL,
-    reuseExistingServer: !isCI,
+    reuseExistingServer: !isCI && process.env.PLAYWRIGHT_FRESH_SERVER !== 'true',
     timeout: 120_000,
   },
 });

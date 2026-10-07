@@ -6,6 +6,15 @@ import { middleware } from '../middleware';
 afterEach(() => vi.unstubAllEnvs());
 
 describe('Vercel backend proxy', () => {
+  it('keeps backend login redirects on the configured public origin', () => {
+    vi.stubEnv('WEB_BACKEND_LOCAL', 'true');
+    vi.stubEnv('BACKEND_PROXY_ENABLED', '');
+    vi.stubEnv('NEXTAUTH_URL', 'https://music.example.com');
+    const response = middleware(new NextRequest('http://0.0.0.0:3000/dashboard/settings'));
+    expect(response.headers.get('location')).toBe(
+      'https://music.example.com/login?callbackUrl=%2Fdashboard%2Fsettings',
+    );
+  });
   it('keeps the original routes only on the explicitly local backend', () => {
     vi.stubEnv('BACKEND_PROXY_ENABLED', '');
     vi.stubEnv('WEB_BACKEND_LOCAL', 'true');

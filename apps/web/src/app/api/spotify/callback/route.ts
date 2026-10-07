@@ -3,17 +3,18 @@ import { NextResponse, type NextRequest } from 'next/server';
 import { withErrorHandling } from '@/lib/api';
 import { requireUser } from '@/lib/auth/session';
 import { getLogger } from '@/lib/logger';
+import { publicUrl } from '@/lib/public-origin';
 import { completeLink } from '@/lib/services/spotify';
 import { STATE_COOKIE } from '../authorize/route';
 
 export const dynamic = 'force-dynamic';
 
-function settingsRedirect(request: NextRequest, outcome: string): NextResponse {
-  const redirectUrl = new URL('/dashboard/settings', request.url);
+function settingsRedirect(outcome: string): NextResponse {
+  const redirectUrl = publicUrl('/dashboard/settings');
   redirectUrl.searchParams.set('spotify', outcome);
 
   const response = NextResponse.redirect(redirectUrl);
-  response.cookies.delete(STATE_COOKIE);
+  response.cookies.set(STATE_COOKIE, '', { path: '/api/spotify', maxAge: 0 });
 
   return response;
 }
@@ -23,7 +24,7 @@ export const GET = withErrorHandling('GET /api/spotify/callback', async (request
   const params = request.nextUrl.searchParams;
 
   if (params.get('error') !== null) {
-    return settingsRedirect(request, 'denied');
+    return settingsRedirect('denied');
   }
 
   const code = params.get('code');
@@ -31,7 +32,7 @@ export const GET = withErrorHandling('GET /api/spotify/callback', async (request
   const expectedState = request.cookies.get(STATE_COOKIE)?.value;
 
   if (code === null || state === null || expectedState === undefined || state !== expectedState) {
-    return settingsRedirect(request, 'invalid');
+    return settingsRedirect('invalid');
   }
 
   try {
@@ -39,8 +40,8 @@ export const GET = withErrorHandling('GET /api/spotify/callback', async (request
   } catch (error) {
     getLogger('spotify').warn({ err: error, userId: user.id }, 'Spotify link failed');
 
-    return settingsRedirect(request, 'failed');
+    return settingsRedirect('failed');
   }
 
-  return settingsRedirect(request, 'linked');
+  return settingsRedirect('linked');
 });

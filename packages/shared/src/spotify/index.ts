@@ -6,3 +6,5 @@
  * use for them.
  */
 export * from './search.js';
+export * from './response.js';
+export * from './errors.js';

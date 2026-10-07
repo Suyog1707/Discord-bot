@@ -34,3 +34,18 @@ test.describe('health endpoint', () => {
     expect(body.data?.dependencies).toHaveProperty('redis');
   });
 });
+
+test.describe('unauthenticated security boundaries', () => {
+  test('dashboard sends visitors to login', async ({ page }) => {
+    await page.goto('/dashboard/settings');
+    await expect(page).toHaveURL(/\/login\?/);
+    await expect(page.getByRole('button', { name: 'Continue with Discord' })).toBeVisible();
+  });
+  test('Spotify linking and callback require a Discord session', async ({ request }) => {
+    for (const path of ['/api/spotify/authorize', '/api/spotify/callback?code=test&state=test']) {
+      const response = await request.get(path);
+      expect(response.status()).toBe(401);
+      expect(response.headers().location).toBeUndefined();
+    }
+  });
+});

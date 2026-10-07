@@ -1,11 +1,7 @@
 /**
  * The corrected Spotify request shapes.
  *
- * `playlistTracks` used to call `/playlists/{id}/items` — a route Spotify does
- * not publish — and read each entry as `{ item }` instead of `{ track }`;
- * `listPlaylists` read `items.total` where the API returns `tracks.total`.
- * None of it had ever run, because no account had been linked, so nothing
- * caught it. These tests pin the real shapes so they cannot regress.
+ * Cover current Spotify playlist responses and legacy compatibility.
  */
 import { createCipheriv, createHash, randomBytes } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -81,14 +77,13 @@ describe('playlistTracks', () => {
     vi.unstubAllGlobals();
   });
 
-  /** The route bug: `/items` is not a Spotify endpoint. */
-  it('requests the documented /tracks route for a playlist', async () => {
+  it('requests the current /items route for a playlist', async () => {
     const fetchMock = mockFetchSequence([{ items: [], next: null }]);
 
     await makeService().playlistTracks('123', 'playlist-abc', 50);
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
-      'https://api.spotify.com/v1/playlists/playlist-abc/tracks?limit=100',
+      'https://api.spotify.com/v1/playlists/playlist-abc/items?limit=50',
     );
   });
 
@@ -100,7 +95,11 @@ describe('playlistTracks', () => {
     expect(fetchMock.mock.calls[0]?.[0]).toBe('https://api.spotify.com/v1/me/tracks?limit=50');
   });
 
-  /** The field bug: each entry is wrapped as `{ track }`, never `{ item }`. */
+  it('unwraps the current item field', async () => {
+    mockFetchSequence([{ items: [{ item: rawTrack }], next: null }]);
+    expect(await makeService().playlistTracks('123', 'p', 50)).toHaveLength(1);
+  });
+
   it('unwraps each entry from the track field', async () => {
     mockFetchSequence([{ items: [{ track: rawTrack }], next: null }]);
 
@@ -161,6 +160,20 @@ describe('playlistTracks', () => {
 
     expect(tracks).toHaveLength(3);
   });
+  it('refuses repeated pages instead of looping forever', async () => {
+    const next = 'https://api.spotify.com/v1/repeat';
+    mockFetchSequence([
+      { items: [], next },
+      { items: [], next },
+    ]);
+    await expect(makeService().playlistTracks('123', 'p', 3)).rejects.toThrow(
+      'repeated track pages',
+    );
+  });
+  it('explains a missing playlist contents response', async () => {
+    mockFetchSequence([{ next: null }]);
+    await expect(makeService().playlistTracks('123', 'p', 3)).rejects.toThrow('own or collaborate');
+  });
 });
 
 describe('listPlaylists', () => {
@@ -199,6 +212,12 @@ describe('listPlaylists', () => {
       snapshotId: 'snap-1',
     });
   });
+  it('reads the 2026 items count', async () => {
+    mockFetchSequence([
+      { items: [{ id: 'p', name: 'Current', items: { total: 42 }, owner: null }], next: null },
+    ]);
+    expect((await makeService().listPlaylists('123'))[1]?.trackCount).toBe(42);
+  });
 
   /** Spotify pads pages with nulls for playlists the user can no longer see. */
   it('survives null entries and missing tracks/owner objects', async () => {
@@ -223,5 +242,22 @@ describe('listPlaylists', () => {
 
     expect(playlists).toHaveLength(2);
     expect(playlists[1]).toMatchObject({ spotifyId: 'p2', trackCount: 0, owner: null });
+  });
+});
+
+describe('Spotify link cache invalidation', () => {
+  it('does not keep a deleted dashboard link alive through a cached token', async () => {
+    const findFirst = vi.fn(() => Promise.resolve(account as typeof account | null));
+    const service = new SpotifyService({ spotifyAccount: { findFirst } } as never);
+    expect(await service.accessTokenForPlayback('123')).toBe('access-token');
+    findFirst.mockResolvedValueOnce(null);
+    expect(await service.accessTokenForPlayback('123')).toBeNull();
+  });
+  it('uses a newly linked account token rather than the previous cached token', async () => {
+    const findFirst = vi.fn(() => Promise.resolve(account));
+    const service = new SpotifyService({ spotifyAccount: { findFirst } } as never);
+    await service.accessTokenForPlayback('123');
+    findFirst.mockResolvedValueOnce({ ...account, accessToken: encrypt('new-access') });
+    expect(await service.accessTokenForPlayback('123')).toBe('new-access');
   });
 });

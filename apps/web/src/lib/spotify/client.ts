@@ -6,12 +6,17 @@ import 'server-only';
  * SPOTIFY_CLIENT_ID/SECRET are configured — callers gate on
  * `isSpotifyConfigured()` and surface a clear message otherwise.
  */
-import { UpstreamError } from '@discord-music/shared';
+import {
+  UpstreamError,
+  spotifyTrack,
+  spotifyApiUrl,
+  spotifyRequestError,
+} from '@discord-music/shared';
 
 import { getEnv } from '@/lib/env';
+import { publicUrl } from '@/lib/public-origin';
 
 const ACCOUNTS_BASE = 'https://accounts.spotify.com';
-const API_BASE = 'https://api.spotify.com/v1';
 
 /** Read-only scopes: playlists plus (optional at use) the user's library. */
 export const SPOTIFY_SCOPES = 'playlist-read-private playlist-read-collaborative user-library-read';
@@ -38,7 +43,14 @@ export function redirectUri(): string {
     throw new UpstreamError('SPOTIFY_REDIRECT_URI is not configured.');
   }
 
-  return redirectUri;
+  const configured = new URL(redirectUri);
+  const expected = publicUrl('/api/spotify/callback');
+  if (configured.href !== expected.href) {
+    throw new UpstreamError(
+      'SPOTIFY_REDIRECT_URI must match the public website /api/spotify/callback URL.',
+    );
+  }
+  return configured.href;
 }
 
 export function authorizeUrl(state: string): string {
@@ -78,17 +90,8 @@ async function tokenRequest(body: URLSearchParams): Promise<{
   const responseText = await response.text();
 
   if (!response.ok) {
-    let spotifyError: unknown = responseText;
-
-    try {
-      spotifyError = JSON.parse(responseText);
-    } catch {
-      // Keep the raw response text.
-    }
-
     console.error('Spotify token request failed:', {
       status: response.status,
-      response: spotifyError,
     });
 
     throw new UpstreamError(`Spotify token request failed (${String(response.status)}).`);
@@ -133,28 +136,18 @@ export async function refreshTokens(refreshToken: string): Promise<SpotifyTokens
 /* ------------------------------------------------------------- API reads */
 
 async function apiGet<T>(accessToken: string, path: string): Promise<T> {
-  const response = await fetch(path.startsWith('https://') ? path : `${API_BASE}${path}`, {
+  const response = await fetch(spotifyApiUrl(path.startsWith('/') ? `/v1${path}` : path), {
     headers: { Authorization: `Bearer ${accessToken}` },
     signal: AbortSignal.timeout(10_000),
   });
   const responseText = await response.text();
 
   if (!response.ok) {
-    let spotifyError: unknown = responseText;
-
-    try {
-      spotifyError = JSON.parse(responseText);
-    } catch {
-      // Keep the raw response text.
-    }
-
     console.error('Spotify API request failed:', {
       status: response.status,
-      response: spotifyError,
-      path,
     });
 
-    throw new UpstreamError(`Spotify API request failed (${String(response.status)}).`);
+    throw spotifyRequestError(response.status, response.headers.get('retry-after'));
   }
 
   return JSON.parse(responseText) as T;
@@ -174,8 +167,9 @@ export interface SpotifyPlaylistSummary {
   readonly id: string;
   readonly name: string;
   readonly snapshot_id: string;
-  readonly tracks: { readonly total: number };
-  readonly owner: { readonly display_name: string | null };
+  readonly tracks?: { readonly total: number } | null;
+  readonly items?: { readonly total: number } | null;
+  readonly owner: { readonly display_name: string | null } | null;
   readonly public: boolean | null;
 }
 
@@ -184,15 +178,18 @@ export async function listPlaylists(
 ): Promise<readonly SpotifyPlaylistSummary[]> {
   const collected: SpotifyPlaylistSummary[] = [];
   let url: string | null = '/me/playlists?limit=50';
+  const seen = new Set<string>();
   while (url !== null && collected.length < 200) {
-    const page: { items: SpotifyPlaylistSummary[]; next: string | null } = await apiGet(
+    if (seen.has(url)) throw new UpstreamError('Spotify returned repeated playlist pages.');
+    seen.add(url);
+    const page: { items: (SpotifyPlaylistSummary | null)[]; next: string | null } = await apiGet(
       accessToken,
       url,
     );
-    collected.push(...page.items);
+    collected.push(...page.items.filter((item): item is SpotifyPlaylistSummary => item !== null));
     url = page.next;
   }
-  return collected;
+  return collected.slice(0, 200);
 }
 
 export interface SpotifyTrack {
@@ -212,15 +209,29 @@ export async function getPlaylistTracks(
   limit: number,
 ): Promise<readonly SpotifyTrack[]> {
   const collected: SpotifyTrack[] = [];
-  let url: string | null = `/playlists/${playlistId}/tracks?limit=100`;
+  let url: string | null = `/playlists/${encodeURIComponent(playlistId)}/items?limit=50`;
+  const seen = new Set<string>();
   while (url !== null && collected.length < limit) {
-    const page: { items: { track: SpotifyTrack | null }[]; next: string | null } = await apiGet(
-      accessToken,
-      url,
-    );
+    if (seen.has(url)) throw new UpstreamError('Spotify returned repeated track pages.');
+    seen.add(url);
+    const page: {
+      items: ({ track?: SpotifyTrack | null; item?: SpotifyTrack | null } | null)[];
+      next: string | null;
+    } = await apiGet(accessToken, url);
+    if (!Array.isArray(page.items))
+      throw new UpstreamError(
+        'Spotify did not provide playlist tracks. You may need to own or collaborate on this playlist.',
+      );
     for (const item of page.items) {
-      if (item.track !== null && item.track.is_local !== true && item.track.id !== null) {
-        collected.push(item.track);
+      const track = spotifyTrack(item);
+      if (
+        track !== null &&
+        track.is_local !== true &&
+        track.id !== null &&
+        Array.isArray(track.artists) &&
+        typeof track.duration_ms === 'number'
+      ) {
+        collected.push(track);
       }
     }
     url = page.next;
@@ -232,10 +243,7 @@ export async function getPlaylistMeta(
   accessToken: string,
   playlistId: string,
 ): Promise<SpotifyPlaylistSummary> {
-  return apiGet(
-    accessToken,
-    `/playlists/${playlistId}?fields=id,name,snapshot_id,tracks(total),owner(display_name),public`,
-  );
+  return apiGet(accessToken, `/playlists/${encodeURIComponent(playlistId)}`);
 }
 
 /** The user's Liked Songs (requires user-library-read). */
@@ -245,12 +253,25 @@ export async function getSavedTracks(
 ): Promise<readonly SpotifyTrack[]> {
   const collected: SpotifyTrack[] = [];
   let url: string | null = '/me/tracks?limit=50';
+  const seen = new Set<string>();
   while (url !== null && collected.length < limit) {
-    const page: { items: { track: SpotifyTrack }[]; next: string | null } = await apiGet(
-      accessToken,
-      url,
-    );
-    collected.push(...page.items.map((item) => item.track));
+    if (seen.has(url)) throw new UpstreamError('Spotify returned repeated saved-track pages.');
+    seen.add(url);
+    const page: {
+      items: ({ track?: SpotifyTrack | null; item?: SpotifyTrack | null } | null)[];
+      next: string | null;
+    } = await apiGet(accessToken, url);
+    for (const entry of page.items) {
+      const track = spotifyTrack(entry);
+      if (
+        track !== null &&
+        track.is_local !== true &&
+        track.id !== null &&
+        Array.isArray(track.artists) &&
+        typeof track.duration_ms === 'number'
+      )
+        collected.push(track);
+    }
     url = page.next;
   }
   return collected.slice(0, limit);

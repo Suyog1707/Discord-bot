@@ -8,7 +8,13 @@ import 'server-only';
  * fails with a decryption error (rotated NEXTAUTH_SECRET) surfaces as
  * "relink required" instead of a 500.
  */
-import { ConflictError, LIMITS, NotFoundError, UpstreamError } from '@discord-music/shared';
+import {
+  ConflictError,
+  LIMITS,
+  NotFoundError,
+  UpstreamError,
+  spotifyPlaylistCount,
+} from '@discord-music/shared';
 
 import { decryptToken, encryptToken } from '@/lib/crypto';
 import { getDb } from '@/lib/db';
@@ -173,8 +179,8 @@ export async function listImportable(userId: string): Promise<readonly Importabl
     ...playlists.map((playlist) => ({
       spotifyId: playlist.id,
       name: playlist.name,
-      trackCount: playlist.tracks.total,
-      owner: playlist.owner.display_name,
+      trackCount: spotifyPlaylistCount(playlist),
+      owner: playlist.owner?.display_name ?? null,
       importedPlaylistId: bytSpotifyId.get(playlist.id) ?? null,
     })),
   ];

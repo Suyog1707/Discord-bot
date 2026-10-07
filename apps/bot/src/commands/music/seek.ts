@@ -16,9 +16,11 @@ export function parseTimestamp(input: string): number | null {
   if (parts.length === 0 || parts.length > 3 || parts.some((p) => !/^\d+$/u.test(p))) return null;
 
   const numbers = parts.map(Number);
+  if (numbers.some((value) => !Number.isSafeInteger(value))) return null;
+  if (numbers.slice(1).some((value) => value >= 60)) return null;
   let seconds = 0;
   for (const value of numbers) seconds = seconds * 60 + value;
-  return seconds * 1000;
+  return Number.isSafeInteger(seconds * 1000) ? seconds * 1000 : null;
 }
 
 export default defineCommand({
