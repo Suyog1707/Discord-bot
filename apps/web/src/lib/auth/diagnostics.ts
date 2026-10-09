@@ -13,6 +13,13 @@ export function authDiagnostics(error: unknown): Record<string, unknown> {
         diagnostic[key] = field;
     }
     const message = typeof value.message === 'string' ? value.message : '';
+    if (
+      typeof value.status === 'number' &&
+      Number.isInteger(value.status) &&
+      value.status >= 100 &&
+      value.status <= 599
+    )
+      diagnostic.httpStatus = String(value.status);
     const property =
       /"(access_token|token_type|expires_in|refresh_token|scope|id_token|sub)" property/u.exec(
         message,
@@ -20,7 +27,13 @@ export function authDiagnostics(error: unknown): Record<string, unknown> {
     if (property) {
       diagnostic.property = property;
       diagnostic.category = 'OAuth response property missing or invalid';
-    } else if (/no authorization code in/iu.test(message))
+    } else if (/body must be a top level object/iu.test(message))
+      diagnostic.category = 'OAuth response JSON is not an object';
+    else if (/failed to parse.*body as JSON/iu.test(message))
+      diagnostic.category = 'OAuth response is not valid JSON';
+    else if (/unexpected HTTP status code/iu.test(message))
+      diagnostic.category = 'OAuth endpoint returned unexpected HTTP status';
+    else if (/no authorization code in/iu.test(message))
       diagnostic.category = 'OAuth callback missing authorization code';
     else if (/invalid_client/iu.test(message))
       diagnostic.category = 'Discord client credentials rejected';

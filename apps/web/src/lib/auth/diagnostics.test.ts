@@ -1,6 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import { authDiagnostics } from './diagnostics';
 describe('safe Auth.js diagnostics', () => {
+  it('identifies a non-object token response without exposing its body', () => {
+    const error = Object.assign(new Error('"response" body must be a top level object'), {
+      code: 'OAUTH_INVALID_RESPONSE',
+      cause: { body: ['private-token'] },
+    });
+    expect(authDiagnostics(error)).toMatchObject({
+      causes: [{ category: 'OAuth response JSON is not an object' }, {}],
+    });
+    expect(JSON.stringify(authDiagnostics(error))).not.toContain('private-token');
+  });
   it('identifies malformed token fields without logging their values or response bodies', () => {
     const error = Object.assign(
       new Error('"response" body "access_token" property must be a non-empty string'),
