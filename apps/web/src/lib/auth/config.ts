@@ -22,6 +22,7 @@ import { getEnv, isProduction } from '@/lib/env';
 import { getLogger } from '@/lib/logger';
 import { omitUndefined } from '@/lib/object';
 import { discordAdapter } from './adapter';
+import { authDiagnostics } from './diagnostics';
 
 /** OAuth scopes: identity + email for the profile, guilds for the server list. */
 const DISCORD_SCOPES = ['identify', 'email', 'guilds'].join(' ');
@@ -135,7 +136,7 @@ export function buildAuthConfig(): NextAuthConfig {
     },
     logger: {
       error(error) {
-        logger.error({ err: error }, 'Auth.js error');
+        logger.error({ err: error, authDiagnostic: authDiagnostics(error) }, 'Auth.js error');
       },
       warn(code) {
         logger.warn({ code }, 'Auth.js warning');
