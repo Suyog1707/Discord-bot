@@ -25,7 +25,14 @@ export default async function LoginPage({
   searchParams: Promise<{ callbackUrl?: string; error?: string; reauth?: string }>;
 }) {
   const params = await searchParams;
-  const callbackUrl = safeCallbackUrl(params.callbackUrl);
+  const requested = safeCallbackUrl(params.callbackUrl);
+  // A stale callback pointing back to login must not create a redirect loop
+  // for a valid session. Authentication endpoints are not landing pages.
+  const pathname = new URL(requested, 'https://internal.invalid').pathname;
+  const callbackUrl =
+    pathname.replace(/\/+$/u, '') === '/login' || pathname.startsWith('/api/auth')
+      ? '/dashboard'
+      : requested;
   /**
    * Sent here by `withDiscordLink`: the visitor is still signed in to *this*
    * app, but the Discord authorization behind it is dead. Skipping the

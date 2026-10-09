@@ -6,6 +6,8 @@ test.describe('landing page', () => {
 
     await expect(page.getByRole('heading', { name: 'Discord Music Platform' })).toBeVisible();
     await expect(page.getByRole('region', { name: 'Features' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Continue with Discord' })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Sign in with Discord' })).toHaveCount(0);
   });
 
   test('has no horizontal overflow on mobile', async ({ page }) => {

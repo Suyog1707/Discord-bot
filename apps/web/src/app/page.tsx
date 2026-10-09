@@ -1,5 +1,7 @@
 import { ListMusic, Music4, Radio, ShieldCheck } from 'lucide-react';
 import Link from 'next/link';
+import { signIn } from '@/lib/auth';
+import { getCurrentUser } from '@/lib/auth/session';
 
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -7,9 +9,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 /**
  * Landing page.
  *
- * Placeholder shell for Phase 1: it proves Tailwind tokens, the shadcn/ui
- * primitives and the App Router render correctly. Sign-in arrives in Phase 2
- * and the dashboard itself in Phase 5.
+ * Navigation reflects the server-verified session, not merely cookie presence.
+ * Signed-out visitors can start Discord OAuth without an intermediate page.
  */
 
 const FEATURES = [
@@ -36,7 +37,8 @@ const FEATURES = [
   },
 ] as const;
 
-export default function HomePage() {
+export default async function HomePage() {
+  const user = await getCurrentUser();
   return (
     <main className="mx-auto flex min-h-dvh w-full max-w-5xl flex-col items-center justify-center gap-12 px-6 py-16">
       <header className="flex flex-col items-center gap-4 text-center">
@@ -51,9 +53,22 @@ export default function HomePage() {
           shared packages are in place — features arrive phase by phase.
         </p>
         <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
-          <Button size="lg" asChild>
-            <Link href="/login">Sign in with Discord</Link>
-          </Button>
+          {user !== null ? (
+            <Button size="lg" asChild>
+              <Link href="/dashboard">Open dashboard</Link>
+            </Button>
+          ) : (
+            <form
+              action={async () => {
+                'use server';
+                await signIn('discord', { redirectTo: '/dashboard' });
+              }}
+            >
+              <Button size="lg" type="submit">
+                Continue with Discord
+              </Button>
+            </form>
+          )}
           <Button size="lg" variant="outline" asChild>
             <a href="https://discord.js.org" target="_blank" rel="noreferrer noopener">
               Documentation
