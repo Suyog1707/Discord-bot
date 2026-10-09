@@ -1,22 +1,42 @@
-import { render, screen, cleanup } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   user: vi.fn(),
+  signIn: vi.fn(),
   redirect: vi.fn((target: string) => {
     throw new Error(`redirect:${target}`);
   }),
 }));
 vi.mock('@/lib/auth/session', () => ({ getCurrentUser: mocks.user }));
-vi.mock('@/lib/auth', () => ({ signIn: vi.fn() }));
+vi.mock('next-auth/react', () => ({ signIn: mocks.signIn }));
 vi.mock('next/navigation', () => ({ redirect: mocks.redirect }));
 import HomePage from './page';
 import LoginPage from './login/page';
 beforeEach(() => {
   mocks.user.mockReset();
+  mocks.signIn.mockReset();
   mocks.redirect.mockClear();
 });
 afterEach(cleanup);
 describe('session-aware entry pages', () => {
+  it('starts sign-in through the client auth API with the requested dashboard destination', async () => {
+    mocks.user.mockResolvedValue(null);
+    render(
+      await LoginPage({ searchParams: Promise.resolve({ callbackUrl: '/dashboard/settings' }) }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Continue with Discord' }));
+    await waitFor(() => {
+      expect(mocks.signIn).toHaveBeenCalledWith('discord', { redirectTo: '/dashboard/settings' });
+    });
+  });
+  it('shows a safe retry error when sign-in cannot start', async () => {
+    mocks.user.mockResolvedValue(null);
+    mocks.signIn.mockRejectedValue(new Error('private-token'));
+    render(await HomePage());
+    fireEvent.click(screen.getByRole('button', { name: 'Continue with Discord' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not start Discord sign-in');
+    expect(document.body.textContent).not.toContain('private-token');
+  });
   it('offers dashboard directly to an authenticated visitor', async () => {
     mocks.user.mockResolvedValue({ id: 'user' });
     render(await HomePage());

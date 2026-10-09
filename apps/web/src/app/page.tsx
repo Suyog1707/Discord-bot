@@ -1,6 +1,6 @@
 import { ListMusic, Music4, Radio, ShieldCheck } from 'lucide-react';
 import Link from 'next/link';
-import { signIn } from '@/lib/auth';
+import { DiscordSignInButton } from '@/components/discord-sign-in-button';
 import { getCurrentUser } from '@/lib/auth/session';
 
 import { Button } from '@/components/ui/button';
@@ -58,16 +58,7 @@ export default async function HomePage() {
               <Link href="/dashboard">Open dashboard</Link>
             </Button>
           ) : (
-            <form
-              action={async () => {
-                'use server';
-                await signIn('discord', { redirectTo: '/dashboard' });
-              }}
-            >
-              <Button size="lg" type="submit">
-                Continue with Discord
-              </Button>
-            </form>
+            <DiscordSignInButton redirectTo="/dashboard">Continue with Discord</DiscordSignInButton>
           )}
           <Button size="lg" variant="outline" asChild>
             <a href="https://discord.js.org" target="_blank" rel="noreferrer noopener">

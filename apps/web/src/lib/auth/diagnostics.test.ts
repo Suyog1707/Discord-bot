@@ -1,6 +1,27 @@
 import { describe, expect, it } from 'vitest';
 import { authDiagnostics } from './diagnostics';
 describe('safe Auth.js diagnostics', () => {
+  it('identifies malformed token fields without logging their values or response bodies', () => {
+    const error = Object.assign(
+      new Error('"response" body "access_token" property must be a non-empty string'),
+      {
+        code: 'OAUTH_INVALID_RESPONSE',
+        cause: { body: { refresh_token: 'private' } },
+      },
+    );
+    expect(authDiagnostics(error)).toMatchObject({
+      causes: [
+        { property: 'access_token', category: 'OAuth response property missing or invalid' },
+        {},
+      ],
+    });
+    expect(JSON.stringify(authDiagnostics(error))).not.toContain('private');
+  });
+  it('identifies a missing callback code', () => {
+    expect(
+      authDiagnostics(new Error('no authorization code in "callbackParameters"')),
+    ).toMatchObject({ causes: [{ category: 'OAuth callback missing authorization code' }] });
+  });
   it('preserves a nested Prisma failure hidden in cause.err', () => {
     const inner = Object.assign(new Error('Unique constraint password=private'), { code: 'P2002' });
     const outer = new Error('callback', { cause: { err: inner } });
