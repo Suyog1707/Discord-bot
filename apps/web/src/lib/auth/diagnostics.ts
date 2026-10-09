@@ -13,6 +13,7 @@ export function authDiagnostics(error: unknown): Record<string, unknown> {
         diagnostic[key] = field;
     }
     const message = typeof value.message === 'string' ? value.message : '';
+    diagnostic.messagePresent = message ? 'yes' : 'no';
     if (
       typeof value.status === 'number' &&
       Number.isInteger(value.status) &&
@@ -27,7 +28,13 @@ export function authDiagnostics(error: unknown): Record<string, unknown> {
     if (property) {
       diagnostic.property = property;
       diagnostic.category = 'OAuth response property missing or invalid';
-    } else if (/body must be a top level object/iu.test(message))
+    } else if (/parameter must be provided only once/iu.test(message))
+      diagnostic.category = 'Duplicate OAuth callback parameter';
+    else if (/contains a JARM response/iu.test(message))
+      diagnostic.category = 'Unexpected signed OAuth authorization response';
+    else if (/"iss".*response parameter|response parameter "iss"/iu.test(message))
+      diagnostic.category = 'OAuth authorization issuer missing or mismatched';
+    else if (/body must be a top level object/iu.test(message))
       diagnostic.category = 'OAuth response JSON is not an object';
     else if (/failed to parse.*body as JSON/iu.test(message))
       diagnostic.category = 'OAuth response is not valid JSON';
@@ -51,5 +58,5 @@ export function authDiagnostics(error: unknown): Record<string, unknown> {
     const cause = value.cause;
     current = cause !== null && typeof cause === 'object' && 'err' in cause ? cause.err : cause;
   }
-  return { causes };
+  return { diagnosticVersion: 3, causes };
 }

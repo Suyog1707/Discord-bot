@@ -1,6 +1,20 @@
 import { describe, expect, it } from 'vitest';
 import { authDiagnostics } from './diagnostics';
 describe('safe Auth.js diagnostics', () => {
+  it('identifies issuer validation without logging the issuer or callback parameters', () => {
+    const error = Object.assign(new Error('unexpected "iss" (issuer) response parameter value'), {
+      code: 'OAUTH_INVALID_RESPONSE',
+      cause: { parameters: new URLSearchParams({ code: 'private' }) },
+    });
+    expect(authDiagnostics(error)).toMatchObject({
+      diagnosticVersion: 3,
+      causes: [
+        { category: 'OAuth authorization issuer missing or mismatched', messagePresent: 'yes' },
+        {},
+      ],
+    });
+    expect(JSON.stringify(authDiagnostics(error))).not.toContain('private');
+  });
   it('identifies a non-object token response without exposing its body', () => {
     const error = Object.assign(new Error('"response" body must be a top level object'), {
       code: 'OAUTH_INVALID_RESPONSE',
