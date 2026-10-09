@@ -52,6 +52,9 @@ export function buildAuthConfig(): NextAuthConfig {
     },
     providers: [
       Discord({
+        // Discord returns RFC 9207 `iss`. Without this, Auth.js falls back to
+        // https://authjs.dev and rejects Discord's legitimate callback.
+        issuer: 'https://discord.com',
         clientId: env.DISCORD_CLIENT_ID,
         clientSecret: env.DISCORD_CLIENT_SECRET,
         authorization: { params: { scope: DISCORD_SCOPES } },

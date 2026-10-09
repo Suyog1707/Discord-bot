@@ -44,6 +44,10 @@ async function fireSignIn(account: unknown): Promise<void> {
 }
 
 describe('signIn event: Discord token persistence', () => {
+  it('pins the Discord issuer instead of the Auth.js fallback', () => {
+    const provider = buildAuthConfig().providers[0] as { options?: { issuer?: string } };
+    expect(provider.options?.issuer).toBe('https://discord.com');
+  });
   beforeEach(() => {
     updateMany.mockClear();
     userUpdate.mockClear();
