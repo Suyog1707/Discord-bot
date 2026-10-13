@@ -8,11 +8,22 @@ import {
 } from './candidate-matcher.js';
 import {
   formatResolutionTrace,
-  resolvePlayback,
+  resolvePlayback as resolveWithDefaults,
   ResolutionCache,
   type ProviderSearch,
+  type ResolveOptions,
 } from './playback-resolver.js';
 import { buildSearchQuery } from './track.js';
+
+// Exercise the supported explicit SoundCloud-first policy in the existing
+// scheduling tests; production defaults are verified separately below.
+function resolvePlayback(
+  wanted: CanonicalTrack,
+  search: ProviderSearch<MatchCandidate>,
+  options: ResolveOptions = {},
+) {
+  return resolveWithDefaults(wanted, search, { order: ['soundcloud', 'youtube'], ...options });
+}
 
 let seq = 0;
 function upload(
@@ -52,6 +63,25 @@ function catalogue(shelves: Partial<Record<PlaybackProvider, readonly MatchCandi
 }
 
 describe('provider priority', () => {
+  it('defaults to YouTube even when SoundCloud also has a confident match', async () => {
+    const { search } = catalogue({
+      soundcloud: [upload('Blinding Lights', 'The Weeknd', 200_000)],
+      youtube: [upload('Blinding Lights (Official Audio)', 'The Weeknd - Topic', 200_000)],
+    });
+    expect((await resolveWithDefaults(wanted, search)).result?.provider).toBe('youtube');
+  });
+  it('rejects cutscenes and opening sequences in favour of the recording', async () => {
+    const { search } = catalogue({
+      youtube: [
+        upload('Blinding Lights cutscene', 'The Weeknd', 200_000),
+        upload('Blinding Lights opening sequence', 'The Weeknd', 200_000),
+        upload('Blinding Lights Lyrics', 'The Weeknd - Topic', 200_000),
+      ],
+    });
+    expect((await resolveWithDefaults(wanted, search)).result?.candidate.title).toBe(
+      'Blinding Lights Lyrics',
+    );
+  });
   it('plays a confident SoundCloud match without ever asking YouTube', async () => {
     const { search, calls } = catalogue({
       soundcloud: [upload('Blinding Lights', 'The Weeknd', 200_000)],

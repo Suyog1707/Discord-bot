@@ -299,7 +299,7 @@ export const botEnvSchema = requireInProduction(
        */
       PLAYBACK_PROVIDER_ORDER: z
         .enum(['soundcloud,youtube', 'youtube,soundcloud', 'soundcloud', 'youtube'])
-        .default('soundcloud,youtube'),
+        .default('youtube,soundcloud'),
       /**
        * How far a candidate's runtime may sit from the canonical runtime and
        * still count as a match. The ±10-15s band covers fade-outs, silent tails

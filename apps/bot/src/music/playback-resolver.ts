@@ -5,7 +5,9 @@
  * metadata layer has already identified, find the upload that most accurately
  * IS that recording — or return nothing.
  *
- * Provider order is SoundCloud first, YouTube second, and the reason is not
+ * Default priority is now YouTube first with lyrics-focused matching. The
+ * SoundCloud-first strategy below remains supported as an explicit override.
+ * Historically provider order was SoundCloud first, YouTube second, because
  * that SoundCloud's catalogue is better. It is that SoundCloud's catalogue is
  * *only music*. Everything in it is an upload someone published as audio, so
  * the worst realistic wrong answer there is a bootleg remix. YouTube's index
@@ -49,7 +51,7 @@ import {
 const logger = getLogger('resolver');
 
 /** The architecture's default priority. Overridable per call and by configuration. */
-export const DEFAULT_PROVIDER_ORDER: readonly PlaybackProvider[] = ['soundcloud', 'youtube'];
+export const DEFAULT_PROVIDER_ORDER: readonly PlaybackProvider[] = ['youtube', 'soundcloud'];
 
 /**
  * How long a provider searches alone before the next one is started alongside

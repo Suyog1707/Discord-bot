@@ -259,6 +259,8 @@ const JUNK_PATTERNS: readonly (readonly [string, number])[] = [
  * on top, so a recording the catalogue calls "Love Scene" vetoes nothing.
  */
 const VETO_TITLE: readonly RegExp[] = [
+  /\bcut\s*scenes?\b/iu,
+  /\b(?:opening|ending)\s+(?:sequence|credits)\b/iu,
   /\bscenes?\b/iu,
   /\bclips?\b/iu,
   /\bdialogues?\b/iu,

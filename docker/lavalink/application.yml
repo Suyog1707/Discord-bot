@@ -81,10 +81,11 @@ lavalink:
       rotation: true
       channelMix: true
       lowPass: true
-    bufferDurationMs: 400
-    frameBufferDurationMs: 5000
-    opusEncodingQuality: 10
-    resamplingQuality: LOW
+    # More headroom for short network/GC stalls and lower multi-player CPU cost.
+    bufferDurationMs: 1000
+    frameBufferDurationMs: 10000
+    opusEncodingQuality: 8
+    resamplingQuality: MEDIUM
     trackStuckThresholdMs: 10000
     useSeekGhosting: true
     youtubePlaylistLoadLimit: 6
@@ -174,12 +175,12 @@ plugins:
     # providers directly so it can filter and score candidates, which LavaSrc
     # cannot do. The order still mirrors the same policy so the two paths do not
     # disagree about where audio should come from — ISRC first because it names
-    # the recording outright, then SoundCloud, then YouTube.
+    # the recording outright, with YouTube ahead of SoundCloud for each query.
     providers:
-      - 'scsearch:%ISRC%'
       - 'ytsearch:"%ISRC%"'
-      - 'scsearch:%QUERY%'
+      - 'scsearch:%ISRC%'
       - 'ytsearch:%QUERY%'
+      - 'scsearch:%QUERY%'
     sources:
       # Metadata only: these resolve an identity and then stream through
       # SoundCloud/YouTube per the provider list above. Deezer stays off here
