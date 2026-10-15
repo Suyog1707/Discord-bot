@@ -128,6 +128,8 @@ const VOICE_RECONNECT_WINDOW_MS = 60_000;
  * is actually for, and it still counts.
  */
 const VOICE_RECONNECT_STABILITY_MS = 30_000;
+/** How long a Lavalink REST call may take before the bot gives up on it. */
+const LAVALINK_REST_TIMEOUT_MS = 15_000;
 /** A reachability probe should answer immediately or not at all. */
 const PROBE_TIMEOUT_MS = 2_000;
 /**
@@ -404,6 +406,10 @@ export class MusicManager {
         resumeTimeout: 30,
         reconnectTries: 5,
         reconnectInterval: 5,
+        // Shoukaku's default is 60s. A Lavalink that stops answering player
+        // updates then holds every /play for two minutes (60s x the join retry)
+        // before failing. Track lookups finish in well under this.
+        restTimeout: LAVALINK_REST_TIMEOUT_MS,
         // Player state moves elsewhere if a node dies (single node today, but
         // correct once more are added).
         moveOnDisconnect: true,
@@ -598,6 +604,21 @@ export class MusicManager {
           deaf: true,
         });
       } catch (error) {
+        // The REST call to Lavalink timed out: Discord is not at fault, so
+        // clearing the voice state and waiting out a second timeout only
+        // doubles the user's wait.
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          logger.warn(
+            { err: error, guildId, channelId: voiceChannelId },
+            'Lavalink did not answer the voice join',
+          );
+          throw new UpstreamError(
+            'The music server is not responding right now. Try again shortly.',
+            {
+              cause: error,
+            },
+          );
+        }
         lastError = error;
         logger.warn(
           { err: error, guildId, channelId: voiceChannelId, attempt },
