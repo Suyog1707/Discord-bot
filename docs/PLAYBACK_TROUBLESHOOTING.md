@@ -63,3 +63,14 @@ at `debug`. Ideal is 3000 `sent` frames per playing player per minute.
 mean the VPS's shared CPU is being taken by the hypervisor; the real fix is
 dedicated vCPUs. The compose file runs Lavalink with ZGC to remove GC pauses as
 a contributing cause.
+
+**Synchronized healthchecks (found in production).** Steal bursts of 25-52%
+landed every minute at about second :02, lining up with listener reports and
+mid-song frame drops. `vmstat 1` (the `st` column) showed the burst, and
+`ps -eo pcpu,args --sort=-pcpu` sampled during it showed the top CPU users were
+the Docker healthchecks: a `node -e fetch(...)` per container (about 150% CPU
+on bots, 112% on web-backend). Eight containers had restarted together, so
+their 30 s checks fired in sync, and the burst got the VPS throttled, starving
+Lavalink's 20 ms sender. Fix: the bot and web-backend healthchecks now use
+busybox `wget` (already in node:22-alpine) every 60 s, and `lavalink` has
+`cpu_shares: 2048` so it wins under contention.

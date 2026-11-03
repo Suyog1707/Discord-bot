@@ -99,15 +99,15 @@ services:
       WEB_BACKEND_LOCAL: 'true'
       DATABASE_URL: postgresql://${POSTGRES_USER:-discord_music}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-discord_music}
       REDIS_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}@redis:6379
+    # busybox wget rather than a node probe: starting a Node.js process per
+    # check, in sync across containers, caused CPU bursts that stuttered audio.
     healthcheck:
       test:
         [
-          'CMD',
-          'node',
-          '-e',
-          "fetch('http://127.0.0.1:3000/api/health',{redirect:'manual'}).then(r=>process.exit(r.status===200?0:1)).catch(()=>process.exit(1))",
+          'CMD-SHELL',
+          'wget -q -O /dev/null http://127.0.0.1:3000/api/health || exit 1',
         ]
-      interval: 30s
+      interval: 60s
       timeout: 10s
       retries: 3
       start_period: 40s
@@ -169,6 +169,10 @@ services:
     image: ghcr.io/lavalink-devs/lavalink:4
     container_name: dmp-lavalink
     restart: unless-stopped
+    # Under CPU contention, Lavalink's audio sender should win over the bots,
+    # web and other containers on this shared host. Only matters when the CPU
+    # is contended; it caps nothing.
+    cpu_shares: 2048
     depends_on:
       lavalink-init:
         condition: service_completed_successfully
@@ -296,20 +300,20 @@ services:
       BOT_LABEL: main
       BOT_TOKEN: ${BOT_TOKEN}
       BOT_CLIENT_ID: ${BOT_CLIENT_ID}
-    # Probed with node rather than curl: the image is node:22-alpine, which
-    # ships neither curl nor a wget with predictable flags, and node is
-    # guaranteed present because it is what runs the bot. Unhealthy means the
-    # gateway is gone — see `resolveBotHealth` for why that is the only thing
+    # Probed with busybox wget, which node:22-alpine ships (verified on the
+    # VPS). It replaced a node probe: starting a whole Node.js process per
+    # check, x8 containers firing in sync, caused CPU bursts every minute that
+    # got the VPS throttled and stuttered audio. `$$` passes the variable to the
+    # container's shell instead of Compose interpolating it. Unhealthy means the
+    # gateway is gone; see `resolveBotHealth` for why that is the only thing
     # reported as unhealthy.
     healthcheck: &bot-healthcheck
       test:
         [
-          'CMD',
-          'node',
-          '-e',
-          "fetch('http://127.0.0.1:'+(process.env.BOT_INTERNAL_PORT||8080)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+          'CMD-SHELL',
+          'wget -q -O /dev/null "http://127.0.0.1:$${BOT_INTERNAL_PORT:-8080}/health" || exit 1',
         ]
-      interval: 30s
+      interval: 60s
       timeout: 5s
       retries: 3
       start_period: 40s
