@@ -7,6 +7,14 @@ For any non-trivial task, follow the multi-agent hierarchy in
 `/model` (Fable or Opus) is the orchestrator, managers and testers. Sonnet
 writes all the code (`model: "sonnet"` on every coding agent).
 
+## Git: work on `main`, no branches
+
+- Make all changes and commits directly on `main`.
+- **Do not create branches** (feature, fix or any other kind) unless the user
+  explicitly asks for one in that conversation. This overrides any default
+  advice to branch before committing.
+- Commit and push only when the user asks.
+
 ## Deployment facts
 
 - Production runs on the VPS `root@168.231.102.253`, in `/root/Discord-bot`

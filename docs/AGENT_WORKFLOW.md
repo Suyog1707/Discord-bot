@@ -85,6 +85,8 @@ Never "it should work". If something wasn't run, say so.
 
 ## Constraints every agent inherits
 
+- **Git: everything happens on `main`.** No agent creates a branch unless the
+  user explicitly asks for one. Commits go straight to `main`.
 - **The VPS (`root@168.231.102.253`) is a company server.** Touch only the
   `discord-music` stack in `/root/Discord-bot` (containers named `dmp-*` and
   `discord-music-*`). Never change its Cloudflare tunnel, nginx, firewall,
