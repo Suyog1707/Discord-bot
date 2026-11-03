@@ -28,6 +28,14 @@ export function isDevelopment(): boolean {
   return getEnv().NODE_ENV === 'development';
 }
 
+/**
+ * Whether SoundCloud search is allowed. Off by default because every
+ * `scsearch:` lookup was failing in production; see `music/soundcloud.ts`.
+ */
+export function isSoundcloudEnabled(): boolean {
+  return getEnv().SOUNDCLOUD_ENABLED;
+}
+
 /** Lavalink connection details. */
 export interface LavalinkNode {
   readonly name: string;

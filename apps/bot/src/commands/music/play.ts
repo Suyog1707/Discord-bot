@@ -3,6 +3,7 @@ import { EmbedBuilder, MessageFlags, PermissionFlagsBits } from 'discord.js';
 import { toAutocompleteChoices } from '@discord-music/shared';
 import { LoadType } from 'shoukaku';
 
+import { isSoundcloudEnabled } from '../../config/env.js';
 import type { BotClient } from '../../core/bot-client.js';
 import { defineCommand, SlashCommandBuilder } from '../../core/command.js';
 import { routedReceiptOf } from '../../core/routed-interactions.js';
@@ -57,6 +58,20 @@ function cacheSuggestions(query: string, choices: { name: string; value: string 
   suggestionCache.set(query, { choices, expiresAt: Date.now() + SUGGESTION_TTL_MS });
 }
 
+/**
+ * The `source` choices on offer.
+ *
+ * SoundCloud is listed only when `SOUNDCLOUD_ENABLED` is on: with it off,
+ * picking it can only ever be refused. Evaluated when the command definition
+ * is built (at load), so changing the flag takes a restart, which is also what
+ * re-registering the command with Discord needs.
+ */
+export function sourceChoices(): { name: string; value: string }[] {
+  const choices = [{ name: 'YouTube', value: 'youtube' }];
+  if (isSoundcloudEnabled()) choices.push({ name: 'SoundCloud', value: 'soundcloud' });
+  return choices;
+}
+
 export default defineCommand({
   data: new SlashCommandBuilder()
     .setName('play')
@@ -72,11 +87,8 @@ export default defineCommand({
     .addStringOption((option) =>
       option
         .setName('source')
-        .setDescription('Pin playback to one provider (default: SoundCloud, then YouTube)')
-        .addChoices(
-          { name: 'YouTube', value: 'youtube' },
-          { name: 'SoundCloud', value: 'soundcloud' },
-        ),
+        .setDescription('Pin playback to one provider (default: YouTube)')
+        .addChoices(...sourceChoices()),
     )
     .addBooleanOption((option) =>
       option.setName('next').setDescription('Insert at the front of the queue'),

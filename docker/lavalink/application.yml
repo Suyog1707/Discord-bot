@@ -178,9 +178,11 @@ plugins:
     # the recording outright, with YouTube ahead of SoundCloud for each query.
     providers:
       - 'ytsearch:"%ISRC%"'
-      - 'scsearch:%ISRC%'
       - 'ytsearch:%QUERY%'
-      - 'scsearch:%QUERY%'
+      # SoundCloud mirror lookups ('scsearch:%ISRC%' after the ISRC line,
+      # 'scsearch:%QUERY%' after the query line) are removed: every SoundCloud
+      # search currently fails with "Did not detect any supported formats".
+      # Restore both once SoundCloud playback works again.
     sources:
       # Metadata only: these resolve an identity and then stream through
       # SoundCloud/YouTube per the provider list above. Deezer stays off here

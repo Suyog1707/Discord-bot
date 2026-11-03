@@ -169,8 +169,10 @@ export interface SpotifyPlaylistSummary {
   readonly snapshot_id: string;
   readonly tracks?: { readonly total: number } | null;
   readonly items?: { readonly total: number } | null;
-  readonly owner: { readonly display_name: string | null } | null;
+  readonly owner: { readonly id?: string; readonly display_name: string | null } | null;
   readonly public: boolean | null;
+  /** Collaborators may read the items even when someone else owns the playlist. */
+  readonly collaborative?: boolean;
 }
 
 export async function listPlaylists(

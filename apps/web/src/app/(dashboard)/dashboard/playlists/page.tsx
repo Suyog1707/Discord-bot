@@ -18,6 +18,14 @@ import {
   listImportable,
   syncSpotifyPlaylist,
 } from '@/lib/services/spotify';
+import { PendingSubmitButton } from '@/components/dashboard/pending-submit-button';
+import { SpotifyActionForm } from '@/components/dashboard/spotify-action-form';
+import {
+  errorResult,
+  importSuccessResult,
+  syncSuccessResult,
+  type ActionResult,
+} from '@/lib/action-result';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -60,18 +68,32 @@ export default async function PlaylistsPage({
 
   const importable = spotify.linked ? await listImportable(user.id).catch(() => null) : null;
 
-  async function importSpotify(formData: FormData) {
+  // These two return a result instead of throwing: a thrown error inside a
+  // plain form action never reaches the user. `useActionState` in
+  // SpotifyActionForm renders the returned message. They stay inline, like every
+  // other action on this page, and are passed down as props.
+  async function importSpotify(_previous: ActionResult, formData: FormData): Promise<ActionResult> {
     'use server';
     const actor = await requireUserOrRedirect('/dashboard/playlists');
-    await importSpotifyItem(actor.id, formString(formData, 'spotifyId'));
-    revalidatePath('/dashboard/playlists');
+    try {
+      const outcome = await importSpotifyItem(actor.id, formString(formData, 'spotifyId'));
+      revalidatePath('/dashboard/playlists');
+      return importSuccessResult(outcome);
+    } catch (error) {
+      return errorResult(error);
+    }
   }
 
-  async function syncSpotify(formData: FormData) {
+  async function syncSpotify(_previous: ActionResult, formData: FormData): Promise<ActionResult> {
     'use server';
     const actor = await requireUserOrRedirect('/dashboard/playlists');
-    await syncSpotifyPlaylist(actor.id, formString(formData, 'playlistId'));
-    revalidatePath('/dashboard/playlists');
+    try {
+      const outcome = await syncSpotifyPlaylist(actor.id, formString(formData, 'playlistId'));
+      revalidatePath('/dashboard/playlists');
+      return syncSuccessResult(outcome);
+    } catch (error) {
+      return errorResult(error);
+    }
   }
 
   // Group by folder; unfiled playlists render first without a heading.
@@ -158,9 +180,9 @@ export default async function PlaylistsPage({
               <Label htmlFor="file">Import a playlist (.json export)</Label>
               <Input id="file" name="file" type="file" accept="application/json,.json" required />
             </div>
-            <Button type="submit" variant="secondary">
+            <PendingSubmitButton variant="secondary" pendingLabel="Importing…">
               Import
-            </Button>
+            </PendingSubmitButton>
           </form>
         </CardContent>
       </Card>
@@ -186,13 +208,19 @@ export default async function PlaylistsPage({
                     {item.owner ?? 'Library'}
                     {item.trackCount > 0 ? ` · ${String(item.trackCount)} tracks` : ''}
                   </span>
+                  {item.importBlocked && (
+                    <span className="text-muted-foreground block text-xs">
+                      Spotify only allows importing playlists you own or collaborate on
+                    </span>
+                  )}
                 </span>
-                <form action={importSpotify}>
-                  <input type="hidden" name="spotifyId" value={item.spotifyId} />
-                  <Button type="submit" size="sm" variant="outline">
-                    {item.importedPlaylistId === null ? 'Import' : 'Re-sync'}
-                  </Button>
-                </form>
+                <SpotifyActionForm
+                  action={importSpotify}
+                  fieldName="spotifyId"
+                  fieldValue={item.spotifyId}
+                  label={item.importedPlaylistId === null ? 'Import' : 'Re-sync'}
+                  pendingLabel={item.importedPlaylistId === null ? 'Importing…' : 'Syncing…'}
+                />
               </div>
             ))}
           </CardContent>
@@ -271,17 +299,14 @@ export default async function PlaylistsPage({
                       </Button>
                     </form>
                     {playlist.spotifyId !== null && (
-                      <form action={syncSpotify}>
-                        <input type="hidden" name="playlistId" value={playlist.id} />
-                        <Button
-                          type="submit"
-                          size="sm"
-                          variant="outline"
-                          title="Re-sync from Spotify"
-                        >
-                          Sync
-                        </Button>
-                      </form>
+                      <SpotifyActionForm
+                        action={syncSpotify}
+                        fieldName="playlistId"
+                        fieldValue={playlist.id}
+                        label="Sync"
+                        pendingLabel="Syncing…"
+                        title="Re-sync from Spotify"
+                      />
                     )}
                     <form action={remove}>
                       <input type="hidden" name="playlistId" value={playlist.id} />

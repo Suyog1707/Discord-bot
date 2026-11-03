@@ -24,6 +24,7 @@ import {
   type RawInteraction,
   type RoutingDecision,
 } from '@discord-music/shared';
+import { claimAndHandOver, handOver } from '@discord-music/shared/redis';
 
 import { getEnv } from '@/lib/env';
 import { getLogger } from '@/lib/logger';
@@ -31,7 +32,6 @@ import { getReadyRedis } from '@/lib/redis';
 
 import { editOriginalResponse, fetchVoiceChannelId } from './discord-api';
 import { fleetFromDatabase, FleetUnavailableError, readFleet, readFleetIds } from './fleet';
-import { claimAndHandOver, handOver } from './hand-over';
 
 /** Discord's flag for a reply only the caller can see. */
 const EPHEMERAL = 64;

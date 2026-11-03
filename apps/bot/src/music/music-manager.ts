@@ -56,6 +56,7 @@ import {
   type ReconnectBudget,
   type ReconnectClaim,
 } from './voice-close.js';
+import { assessAudioHealth, type LavalinkStatsLike } from './audio-health.js';
 import { ControllerMessage } from './controller.js';
 import { GuildPlayer } from './guild-player.js';
 import {
@@ -78,7 +79,8 @@ import {
 import { AUTOPLAY_WEIGHTS } from './match-config.js';
 import { identifyCanonicalTrack } from './metadata-providers.js';
 import { resolvePlayback, ResolutionCache, type ResolvedPlayback } from './playback-resolver.js';
-import { getResolutionSettings } from './resolution-settings.js';
+import { getResolutionSettings, providerOrderFor } from './resolution-settings.js';
+import { explainSoundcloudLinkFailure, soundcloudSearchRefusal } from './soundcloud.js';
 import type { SpotifyResolution, SpotifyTrackMeta } from './spotify-resolver.js';
 import type { PersistedQueue, QueueStore, StayConnectedSession } from './queue-store.js';
 import { resolvePlatformLinks, type PlatformLinks } from './platform-links.js';
@@ -91,6 +93,7 @@ import {
 } from './track.js';
 
 const logger = getLogger('music');
+const audioHealthLogger = getLogger('audio-health');
 
 /** How often to re-probe an audio server that Shoukaku gave up on. */
 const RECONNECT_PROBE_INTERVAL_MS = 30_000;
@@ -432,6 +435,18 @@ export class MusicManager {
         return;
       }
       logger.error({ err: error, node: name }, 'Lavalink node error');
+    });
+    // Lavalink pushes a `stats` op about once a minute. Shoukaku re-emits every
+    // node message as 'raw' (before it stores the payload on `node.stats`), so
+    // the payload is read from the event itself. Observation only: playback is
+    // never touched.
+    this.shoukaku.on('raw', (name, json) => {
+      if (typeof json !== 'object' || json === null || (json as { op?: unknown }).op !== 'stats') {
+        return;
+      }
+      const report = assessAudioHealth(json as LavalinkStatsLike);
+      if (report === null) return;
+      audioHealthLogger[report.level]({ node: name, ...report.fields }, report.message);
     });
     this.shoukaku.on('close', (name, code, reason) => {
       logger.warn(
@@ -1016,6 +1031,9 @@ export class MusicManager {
       ...(track.playbackSource === undefined ? {} : { playbackSource: track.playbackSource }),
     });
     const alternative: PlaybackProvider = failed === 'soundcloud' ? 'youtube' : 'soundcloud';
+    // The only alternative to a failed YouTube stream is SoundCloud; while it
+    // is disabled there is nothing to try, and no scsearch: may be sent.
+    if (alternative === 'soundcloud' && !getResolutionSettings().soundcloudEnabled) return null;
 
     // Everything already known about the track becomes the canonical identity
     // the alternative is held to — including the runtime, which is the signal
@@ -1211,8 +1229,8 @@ export class MusicManager {
    *     nothing more, so the single largest positive signal is unavailable and
    *     every score lands correspondingly lower. `AUTOPLAY_WEIGHTS` moves the
    *     threshold with it; the vetoes and filters are unchanged.
-   *   - **The same provider order as a user request.** SoundCloud first,
-   *     YouTube as the fallback, HTTP untouched. The recommendation engine
+   *   - **The same provider order as a user request.** The configured order
+   *     (SoundCloud only when enabled), HTTP untouched. The recommendation engine
    *     never names a provider; it hands over a song and this decides where
    *     the audio comes from. (This once pinned YouTube so the mix fallback
    *     had video ids to seed from; that fallback is the last resort now and
@@ -1501,13 +1519,15 @@ export class MusicManager {
   }
 
   /**
-   * The best playable upload for one canonical recording — SoundCloud first,
-   * YouTube as the fallback.
+   * The best playable upload for one canonical recording — walking the
+   * configured provider order (YouTube first by default; SoundCloud only when
+   * `SOUNDCLOUD_ENABLED` is on).
    *
    * All of the policy lives in {@link resolvePlayback}; this only supplies the
    * node-bound search, the configured weights and the cache. A null return is a
    * real answer and means every provider was asked and none of them produced a
-   * candidate worth playing.
+   * candidate worth playing. An explicit SoundCloud pin while SoundCloud is
+   * disabled also returns null, without searching anything.
    */
   async #resolvePlayable(
     node: Node,
@@ -1528,13 +1548,17 @@ export class MusicManager {
   ): Promise<ResolvedPlayback<LavalinkCandidate> | null> {
     const settings = getResolutionSettings();
     const preference = options.preference ?? 'auto';
+    const order = providerOrderFor(preference, settings);
+    // Nothing to search (an explicit SoundCloud pin while it is disabled). An
+    // explicit pin never silently falls through to YouTube.
+    if (order.length === 0) return null;
     const { result } = await resolvePlayback<LavalinkCandidate>(
       wanted,
       this.#providerSearch(node),
       {
         // An explicitly chosen source pins the walk to that one provider; there
         // is no silent fall-through to somewhere the user did not ask for.
-        order: preference === 'auto' ? settings.order : [preference],
+        order,
         weights: settings.weights,
         duration: settings.duration,
         officialChannelTokens: settings.officialChannelTokens,
@@ -2364,7 +2388,8 @@ export class MusicManager {
    *      runtime and, where the catalogue exposes one, an ISRC. The listener
    *      keeps that identity: the catalogue's title, artwork and URL, never
    *      the playback provider's page.
-   *   2. **Playback.** SoundCloud first, YouTube as the fallback, each with
+   *   2. **Playback.** The configured provider order (YouTube first by default;
+   *      SoundCloud only when enabled), each with
    *      multiple candidates filtered, scored and ranked against the canonical
    *      track. Nothing plays unless it clears that provider's confidence
    *      threshold.
@@ -2391,6 +2416,15 @@ export class MusicManager {
     if (node === undefined) {
       throw new UpstreamError('The music server is not available right now. Try again shortly.');
     }
+
+    // `/play source:SoundCloud` with free text while SoundCloud search is off:
+    // fail fast with a clear message, before any catalogue lookups.
+    const refusal = soundcloudSearchRefusal(
+      input,
+      source,
+      getResolutionSettings().soundcloudEnabled,
+    );
+    if (refusal !== null) throw new ValidationError(refusal);
 
     // Spotify links: metadata from the Web API, audio via the playback layer —
     // Spotify audio itself is never streamed.
@@ -2537,16 +2571,25 @@ export class MusicManager {
     requestedBy: { readonly id: string; readonly name: string },
     source: PlaybackPreference,
   ): Promise<ResolveResult> {
-    const searchSource: PlaybackProvider = source === 'soundcloud' ? 'soundcloud' : 'youtube';
+    const { soundcloudEnabled } = getResolutionSettings();
+    // Defence in depth: `resolve()` already refuses SoundCloud-pinned text while
+    // SoundCloud is off, but nothing here may ever build a scsearch: query then.
+    const searchSource: PlaybackProvider =
+      source === 'soundcloud' && soundcloudEnabled ? 'soundcloud' : 'youtube';
+    // A SoundCloud link is still handed to Lavalink (it may work); if the
+    // lookup fails while SoundCloud is off, say why instead of a generic error.
+    const linkFailure = explainSoundcloudLinkFailure(input, soundcloudEnabled);
 
     let response: LavalinkResponse | undefined;
     try {
       response = await node.rest.resolve(buildSearchQuery(input, searchSource));
     } catch (error) {
+      if (linkFailure !== null) throw new ValidationError(linkFailure, { cause: error });
       throw new UpstreamError('Track lookup failed. Try again shortly.', { cause: error });
     }
 
     if (response === undefined) {
+      if (linkFailure !== null) throw new ValidationError(linkFailure);
       throw new NotFoundError('No results for that query.');
     }
 
@@ -2567,9 +2610,11 @@ export class MusicManager {
         };
 
       case LoadType.EMPTY:
+        if (linkFailure !== null) throw new ValidationError(linkFailure);
         throw new NotFoundError('No results for that query.');
 
       case LoadType.ERROR:
+        if (linkFailure !== null) throw new ValidationError(linkFailure);
         throw new ValidationError(
           `That could not be loaded: ${response.data.message || 'unknown error'}.`,
         );

@@ -118,14 +118,40 @@ redeploy; do not disable the proxy flag.
 - The bot refuses to boot in production if any dependency is unreachable —
   fix the dependency rather than downgrading NODE_ENV.
 
-## Switching commands to the router
+## How commands reach the fleet
 
 Discord delivers an application's interactions either down its gateway
-connection or to an HTTPS endpoint — never both. Setting the endpoint moves
-_all_ of them: commands, buttons and menus alike.
+connection or to an HTTPS endpoint — never both, and setting the endpoint moves
+_all_ of them: commands, buttons and menus alike. Both modes route to the whole
+fleet, over the same Redis queues, with the same decision (`routeInteraction`).
 
-Do it once, on the command application only. The player applications keep their
-gateways and are untouched.
+### Recommended: gateway (Interactions Endpoint URL cleared)
+
+**Leave the Interactions Endpoint URL empty** (developer portal → the command
+application → General Information). Main receives commands over its own
+gateway within milliseconds, acknowledges them locally, picks the bot for the
+caller's voice channel and pushes the command onto that bot's queue — its own
+included — where each bot's interaction subscriber runs it. Multi-room routing
+is kept. The player applications keep their gateways and are untouched.
+
+Why this is the recommended mode: through Vercel and a Tailscale Funnel,
+commands reached the VPS 2.8–40 s after Discord created them (Funnel's TLS
+relay alone took 1.2–6 s). Discord's window is 3 s, so people saw "application
+did not respond" and `10015 Unknown Webhook`, while the bots themselves took
+about 50 ms. The gateway path removes the relay entirely.
+
+Requirements and limits:
+
+- Main needs Redis. Without Redis, or when a command's raw payload was not
+  captured, main runs the command locally — single-room, as before routing
+  existed.
+- Main must be up for commands to work. That is the same blast radius as
+  before an endpoint was ever set.
+
+### Alternative: HTTP router (Interactions Endpoint URL set)
+
+Still supported; the web router is unchanged. Do it once, on the command
+application only.
 
 1. Confirm the router answers. Discord validates the URL by sending a PING and
    a handful of deliberately-invalid signatures; it will refuse the URL unless
@@ -138,28 +164,20 @@ gateways and are untouched.
 4. Check a controller button, and `/spotify playlists` if Spotify tokens are
    configured — those are the two paths that change shape, not just address.
 
+Use this only if the relay path is fast enough for your deployment; if commands
+start timing out, go back to the gateway.
+
 ### Rolling back
 
 **Clear the Interactions Endpoint URL.** Commands resume over the gateway
-within seconds, with no deploy and no restart.
+within seconds, with no deploy and no restart, and now keep multi-room routing:
+main routes them to the fleet exactly as the web router does. Rehearse it once
+so it is a known move rather than a thing to work out under pressure.
 
-That works because the gateway path is never removed: the bots still need it
-for voice, for guild events, and for the components of every message a _player_
-posts. Rehearse it once so it is a known move rather than a thing to work out
-under pressure.
+The same switch works the other way: setting the URL moves everything back to
+the web router. Nothing disconnects either way.
 
-**What rolling back costs.** Commands come back, but single-room only. The
-layer that let one bot hand a channel to another was removed once the router
-had proved itself, so on the gateway path the main bot receives everything and
-has no way to pass a second channel to a sibling. A server already playing in
-two channels keeps both — nothing disconnects — but a _new_ second room cannot
-be started until the endpoint URL is restored.
-
-That is a deliberate trade: keeping a parallel hand-off mechanism alive forever,
-to insure against a switch that flips back in seconds, is a standing
-maintenance cost for a momentary one.
-
-The failure it covers is real and worth naming: with the endpoint set, an
-outage of the web deployment takes down every slash command in every server.
-Before, the same was true of the primary bot container. The blast radius has
-not grown, but it has moved somewhere else, and this is the lever.
+The failure the HTTP mode adds is real and worth naming: with the endpoint set,
+an outage of the web deployment takes down every slash command in every server.
+In gateway mode the same is true of the primary bot container instead. Pick the
+one whose outage you would rather have, and keep the switch in mind as the lever.

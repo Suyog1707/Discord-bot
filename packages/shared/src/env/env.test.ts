@@ -47,6 +47,21 @@ describe('botEnvSchema', () => {
     }
   });
 
+  it('keeps SoundCloud search off unless SOUNDCLOUD_ENABLED opts in', () => {
+    // Every scsearch: lookup was failing in production ("Did not detect any
+    // supported formats"), so the default is off and enabling it is explicit.
+    expect(parseEnv(botEnvSchema, validBotEnv, 'apps/bot').SOUNDCLOUD_ENABLED).toBe(false);
+    for (const [input, expected] of [
+      ['true', true],
+      ['1', true],
+      ['false', false],
+      ['0', false],
+    ] as const) {
+      const env = parseEnv(botEnvSchema, { ...validBotEnv, SOUNDCLOUD_ENABLED: input });
+      expect(env.SOUNDCLOUD_ENABLED).toBe(expected);
+    }
+  });
+
   it('treats a blank optional variable as unset', () => {
     // `.env.example` ships `BOT_DEV_GUILD_ID=` and `--env-file` loads it as ''.
     const env = parseEnv(botEnvSchema, { ...validBotEnv, BOT_DEV_GUILD_ID: '' }, 'apps/bot');

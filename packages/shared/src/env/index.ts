@@ -291,15 +291,27 @@ export const botEnvSchema = requireInProduction(
       /* ---------------------------------------------------------------- */
 
       /**
-       * Playback provider priority. SoundCloud first by design: its catalogue
-       * is only music, so its worst wrong answer is a bootleg remix, whereas
-       * YouTube's index holds the film the song is from and everything anyone
-       * ever said about it. Flip this to fall back the other way without a
-       * deploy when SoundCloud coverage is the bigger problem for a workload.
+       * Playback provider priority. The default is YouTube first, with
+       * lyrics-focused matching. SoundCloud only participates when
+       * `SOUNDCLOUD_ENABLED` is true; while it is off, a `soundcloud` entry
+       * here is ignored (and a SoundCloud-only order degrades to YouTube).
+       * Change the order without a deploy when one catalogue's coverage is the
+       * bigger problem for a workload.
        */
       PLAYBACK_PROVIDER_ORDER: z
         .enum(['soundcloud,youtube', 'youtube,soundcloud', 'soundcloud', 'youtube'])
         .default('youtube,soundcloud'),
+      /**
+       * Whether the bot may search SoundCloud at all. Off by default: in
+       * production every `scsearch:` lookup failed inside Lavalink with
+       * "FriendlyException: Something went wrong while looking up the track.
+       * Caused by: java.lang.RuntimeException: Did not detect any supported
+       * formats", the resolver logged `fromSoundcloud: 0` on every resolution,
+       * and each lookup only added load and latency. When false the bot never
+       * sends a `scsearch:` query and never waits on one. Turn it on only
+       * after confirming SoundCloud search works again.
+       */
+      SOUNDCLOUD_ENABLED: booleanish.default(false),
       /**
        * How far a candidate's runtime may sit from the canonical runtime and
        * still count as a match. The ±10-15s band covers fade-outs, silent tails

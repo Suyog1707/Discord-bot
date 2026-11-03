@@ -26,7 +26,7 @@ import {
 } from '@discord-music/shared/redis';
 import { randomUUID } from 'node:crypto';
 
-import { Client, GatewayIntentBits, Options, Partials } from 'discord.js';
+import { Client, Events, GatewayIntentBits, Options, Partials } from 'discord.js';
 
 import { getEnv, getLavalinkNode, isDevelopment, isProduction } from '../config/env.js';
 import { getLogger, logger, type Logger } from '../lib/logger.js';
@@ -45,6 +45,7 @@ import { CommandRegistry } from './command-registry.js';
 import { type AiStack, createAiStack } from '../ai/index.js';
 import { CooldownManager } from './cooldown.js';
 import { EventRegistry } from './event-registry.js';
+import { RawInteractionCache } from './raw-interactions.js';
 
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));
 
@@ -107,6 +108,11 @@ export class BotClient extends Client {
   readonly instanceId: string = randomUUID().slice(0, 8);
   readonly commands = new CommandRegistry();
   readonly events = new EventRegistry();
+  /**
+   * The raw payloads of recent interactions, for the gateway router to hand
+   * to another bot. Filled only on the primary; empty everywhere else.
+   */
+  readonly rawInteractions = new RawInteractionCache();
   readonly logger: Logger = logger;
   readonly prisma: PrismaClient;
   /** Per-user command cooldowns (Redis-backed when available). */
@@ -341,6 +347,19 @@ export class BotClient extends Client {
      */
     await this.commands.loadFrom(commandsDirectory);
     await this.events.loadFrom(eventsDirectory);
+    /**
+     * The primary keeps what Discord sent, because it may have to forward it.
+     *
+     * `raw` fires synchronously for every packet before discord.js builds the
+     * interaction, so the payload is cached by the time `interactionCreate`
+     * runs. Attached before the other handlers and before login so no early
+     * packet is missed. Players never route, so they never pay for it.
+     */
+    if (this.identity.role === 'primary') {
+      this.on(Events.Raw, (packet: unknown) => {
+        this.rawInteractions.capture(packet);
+      });
+    }
     this.events.attach(this);
 
     await this.#verifyDependencies();
@@ -477,6 +496,16 @@ export class BotClient extends Client {
       this.logger.warn({ err: error }, 'Dashboard command subscriber failed to start');
       this.#commandSubscriber = undefined;
     }
+  }
+
+  /**
+   * Whether this container is reading its own routed-command queue.
+   *
+   * False when Redis is absent or the subscriber failed to start. The
+   * gateway router checks it before handing anything to this bot's queue.
+   */
+  get interactionSubscriberRunning(): boolean {
+    return this.#interactionSubscriber?.running ?? false;
   }
 
   /**

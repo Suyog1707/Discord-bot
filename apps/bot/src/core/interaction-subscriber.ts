@@ -77,6 +77,17 @@ export class InteractionSubscriber {
     await closeRedis(this.#reader);
   }
 
+  /**
+   * Whether the loop is taking commands off the queue right now.
+   *
+   * Read-only on purpose: the router asks it before pushing anything onto
+   * this container's own queue, because a queue nobody reads is a command
+   * that never answers.
+   */
+  get running(): boolean {
+    return this.#running;
+  }
+
   #isRunning(): boolean {
     return this.#running;
   }

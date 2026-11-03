@@ -1,5 +1,3 @@
-import 'server-only';
-
 /**
  * Putting a command on a bot's queue — and, when the command promises that bot
  * a room, reserving it in the same breath.
@@ -16,8 +14,9 @@ import {
   interactionQueueKey,
   INTERACTION_QUEUE_TTL_SECONDS,
   roomClaimKey,
-} from '@discord-music/shared';
-import type { Redis } from '@discord-music/shared/redis';
+} from '../interactions/index.js';
+
+import type { Redis } from './index.js';
 
 /**
  * Claim the bot; if that worked, claim the room and hand over. If it did not,

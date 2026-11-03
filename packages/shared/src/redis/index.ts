@@ -121,4 +121,5 @@ export async function closeRedis(client: Redis): Promise<void> {
   }
 }
 
+export * from './hand-over.js';
 export * from './presence.js';

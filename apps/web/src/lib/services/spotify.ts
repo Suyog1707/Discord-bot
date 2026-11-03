@@ -155,16 +155,24 @@ export interface ImportableItem {
   readonly owner: string | null;
   /** Set when a local playlist already mirrors this Spotify item. */
   readonly importedPlaylistId: string | null;
+  /**
+   * True when Spotify's Development Mode will probably refuse this playlist:
+   * it is neither owned nor collaborative for the linked account. Advisory
+   * only — the import is still attempted, because an extended-quota app may
+   * be allowed to read it.
+   */
+  readonly importBlocked: boolean;
 }
 
 export async function listImportable(userId: string): Promise<readonly ImportableItem[]> {
   const accessToken = await getValidAccessToken(userId);
-  const [playlists, existing] = await Promise.all([
+  const [playlists, existing, status] = await Promise.all([
     listPlaylists(accessToken),
     getDb().playlist.findMany({
       where: { ownerId: userId, spotifyId: { not: null } },
       select: { id: true, spotifyId: true },
     }),
+    getSpotifyStatus(userId),
   ]);
   const bytSpotifyId = new Map(existing.map((row) => [row.spotifyId, row.id]));
 
@@ -175,6 +183,7 @@ export async function listImportable(userId: string): Promise<readonly Importabl
       trackCount: 0,
       owner: null,
       importedPlaylistId: bytSpotifyId.get(LIKED_SONGS_ID) ?? null,
+      importBlocked: false, // the library endpoint is always allowed
     },
     ...playlists.map((playlist) => ({
       spotifyId: playlist.id,
@@ -182,6 +191,12 @@ export async function listImportable(userId: string): Promise<readonly Importabl
       trackCount: spotifyPlaylistCount(playlist),
       owner: playlist.owner?.display_name ?? null,
       importedPlaylistId: bytSpotifyId.get(playlist.id) ?? null,
+      // Unknown owner id (either side) is not evidence of a block, so allow it.
+      importBlocked:
+        playlist.collaborative !== true &&
+        playlist.owner?.id !== undefined &&
+        status.spotifyId !== null &&
+        playlist.owner.id !== status.spotifyId,
     })),
   ];
   return items;

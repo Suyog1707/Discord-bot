@@ -6,12 +6,18 @@
  * commands and components go straight to the dispatchers they share with the
  * routed path, because a click has to behave the same whether it arrived here
  * or on a Redis queue.
+ *
+ * The primary adds one step in front: with the Interactions Endpoint URL
+ * cleared it is the application Discord delivers to, so it routes commands to
+ * the fleet (and tagged components to their owner) before anything runs
+ * locally. A player never receives those over its own socket.
  */
 import { Events } from 'discord.js';
 
 import { dispatchChatInputCommand } from '../core/dispatch-command.js';
 import { dispatchMusicComponent, isMusicComponent } from '../core/dispatch-component.js';
 import { defineEvent } from '../core/event.js';
+import { routeGatewayCommand, routeGatewayComponent } from '../core/gateway-router.js';
 
 export default defineEvent({
   name: Events.InteractionCreate,
@@ -35,8 +41,18 @@ export default defineEvent({
     // The controller's buttons and filter menu. Shared with the routed path,
     // because the same click can arrive either way once an application's
     // interactions are delivered over HTTP instead of this socket.
-    if (interaction.isMessageComponent() && isMusicComponent(interaction)) {
-      await dispatchMusicComponent(client, interaction, logger);
+    // A component another bot owns goes to that bot first; whatever is left
+    // is ours, and non-music components stay with their collectors.
+    if (interaction.isMessageComponent()) {
+      if (
+        client.identity.role === 'primary' &&
+        (await routeGatewayComponent(client, interaction, logger))
+      ) {
+        return;
+      }
+      if (isMusicComponent(interaction)) {
+        await dispatchMusicComponent(client, interaction, logger);
+      }
       return;
     }
 
@@ -45,6 +61,10 @@ export default defineEvent({
     // Everything from here — the duplicate check, the acknowledgement, the
     // guards, the error handling — is shared with commands that arrive over
     // Redis from the router, because both have to behave identically.
+    if (client.identity.role === 'primary') {
+      await routeGatewayCommand(client, interaction, logger);
+      return;
+    }
     await dispatchChatInputCommand(client, interaction, logger);
   },
 });

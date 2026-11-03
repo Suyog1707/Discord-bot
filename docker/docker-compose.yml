@@ -178,7 +178,14 @@ services:
       yt-cipher:
         condition: service_started
     environment:
-      _JAVA_OPTIONS: -Xmx1G
+      # 2G, up from 1G: with 7 bots on this one node Lavalink logged
+      # "Suspicious GC results" 9 times in 4 days at 1G. The host has 20+ GB free.
+      #
+      # ZGC: its pauses are sub-millisecond, versus the 200-500 ms G1 pauses seen
+      # here, which delay the 20 ms audio sender (freeze, then fast catch-up).
+      # The image runs JDK 18, where ZGC is not generational; add
+      # -XX:+ZGenerational once the image moves to JDK 21+ (it fails on 18).
+      _JAVA_OPTIONS: -Xmx2G -XX:+UseZGC
       SERVER_PORT: 2333
       LAVALINK_SERVER_PASSWORD: ${LAVALINK_PASSWORD:-youshallnotpass}
       # application.yml interpolates these into the LavaSrc Spotify block. They
