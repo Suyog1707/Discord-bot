@@ -9,9 +9,9 @@ rejects cutscenes and opening/ending sequences, and rejects unrequested
 sped-up/slowed variants. Explicit media URLs deliberately preserve the selected
 upload. Matching cannot inspect the audio or guarantee every upload is clean.
 
-Lavalink buffers 10 seconds of decoded audio, uses a 1-second NAS buffer and
-Opus quality 8 to reduce CPU pressure. These settings mitigate short stalls;
-they cannot fix persistent upstream throttling, packet loss or an overloaded VPS.
+Lavalink buffers 10 seconds of decoded audio (`frameBufferDurationMs`) and uses
+a 400 ms NAS send buffer. Quality is at maximum (Opus 10, resampling HIGH).
+These settings mitigate short stalls; they cannot fix persistent upstream throttling, packet loss or an overloaded VPS.
 
 If speed is wrong, check `/filter` and turn off nightcore/vaporwave/speed effects.
 If a recording is quiet, first check the Discord user's local bot volume and
@@ -74,3 +74,15 @@ their 30 s checks fired in sync, and the burst got the VPS throttled, starving
 Lavalink's 20 ms sender. Fix: the bot and web-backend healthchecks now use
 busybox `wget` (already in node:22-alpine) every 60 s, and `lavalink` has
 `cpu_shares: 2048` so it wins under contention.
+
+**Buffer and quality settings.** `bufferDurationMs` is the native send queue of
+already-encoded audio. At 1000 ms it made pause lag by about 1 s and enlarged
+the catch-up bursts; it is now 400. It has no effect on sound quality. Quality
+settings are at maximum (`opusEncodingQuality: 10`, `resamplingQuality: HIGH`).
+
+**`nulled` frames with low steal.** Mid-song `nulled` frames while CPU steal is
+only 1-6% point to YouTube download stalls, not the VPS. Temporary DEBUG logging
+for `dev.lavalink.youtube` and `com.sedmelluq.discord.lavaplayer.tools.io` is on
+in `docker/lavalink/application.yml` (marked TEMPORARY) to show stalls, retries,
+throttling and cipher calls in `docker logs dmp-lavalink`. Remove it after the
+investigation.

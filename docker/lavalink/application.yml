@@ -81,11 +81,17 @@ lavalink:
       rotation: true
       channelMix: true
       lowPass: true
-    # More headroom for short network/GC stalls and lower multi-player CPU cost.
-    bufferDurationMs: 1000
+    # Native (JDA-NAS) send queue: audio already encoded and waiting for UDP.
+    # 400 keeps pause/stop and filter changes near-instant and limits catch-up
+    # bursts after a stall; it does not affect sound quality.
+    bufferDurationMs: 400
+    # Read-ahead that absorbs short YouTube download stalls.
     frameBufferDurationMs: 10000
-    opusEncodingQuality: 8
-    resamplingQuality: MEDIUM
+    # 10 is the maximum Opus quality; highest quality is a hard requirement.
+    opusEncodingQuality: 10
+    # Maximum quality. Only costs CPU when a source is not 48 kHz; VPS CPU
+    # headroom is fine since the healthcheck fix.
+    resamplingQuality: HIGH
     trackStuckThresholdMs: 10000
     useSeekGhosting: true
     youtubePlaylistLoadLimit: 6
@@ -220,6 +226,9 @@ logging:
     # Prints the device code and, after authorisation, the refresh token. The
     # OAuth flow is unusable without it (upstream's own note).
     dev.lavalink.youtube.http.YoutubeOauth2Handler: INFO
+    # TEMPORARY (2026-11): diagnose YouTube stream stalls — remove after investigation
+    dev.lavalink.youtube: DEBUG
+    com.sedmelluq.discord.lavaplayer.tools.io: DEBUG
   logback:
     rollingpolicy:
       max-file-size: 25MB
