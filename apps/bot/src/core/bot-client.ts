@@ -36,6 +36,7 @@ import { MusicManager } from '../music/music-manager.js';
 import type { PlayerRouter } from '../music/player-router.js';
 import type { PeerDirectory } from '../music/peers.js';
 import { QueueStore } from '../music/queue-store.js';
+import { RedisResumeStore, ResumeTracker } from '../music/room-resume.js';
 import { DislikesService } from '../services/dislikes-service.js';
 import { FavoritesService } from '../services/favorites-service.js';
 import { GuildService } from '../services/guild-service.js';
@@ -217,6 +218,8 @@ export class BotClient extends Client {
     };
 
     const lavalinkNode = getLavalinkNode();
+    // A getter, because this client drops its Redis handle if the boot check fails.
+    const resumeStore = new RedisResumeStore({ redis: () => this.#redis, botId: resolved.label });
     this.music =
       lavalinkNode === undefined
         ? undefined
@@ -226,6 +229,7 @@ export class BotClient extends Client {
             store: this.services.queueStore,
             guilds: this.services.guilds,
             spotify: this.services.spotify,
+            resume: { store: resumeStore, tracker: new ResumeTracker(resumeStore) },
             // Realtime events ride the shared Redis connection; without Redis
             // the dashboard simply has no live stream (allowed in development).
             publishEvent: (payload) => {
@@ -658,6 +662,13 @@ export class BotClient extends Client {
     this.logger.info({ reason }, 'Shutting down');
 
     if (this.#heartbeat !== undefined) clearInterval(this.#heartbeat);
+    // Before anything is torn down, while Redis is still open: destroyAll
+    // reports every room as stopped and releases the owner key, so the resume
+    // record has to be written first, with "was playing" and the position
+    // intact.
+    await this.music?.prepareForShutdown().catch((error: unknown) => {
+      this.logger.warn({ err: error }, 'Could not save resume records during shutdown');
+    });
     // Leave the fleet deliberately rather than by timing out, so a restart is
     // not offered rooms for the minute its old entry would otherwise linger.
     await this.peers?.withdrawSelf(this.identity.label).catch(() => undefined);

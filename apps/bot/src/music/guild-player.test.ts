@@ -59,6 +59,8 @@ type Handler = (payload: never) => void;
 interface PlayPayload {
   readonly track: { readonly encoded: string; readonly userData?: { readonly playSeq: number } };
   readonly volume: number;
+  /** Where to start, in ms. Only the restart restore sends it. */
+  readonly position?: number;
 }
 
 interface FakePlayer {
@@ -1483,5 +1485,48 @@ describe('GuildPlayer leaving when nothing plays', () => {
     vi.advanceTimersByTime(60_000);
 
     expect(h.selfDestruct).toHaveBeenCalledWith('guild-1', 'idle-timeout');
+  });
+});
+
+describe('GuildPlayer.startAt (resuming after a restart)', () => {
+  it('plays the saved track from the saved position in one request', async () => {
+    const h = harness();
+    h.gp.queue.restore([track('a', 'A'), track('b', 'B'), track('c', 'C')], 0, 'off');
+    h.gp.armRestoredQueue();
+
+    await h.gp.startAt(1, 73_000);
+    await settle();
+
+    // One play, already at the right spot: no audible blip from the top of
+    // the song before a separate seek lands.
+    expect(h.player.playTrack).toHaveBeenCalledTimes(1);
+    expect(h.player.playTrack.mock.calls[0]?.[0]).toMatchObject({
+      track: { encoded: 'encoded-b' },
+      position: 73_000,
+    });
+    expect(h.player.seekTo).not.toHaveBeenCalled();
+    expect(h.gp.queue.currentIndex).toBe(1);
+    expect(h.gp.isPlaying).toBe(true);
+    // Saved, so the queue row follows the cursor.
+    expect(h.store.scheduleSave).toHaveBeenCalled();
+  });
+
+  it('sends no position when starting from the top', async () => {
+    const h = harness();
+    h.gp.queue.restore([track('a', 'A'), track('b', 'B')], 0, 'off');
+
+    await h.gp.startAt(0, 0);
+    await settle();
+
+    expect(h.player.playTrack.mock.calls[0]?.[0]).not.toHaveProperty('position');
+    expect(played(h.player)).toEqual(['encoded-a']);
+  });
+
+  it('returns null and plays nothing for an index outside the queue', async () => {
+    const h = harness();
+    h.gp.queue.restore([track('a', 'A')], 0, 'off');
+
+    expect(await h.gp.startAt(5, 10_000)).toBeNull();
+    expect(h.player.playTrack).not.toHaveBeenCalled();
   });
 });

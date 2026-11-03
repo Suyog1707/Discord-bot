@@ -642,6 +642,23 @@ export class GuildPlayer {
     return target;
   }
 
+  /**
+   * Start the queue at `index`, already `positionMs` into the track.
+   *
+   * Used by the restart restore. It is `jumpTo` with one difference: the start
+   * position travels in the SAME play request. Playing from the top and then
+   * seeking would let a blip of the song's first second out before the seek
+   * lands. Null (and nothing played) when the index is outside the queue.
+   */
+  async startAt(index: number, positionMs: number): Promise<QueuedTrack | null> {
+    const target = this.queue.jumpTo(index);
+    if (target === null) return null;
+    this.#advanceIntent = 'jump';
+    await this.#playTrack(target, positionMs);
+    this.#persist();
+    return target;
+  }
+
   /** Go back to the previously played track. Null when at the start. */
   async previous(): Promise<QueuedTrack | null> {
     const target = this.queue.previous();
@@ -1538,7 +1555,7 @@ export class GuildPlayer {
     return this.#currentLinks;
   }
 
-  async #playTrack(track: QueuedTrack): Promise<void> {
+  async #playTrack(track: QueuedTrack, startPositionMs = 0): Promise<void> {
     // Whatever the queue was when it was restored, it is being played now
     // because somebody asked — the paths that start music on their own are
     // gated above.
@@ -1567,6 +1584,9 @@ export class GuildPlayer {
         // distinguishable from the end of an earlier play of the same song.
         track: { encoded: track.encoded, userData: { playSeq: this.#playSeq } },
         volume: this.#volume,
+        // Only a restart restore asks for a start point; everything else
+        // plays from the top, so the key is absent rather than zero.
+        ...(startPositionMs > 0 && { position: Math.round(startPositionMs) }),
       });
     } catch (error) {
       this.#playing = false;

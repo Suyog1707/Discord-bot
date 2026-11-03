@@ -55,17 +55,23 @@ export default defineEvent({
     });
 
     /**
-     * 24/7 mode: rejoin voice channels and restore queues left by the last run.
+     * Pick the music back up after a restart.
      *
-     * Primary only. Every client firing this would have the whole fleet race to
-     * restore the same guild's single saved 24/7 room, and whichever lost would
-     * find the channel already taken. Restoring across several rooms is the
-     * router's job once it exists.
+     * Every bot restores the rooms it was itself playing in — rejoining and
+     * continuing at about the saved position — so players run this too. Only
+     * the 24/7 pass, which waits in a channel rather than playing, stays with
+     * the primary: every client running it would have the fleet race for the
+     * same guild's single saved 24/7 room.
      */
-    if (client.identity.role === 'primary' && client.music !== undefined) {
-      client.music.restoreStayConnectedPlayers().catch((error: unknown) => {
-        logger.warn({ err: error }, '24/7 restore failed');
-      });
+    if (client.music !== undefined) {
+      client.music
+        .restoreAfterRestart({ stayConnected: client.identity.role === 'primary' })
+        .catch((error: unknown) => {
+          logger.warn({ err: error }, 'Restart restore failed');
+        });
     }
+
+    // Everything above is fire-and-forget; nothing here is waited on.
+    return Promise.resolve();
   },
 });

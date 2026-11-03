@@ -83,6 +83,15 @@ import { getResolutionSettings, providerOrderFor } from './resolution-settings.j
 import { explainSoundcloudLinkFailure, soundcloudSearchRefusal } from './soundcloud.js';
 import type { SpotifyResolution, SpotifyTrackMeta } from './spotify-resolver.js';
 import type { PersistedQueue, QueueStore, StayConnectedSession } from './queue-store.js';
+import {
+  decideStayConnectedRestore,
+  restorePlayingRooms,
+  RESUME_CHECKPOINT_INTERVAL_MS,
+  RESUME_NODE_READY_TIMEOUT_MS,
+  type PlayingRoomView,
+  type ResumeStore,
+  type ResumeTracker,
+} from './room-resume.js';
 import { resolvePlatformLinks, type PlatformLinks } from './platform-links.js';
 import {
   buildSearchQuery,
@@ -318,6 +327,24 @@ export class MusicManager {
   #reconnectTimer: NodeJS.Timeout | undefined;
 
   /**
+   * Remembers which rooms this bot is playing in, so a restart can rejoin
+   * them. Absent in tests and wherever nothing needs resuming.
+   */
+  readonly #resume: { readonly tracker: ResumeTracker; readonly store: ResumeStore } | undefined;
+  #resumeCheckpoint: NodeJS.Timeout | undefined;
+  /**
+   * Set once shutdown begins. A voice socket closing during the teardown is
+   * the teardown, not a fault to rebuild from.
+   */
+  #shuttingDown = false;
+  /**
+   * Guilds with a restart restore in flight. A /play landing on the same bot
+   * in that window waits for it, then finds the player the restore built
+   * instead of racing it into a second join.
+   */
+  readonly #restoring = new Map<string, Promise<unknown>>();
+
+  /**
    * The recommendation-backed autoplay engine, when the AI stack is configured.
    * Undefined leaves autoplay on its original YouTube-mix behaviour.
    */
@@ -385,6 +412,8 @@ export class MusicManager {
       voiceChannelId: string,
       payload: string | null,
     ) => void;
+    /** Resume bookkeeping for restarts; see {@link ResumeTracker}. */
+    readonly resume?: { readonly tracker: ResumeTracker; readonly store: ResumeStore };
   }) {
     this.#client = options.client;
     this.#store = options.store;
@@ -393,6 +422,7 @@ export class MusicManager {
     this.#node = options.node;
     this.#publishEvent = options.publishEvent;
     this.#retainEvent = options.retainEvent;
+    this.#resume = options.resume;
 
     this.shoukaku = new Shoukaku(
       new Connectors.DiscordJS(options.client),
@@ -460,6 +490,147 @@ export class MusicManager {
     });
 
     this.#startNodeSupervisor();
+
+    if (this.#resume !== undefined) {
+      const { tracker } = this.#resume;
+      // A crash gives no chance to write a final position, so positions are
+      // checkpointed while playing. `unref` so it never holds up an exit.
+      this.#resumeCheckpoint = setInterval(() => {
+        void tracker.checkpoint(this.#roomViews());
+      }, RESUME_CHECKPOINT_INTERVAL_MS);
+      this.#resumeCheckpoint.unref();
+    }
+  }
+
+  /** What the resume tracker needs to know about one guild's room. */
+  #roomView(guildId: string): PlayingRoomView | undefined {
+    const player = this.#players.get(guildId);
+    if (player === undefined) return undefined;
+    return {
+      guildId,
+      voiceChannelId: player.voiceChannelId,
+      textChannelId: player.textChannelId,
+      isPlaying: player.isPlaying,
+      paused: player.paused,
+      currentIdentifier: player.queue.current?.identifier ?? null,
+      currentIndex: player.queue.currentIndex,
+      positionMs: Math.max(0, Math.round(player.positionMs)),
+    };
+  }
+
+  #roomViews(): PlayingRoomView[] {
+    return [...this.#players.keys()]
+      .map((guildId) => this.#roomView(guildId))
+      .filter((view): view is PlayingRoomView => view !== undefined);
+  }
+
+  /**
+   * Freeze the resume records at their last true state, before the teardown.
+   *
+   * `destroyAll` reports every room as stopped and releases the owner key;
+   * left to run first it would erase "was playing" and the position. This
+   * writes them, then makes every later sync a no-op.
+   */
+  async prepareForShutdown(): Promise<void> {
+    this.#shuttingDown = true;
+    if (this.#resumeCheckpoint !== undefined) clearInterval(this.#resumeCheckpoint);
+    this.#resumeCheckpoint = undefined;
+    await this.#resume?.tracker.beginShutdown(this.#roomViews());
+  }
+
+  /** Resolve true once a Lavalink node is usable; false if none shows up in time. */
+  async #whenNodeReady(timeoutMs: number): Promise<boolean> {
+    if (this.isAvailable) return true;
+    return new Promise<boolean>((resolve) => {
+      const finish = (ready: boolean): void => {
+        clearTimeout(timer);
+        this.shoukaku.off('ready', onReady);
+        resolve(ready);
+      };
+      const onReady = (): void => {
+        finish(true);
+      };
+      const timer = setTimeout(() => {
+        finish(false);
+      }, timeoutMs);
+      this.shoukaku.on('ready', onReady);
+    });
+  }
+
+  /**
+   * Rejoin what this bot was playing before the restart, and continue it.
+   *
+   * Runs on every bot (each restores its OWN rooms); `stayConnected` adds the
+   * 24/7 pass, which only the primary runs.
+   */
+  async restoreAfterRestart(options: { readonly stayConnected: boolean }): Promise<void> {
+    if (!(await this.#whenNodeReady(RESUME_NODE_READY_TIMEOUT_MS))) {
+      logger.warn('Lavalink never became ready; nothing restored after restart');
+      return;
+    }
+
+    const resume = this.#resume;
+    if (resume !== undefined) {
+      await restorePlayingRooms({
+        store: resume.store,
+        now: () => Date.now(),
+        guildPresent: (guildId) => this.#client.guilds.cache.has(guildId),
+        channelIsVoice: (guildId, voiceChannelId) =>
+          this.#client.guilds.cache
+            .get(guildId)
+            ?.channels.cache.get(voiceChannelId)
+            ?.isVoiceBased() === true,
+        humanListeners: (_guildId, voiceChannelId) => this.#listenerCountIn(voiceChannelId),
+        hasPlayer: (guildId) => this.#players.has(guildId),
+        // Not #savedQueueFor: how old the save may be is the record's call.
+        loadQueue: async (guildId, voiceChannelId) =>
+          this.#store.loadPersisted(guildId, voiceChannelId),
+        startRoom: async ({ record, queue, index, positionMs }) => {
+          const { guildId } = record;
+          const guild = this.#client.guilds.cache.get(guildId);
+          if (guild === undefined) throw new Error('guild left the cache');
+          const work = (async (): Promise<void> => {
+            const listener =
+              queue.listenerId ??
+              [...queue.tracks]
+                .reverse()
+                .find((track) => trackOrigin(track) === 'user' && track.requestedById !== '0')
+                ?.requestedById ??
+              null;
+            const player = await this.#getOrCreatePlayer({
+              guildId,
+              voiceChannelId: record.voiceChannelId,
+              textChannelId: record.textChannelId ?? queue.textChannelId,
+              shardId: guild.shardId,
+              listenerId: listener,
+              // The queue is restored right here with the record's cursor.
+              resumeSavedQueue: false,
+            });
+            player.queue.restore(queue.tracks, index, queue.loopMode);
+            await player.setVolume(queue.volume);
+            if (listener !== null) {
+              void this.#autoplaySession
+                ?.setListener(roomIdOf(guildId, record.voiceChannelId), listener)
+                .catch(() => undefined);
+            }
+            await player.startAt(index, positionMs);
+            this.#syncSessionQueue(guildId);
+            if (player.queue.current === null) {
+              throw new Error('nothing was playing after the restore');
+            }
+          })();
+          this.#restoring.set(guildId, work);
+          try {
+            await work;
+          } finally {
+            this.#restoring.delete(guildId);
+          }
+        },
+        logger,
+      });
+    }
+
+    if (options.stayConnected) await this.restoreStayConnectedPlayers();
   }
 
   /**
@@ -714,6 +885,15 @@ export class MusicManager {
    * `ValidationError` naming the channel.
    */
   async getOrCreatePlayer(options: JoinOptions): Promise<GuildPlayer> {
+    // A restart restore is building this guild's player. Wait for it, so this
+    // call finds that player instead of racing it into a second voice join.
+    const restoring = this.#restoring.get(options.guildId);
+    if (restoring !== undefined) await restoring.catch(() => undefined);
+    return this.#getOrCreatePlayer(options);
+  }
+
+  /** The join itself; the restore calls this directly, the rest go via the guard. */
+  async #getOrCreatePlayer(options: JoinOptions): Promise<GuildPlayer> {
     const existing = this.#players.get(options.guildId);
     if (existing !== undefined) {
       const decision = decideHandover({
@@ -2107,73 +2287,111 @@ export class MusicManager {
           continue;
         }
 
-        // Who this radio is for comes back with the queue: the persisted
-        // owner, or failing that the most recent person who requested one of
-        // the restored tracks.
-        const listener =
-          persisted.listenerId ??
-          [...persisted.tracks]
-            .reverse()
-            .find((track) => trackOrigin(track) === 'user' && track.requestedById !== '0')
-            ?.requestedById ??
-          null;
-        const player = await this.getOrCreatePlayer({
-          guildId,
-          voiceChannelId: persisted.voiceChannelId,
-          textChannelId: persisted.textChannelId,
-          shardId: guild.shardId,
-          listenerId: listener,
-          // This path restores the queue itself, with its own cursor handling
-          // (see the skip below); letting the join do it as well would apply
-          // two different resume policies to one queue.
-          resumeSavedQueue: false,
-        });
-        player.queue.restore(persisted.tracks, persisted.currentIndex, persisted.loopMode);
-        await player.setVolume(persisted.volume);
-        if (listener !== null) {
-          void this.#autoplaySession
-            ?.setListener(roomIdOf(guildId, persisted.voiceChannelId), listener)
-            .catch(() => undefined);
-        }
-
-        // Resume from the track after the last known one — the position within
-        // the old track is stale by now, and skipping forward beats replaying.
-        // The session mirror is synced AFTER the cursor moves, so its queued
-        // set reflects what is actually still ahead. A queue that had already
-        // reached its end does not stay silent: with autoplay on, the restored
-        // listener's taste continues it.
-        player.queue.skip();
-        this.#syncSessionQueue(guildId);
-
-        /**
-         * Restored, and waiting to be asked for.
-         *
-         * 24/7 means the bot waits in the channel — it does not mean it
-         * performs to whoever is standing there. This used to check whether
-         * anybody was present and, if so, start playing immediately: restart a
-         * container while somebody happened to be in the channel and the bot
-         * would appear and begin a queue from a previous session at them, with
-         * autoplay inventing more once it ran out. Nobody had asked for any of
-         * it.
-         *
-         * So the queue is loaded and armed either way, and the first `/play`,
-         * `/join` or press of the controller starts it.
-         */
-        player.armRestoredQueue();
-        logger.info(
-          {
+        // A room one bot is about to resume playing (or already has) is that
+        // bot's; 24/7 only rejoins rooms nobody else is picking up.
+        const verdict = decideStayConnectedRestore({
+          hasPlayer: this.#players.has(guildId),
+          heldBy: await this.#resume?.store.heldElsewhere(
             guildId,
-            tracks: persisted.tracks.length,
-            listener,
-            listenersPresent: player.hasListeners,
-          },
-          '24/7: rejoined and restored the queue; waiting to be asked',
-        );
+            persisted.voiceChannelId,
+            Date.now(),
+          ),
+          humanListeners: this.#listenerCountIn(persisted.voiceChannelId),
+        });
+        if (verdict !== 'restore') {
+          logger.info(
+            { guildId, voiceChannelId, reason: verdict },
+            '24/7 skipped: handled elsewhere',
+          );
+          continue;
+        }
+        // The same claim the playing restore takes, so the router sends a
+        // /play for this room to this bot while it joins.
+        //
+        // It respects the room's owner key. Another bot restoring this room
+        // playing writes that key on PLAYER_CONNECT, and its resume record is
+        // briefly removed at that moment (the connect event syncs it as
+        // not-yet-playing) until TRACK_START saves it again, so
+        // `heldElsewhere` alone can miss it; without this the primary could
+        // join a channel another bot is already playing in.
+        // Trade-off: after a crash (not a graceful stop) a stale owner key
+        // naming another bot (6h TTL) makes the primary skip that 24/7 room
+        // until someone /plays there.
+        if (
+          this.#resume !== undefined &&
+          !(await this.#resume.store.claim(guildId, persisted.voiceChannelId, {
+            respectOwner: true,
+          }))
+        ) {
+          logger.info({ guildId, voiceChannelId }, '24/7 skipped: room claimed by another bot');
+          continue;
+        }
+        try {
+          // Who this radio is for comes back with the queue: the persisted
+          // owner, or failing that the most recent person who requested one of
+          // the restored tracks.
+          const listener =
+            persisted.listenerId ??
+            [...persisted.tracks]
+              .reverse()
+              .find((track) => trackOrigin(track) === 'user' && track.requestedById !== '0')
+              ?.requestedById ??
+            null;
+          const player = await this.getOrCreatePlayer({
+            guildId,
+            voiceChannelId: persisted.voiceChannelId,
+            textChannelId: persisted.textChannelId,
+            shardId: guild.shardId,
+            listenerId: listener,
+            // This path restores the queue itself, with its own cursor handling
+            // (see the skip below); letting the join do it as well would apply
+            // two different resume policies to one queue.
+            resumeSavedQueue: false,
+          });
+          player.queue.restore(persisted.tracks, persisted.currentIndex, persisted.loopMode);
+          await player.setVolume(persisted.volume);
+          if (listener !== null) {
+            void this.#autoplaySession
+              ?.setListener(roomIdOf(guildId, persisted.voiceChannelId), listener)
+              .catch(() => undefined);
+          }
 
-        logger.info(
-          { guildId, tracks: persisted.tracks.length, listener },
-          '24/7: rejoined voice and restored the queue',
-        );
+          // Resume from the track after the last known one — the position within
+          // the old track is stale by now, and skipping forward beats replaying.
+          // The session mirror is synced AFTER the cursor moves, so its queued
+          // set reflects what is actually still ahead. A queue that had already
+          // reached its end does not stay silent: with autoplay on, the restored
+          // listener's taste continues it.
+          player.queue.skip();
+          this.#syncSessionQueue(guildId);
+
+          /**
+           * Restored, and waiting to be asked for.
+           *
+           * 24/7 means the bot waits in the channel — it does not mean it
+           * performs to whoever is standing there. This used to check whether
+           * anybody was present and, if so, start playing immediately: restart a
+           * container while somebody happened to be in the channel and the bot
+           * would appear and begin a queue from a previous session at them, with
+           * autoplay inventing more once it ran out. Nobody had asked for any of
+           * it.
+           *
+           * So the queue is loaded and armed either way, and the first `/play`,
+           * `/join` or press of the controller starts it.
+           */
+          player.armRestoredQueue();
+          logger.info(
+            {
+              guildId,
+              tracks: persisted.tracks.length,
+              listener,
+              listenersPresent: player.hasListeners,
+            },
+            '24/7: rejoined and restored the queue; waiting to be asked',
+          );
+        } finally {
+          await this.#resume?.store.release(guildId, persisted.voiceChannelId);
+        }
       } catch (error) {
         logger.warn({ err: error, guildId }, '24/7 restore failed for this guild');
       }
@@ -2203,6 +2421,10 @@ export class MusicManager {
     // with it rather than leave the dashboard greeting new tabs with a ghost.
     this.#retainEvent?.(guildId, voiceChannelId, state === null ? null : payload);
     this.#controllers.get(guildId)?.onEvent(type, state);
+    // The player is already out of `#players` when PLAYER_DISCONNECT fires, so
+    // a room going away never lands here and never rewrites its record.
+    const view = this.#roomView(guildId);
+    if (view !== undefined) void this.#resume?.tracker.sync(view);
   }
 
   /**
@@ -2246,6 +2468,8 @@ export class MusicManager {
    * costs a gap rather than the song.
    */
   async #reconnectVoice(guildId: string, code: number, reason: string): Promise<void> {
+    // A socket closing because we are shutting down is the teardown itself.
+    if (this.#shuttingDown) return;
     const player = this.#players.get(guildId);
     if (player === undefined) return;
 
@@ -2348,6 +2572,9 @@ export class MusicManager {
     this.#autoplay?.clear(roomIdOf(guildId, player.voiceChannelId));
 
     this.#players.delete(guildId);
+    // Left on purpose, so no restart should bring the room back. A no-op
+    // during shutdown, when the record must survive the teardown.
+    void this.#resume?.tracker.forget(guildId, player.voiceChannelId);
     // A resume nobody asked about does not survive the session it belongs to.
     this.#resumeNotices.delete(guildId);
     // Session over: the next person to summon the bot hosts a fresh one.
@@ -2373,6 +2600,8 @@ export class MusicManager {
   /** Tear down everything — shutdown path. */
   async destroyAll(): Promise<void> {
     this.#stopNodeSupervisor();
+    if (this.#resumeCheckpoint !== undefined) clearInterval(this.#resumeCheckpoint);
+    this.#resumeCheckpoint = undefined;
     await Promise.allSettled([...this.#players.keys()].map((id) => this.destroyPlayer(id)));
   }
 
