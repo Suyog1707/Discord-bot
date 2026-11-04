@@ -181,3 +181,44 @@ The failure the HTTP mode adds is real and worth naming: with the endpoint set,
 an outage of the web deployment takes down every slash command in every server.
 In gateway mode the same is true of the primary bot container instead. Pick the
 one whose outage you would rather have, and keep the switch in mind as the lever.
+
+## Own Tailscale Funnel for the website (replaces the host Funnel)
+
+The website path is browser -> Vercel (middleware rewrite to
+`BACKEND_PROXY_URL`) -> Tailscale Funnel -> `web-gateway`. The Funnel on the
+VPS host's tailscaled belongs to the company tailnet and is congested: TLS
+handshakes take 12-31 s or fail, so Vercel returns 502
+`ROUTER_EXTERNAL_TARGET_HANDSHAKE_ERROR`. Instead, the `tailscale-funnel`
+service runs a separate Tailscale node in a container, joined to a personal
+tailnet, in userspace mode (no host network changes, no contact with the host's
+tailscaled). It serves its own Funnel straight to `web-gateway:8080` over the
+compose network.
+
+1. In the **personal** Tailscale admin console (login.tailscale.com):
+   - DNS: enable MagicDNS and HTTPS Certificates.
+   - Access controls: make sure the policy grants the `funnel` node attribute,
+     e.g. `"nodeAttrs": [{"target": ["autogroup:member"], "attr": ["funnel"]}]`
+     (the default policy usually has it).
+   - Settings -> Keys: generate an auth key (not reusable, not ephemeral).
+2. On the VPS, in `/root/Discord-bot/.env`, set `TS_AUTHKEY=...` and
+   `COMPOSE_PROFILES=players,funnel`.
+3. Start it, then read the URL:
+
+   ```bash
+   docker compose --env-file .env -f docker/docker-compose.yml up -d tailscale-funnel
+   docker logs dmp-tailscale
+   docker exec dmp-tailscale tailscale funnel status
+   ```
+
+4. Test from anywhere (403 is correct without the secret; it should be fast):
+
+   ```bash
+   curl -s -o /dev/null -w '%{http_code} %{time_appconnect}\n' https://tesseract-web.<tailnet>.ts.net/api/health
+   ```
+
+5. In Vercel, set `BACKEND_PROXY_URL` to that URL and Redeploy.
+6. Leave the company host's own Funnel config alone; it is not ours to change.
+
+The security model is unchanged: the gateway still requires `X-Origin-Secret`,
+and only Vercel knows it. The auth key is only needed for the first login; the
+node state lives in the `tailscale-state` volume.
