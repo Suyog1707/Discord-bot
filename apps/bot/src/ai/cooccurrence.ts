@@ -315,6 +315,15 @@ export function similarityBetween(
   return edgeBetween(signals.tracks, keyA, keyB);
 }
 
+/** How strongly two ARTISTS are played together, 0..1 (better directed edge). */
+export function artistSimilarity(
+  signals: CooccurrenceSignals,
+  artistA: string,
+  artistB: string,
+): number {
+  return edgeBetween(signals.artists, artistA, artistB);
+}
+
 /**
  * How well a candidate fits the neighbourhood of a set of seeds, 0..1.
  *

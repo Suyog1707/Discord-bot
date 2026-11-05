@@ -23,11 +23,24 @@
  *    artist only) behind a week-long cache. A week, because an artist's genre
  *    and country do not change and the lookup is the expensive part.
  */
+import {
+  languageFromArtistTags,
+  LINKED_ARTIST_MIN_WEIGHT,
+  styleFromTags,
+  UNKNOWN_CLASSIFICATION,
+  type Classification,
+  type ClassificationSource,
+  type MusicStyle,
+  type SeedHistory,
+} from './autoplay-constraint.js';
 import type { CacheService } from './cache.js';
 import { normaliseTags } from './genre-taxonomy.js';
 import { identityOf, type TrackIdentity } from './identity.js';
 import {
+  languageFromProvider,
+  languageFromText,
   recordingLanguageFromTags,
+  specificLanguagesFromTags,
   type LanguageConfidence,
   type LanguageSource,
   resolveLanguage,
@@ -242,6 +255,12 @@ function buildProfile(
 export class TrackProfileResolver {
   readonly #tags: TagSource;
   readonly #cache: CacheService;
+  /**
+   * Artist lookups already under way. `CacheService.wrap` does not coalesce
+   * concurrent misses, and classifying a pool touches the same artist from
+   * several candidates at once — without this each one would hit Last.fm.
+   */
+  readonly #artistTagsInFlight = new Map<string, Promise<readonly string[] | null>>();
 
   constructor(tags: TagSource, cache: CacheService) {
     this.#tags = tags;
@@ -276,6 +295,148 @@ export class TrackProfileResolver {
     if (resolved.confidence === 'high') return resolved.language;
     if (resolved.source === 'script' && resolved.language !== 'hindi') return resolved.language;
     return null;
+  }
+
+  /**
+   * Language and style of ONE recording, for the seed constraint.
+   *
+   * Strongest evidence first: the provider's own field, the track's own tags,
+   * a distinctive title script, then the artist's tags (which is what rescues
+   * a romanized title such as "Khatta Flow"). Style comes from the track's tags
+   * and falls back to the artist's. Never throws: every failure is "unknown",
+   * and the constraint treats unknown as "only if linked", never as a match.
+   */
+  async autoplayClass(input: TrackProfileInput): Promise<Classification> {
+    try {
+      const identity = identityOf(input.artist, input.title);
+      const [trackTags, artistTags] = await Promise.all([
+        this.#trackTags(identity.key, input.artist, input.title),
+        this.#artistTagsFor(identity.artistKey, input.artist),
+      ]);
+
+      let language: string | null = null;
+      let confidence: Classification['confidence'] = 'none';
+      const sources: ClassificationSource[] = [];
+
+      const provider = languageFromProvider(input.providerLanguage);
+      const trackLanguages = specificLanguagesFromTags(trackTags);
+      // The title only, never the artist name: a native-script credit on a
+      // romanized release says little about this recording's lyrics.
+      const script = languageFromText(input.title);
+      if (provider !== null) {
+        language = provider;
+        confidence = 'high';
+        sources.push('provider');
+      } else if (trackLanguages.size === 1) {
+        language = [...trackLanguages][0] ?? null;
+        confidence = 'high';
+        sources.push('track-tags');
+      } else if (script !== null && script !== 'hindi') {
+        // Devanagari reads as 'hindi' in the script table, but the script is
+        // shared with Marathi and Nepali, so it is no answer on its own.
+        language = script;
+        confidence = 'medium';
+        sources.push('script');
+      } else {
+        const fromArtist = languageFromArtistTags(artistTags, input.title);
+        if (fromArtist !== null) {
+          language = fromArtist;
+          confidence = 'medium';
+          sources.push('artist-tags');
+        }
+      }
+
+      let style: MusicStyle | null = styleFromTags(trackTags);
+      if (style !== null) {
+        if (!sources.includes('track-tags')) sources.push('track-tags');
+      } else {
+        style = styleFromTags(artistTags);
+        if (style !== null && !sources.includes('artist-tags')) sources.push('artist-tags');
+      }
+
+      return { language, style, confidence, sources };
+    } catch {
+      return UNKNOWN_CLASSIFICATION;
+    }
+  }
+
+  /**
+   * `autoplayClass` for the SEED, which may borrow from what the room knows.
+   *
+   * A seed is usually a freshly requested romanized title with no tags of its
+   * own. Its artist's other songs the room played are the next-best evidence,
+   * then songs the room strongly co-plays with it. Whatever is still unknown
+   * after that stays unknown — the constraint then restricts autoplay to the
+   * seed's own and linked artists instead of guessing.
+   */
+  async autoplaySeedClass(input: TrackProfileInput, history: SeedHistory): Promise<Classification> {
+    const own = await this.autoplayClass(input);
+    if (own.language !== null && own.style !== null) return own;
+
+    let { language, style, confidence } = own;
+    const sources = [...own.sources];
+    const adopt = (
+      from: readonly Classification[],
+      source: ClassificationSource,
+      minAgree: number,
+    ): void => {
+      if (language === null) {
+        const votes = from.flatMap((entry) => (entry.language === null ? [] : [entry.language]));
+        const distinct = new Set(votes);
+        if (distinct.size === 1 && votes.length >= minAgree) {
+          language = [...distinct][0] ?? null;
+          confidence = 'medium';
+          sources.push(source);
+        }
+      }
+      if (style === null) {
+        const votes = from.flatMap((entry) => (entry.style === null ? [] : [entry.style]));
+        const distinct = new Set(votes);
+        if (distinct.size === 1 && votes.length >= minAgree) {
+          style = [...distinct][0] ?? null;
+          if (!sources.includes(source)) sources.push(source);
+        }
+      }
+    };
+
+    const sameArtist = await Promise.all(
+      history.sameArtist.slice(0, 6).map((entry) => this.autoplayClass(entry)),
+    );
+    adopt(sameArtist, 'history', 1);
+
+    if (language === null || style === null) {
+      const strong = history.coplayed
+        .filter((entry) => entry.weight >= LINKED_ARTIST_MIN_WEIGHT)
+        .slice(0, 5);
+      const coplayed = await Promise.all(strong.map((entry) => this.autoplayClass(entry)));
+      // Songs the room merely plays alongside the seed are weaker evidence
+      // than the artist's own: two must agree before either value is taken.
+      adopt(coplayed, 'cooccurrence', 2);
+    }
+
+    return { language, style, confidence, sources };
+  }
+
+  /** One lookup per artist, deduped across concurrent callers, cached 7d. */
+  async #artistTagsFor(artistKey: string, artist: string): Promise<readonly string[]> {
+    const lead = primaryArtist(artist).trim();
+    if (lead.length === 0) return [];
+    let pending = this.#artistTagsInFlight.get(artistKey);
+    if (pending === undefined) {
+      pending = this.#cache
+        .wrap<readonly string[]>(`profile:artist-tags:${artistKey}`, PROFILE_TTL_MS, async () => {
+          try {
+            return await this.#tags.artistTags(lead);
+          } catch {
+            // A lookup that THREW is not "no tags": null earns the cache's
+            // short negative TTL rather than a week of emptiness.
+            return null;
+          }
+        })
+        .finally(() => this.#artistTagsInFlight.delete(artistKey));
+      this.#artistTagsInFlight.set(artistKey, pending);
+    }
+    return (await pending) ?? [];
   }
 
   /** Enriched: adds artist tags/country via `TagSource` (cached 7d under `profile:${key}`). */

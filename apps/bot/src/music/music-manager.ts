@@ -349,6 +349,8 @@ export class MusicManager {
    * Undefined leaves autoplay on its original YouTube-mix behaviour.
    */
   #autoplay: AutoplayEngine | undefined;
+  /** Kept so the mix / artist-search fallback can apply the seed language + style constraint. */
+  #planner: AutoplayPlanner | undefined;
   /** The engine's session store — played/queued/reserved state per guild. */
   #autoplaySession: AutoplaySessionStore | undefined;
 
@@ -1278,6 +1280,7 @@ export class MusicManager {
     planner?: AutoplayPlanner,
   ): void {
     this.#autoplay = engine;
+    this.#planner = planner;
     this.#autoplaySession = engine.session;
     orchestrator.setResolver(async (candidate) => this.resolveCandidate(candidate));
     // The planner chooses canonical songs; this is where they become audio.
@@ -2065,6 +2068,26 @@ export class MusicManager {
             }));
     if (history.length === 0 && current === null && queued.length === 0) return [];
 
+    // Anchor-based seeds: user-originated plays anchor the generation, the
+    // newest autoplay play joins only as discounted context. Seeding from
+    // the raw last-4 plays here — origin-blind — was the primary source of
+    // taste drift.
+    const seeds = selectAutoplaySeeds([
+      ...(current === null
+        ? []
+        : [
+            {
+              title: current.title,
+              author: current.author,
+              identifier: current.identifier,
+              origin: trackOrigin(current),
+              skipped: false,
+            },
+          ]),
+      ...history,
+      ...queued,
+    ]);
+
     // The recommendation engine goes first when it is configured: it knows the
     // guild's taste, its recent skips and the language it listens in, none of
     // which a mix URL does. It returns nothing when Last.fm is unavailable or
@@ -2075,26 +2098,6 @@ export class MusicManager {
       // The session's queued-set must be current BEFORE generation reads it:
       // this is the hard "already in the queue" exclusion.
       this.#syncSessionQueue(guildId);
-      // Anchor-based seeds: user-originated plays anchor the generation, the
-      // newest autoplay play joins only as discounted context. Seeding from
-      // the raw last-4 plays here — origin-blind — was the primary source of
-      // taste drift.
-      const seeds = selectAutoplaySeeds([
-        ...(current === null
-          ? []
-          : [
-              {
-                title: current.title,
-                author: current.author,
-                identifier: current.identifier,
-                origin: trackOrigin(current),
-                skipped: false,
-              },
-            ]),
-        ...history,
-        ...queued,
-      ]);
-
       const room = this.#roomOf(guildId);
       const recommended = room === undefined ? [] : await engine.take(room, wanted, seeds);
       if (recommended.length > 0) {
@@ -2151,9 +2154,46 @@ export class MusicManager {
     const perAuthorCount = new Map<string, number>();
     const requester = { id: this.#client.user?.id ?? '0', name: 'Autoplay' };
 
+    // With the AI stack attached, mix and search results are no longer taken
+    // as they come: they are gathered, filtered through the planner's seed
+    // language + style constraint, and only then capped per artist. Without it
+    // (no planner or no room) the behaviour is exactly what it always was.
+    const planner = this.#planner;
+    const constrained = planner !== undefined && fallbackRoom !== undefined;
+    const gathered: QueuedTrack[] = [];
+    /** Bounds the tag lookups the constraint costs. */
+    const GATHER_MAX = 25;
+    const gatherFull = (): boolean =>
+      constrained ? gathered.length >= GATHER_MAX : picks.length >= wanted;
+
+    /** Take a track unless its artist already has two picks. */
+    const accept = (track: QueuedTrack): void => {
+      if (picks.length >= wanted) return;
+      const author = cleanAuthor(track.author);
+      if ((perAuthorCount.get(author) ?? 0) >= 2) return;
+      perAuthorCount.set(author, (perAuthorCount.get(author) ?? 0) + 1);
+      picks.push(track);
+    };
+
+    /** Constrain what was gathered, then take it in order. Returns before/after counts. */
+    const flush = async (): Promise<{ before: number; after: number }> => {
+      const before = gathered.length;
+      if (!constrained) return { before, after: before };
+      // The constraint reads the artist's tags, so it gets the cleaned name
+      // ("Seedhe Maut - Topic" would look up a channel, not an artist).
+      const kept = await planner.constrainRefill(
+        fallbackRoom,
+        seeds,
+        gathered.map((track) => ({ title: track.title, author: cleanAuthor(track.author), track })),
+      );
+      gathered.length = 0;
+      for (const entry of kept) accept(entry.track);
+      return { before, after: kept.length };
+    };
+
     /** Keep a candidate only if it is fresh, playable and not over-represented. */
     const consider = (raw: LavalinkTrack): void => {
-      if (picks.length >= wanted) return;
+      if (gatherFull()) return;
       const track: QueuedTrack = { ...fromLavalinkTrack(raw, requester), origin: 'autoplay' };
 
       const trackKey = identityOf(track.author, track.title).key;
@@ -2162,7 +2202,7 @@ export class MusicManager {
       // Within this batch, dedupe by canonical key as well as identifier —
       // two different uploads of one song are still one song.
       if (
-        picks.some(
+        [...picks, ...gathered].some(
           (pick) =>
             pick.identifier === track.identifier ||
             identityOf(pick.author, pick.title).key === trackKey,
@@ -2172,11 +2212,8 @@ export class MusicManager {
       }
       if (track.isStream) return;
       if (track.durationMs < 60_000 || track.durationMs > 600_000) return;
-      const author = cleanAuthor(track.author);
-      if ((perAuthorCount.get(author) ?? 0) >= 2) return;
-
-      perAuthorCount.set(author, (perAuthorCount.get(author) ?? 0) + 1);
-      picks.push(track);
+      if (constrained) gathered.push(track);
+      else accept(track);
     };
 
     // YouTube mixes are keyed by video id, so only plays whose identifier IS one
@@ -2197,7 +2234,7 @@ export class MusicManager {
     const mixSeeds = (userMixable.length > 0 ? userMixable : mixable).slice(0, 2);
 
     for (const seed of mixSeeds) {
-      if (picks.length >= wanted) break;
+      if (gatherFull()) break;
       try {
         const mix = await node.rest.resolve(
           `https://www.youtube.com/watch?v=${seed.identifier}&list=RD${seed.identifier}`,
@@ -2210,6 +2247,7 @@ export class MusicManager {
       }
     }
 
+    const mixCounts = await flush();
     if (picks.length > 0) {
       logger.info(
         {
@@ -2217,6 +2255,9 @@ export class MusicManager {
           strategy: 'mix',
           seeds: mixSeeds.map((s) => s.identifier),
           picked: picks.length,
+          constrained,
+          gathered: mixCounts.before,
+          kept: mixCounts.after,
         },
         'Autoplay selection',
       );
@@ -2224,7 +2265,7 @@ export class MusicManager {
     }
 
     for (const seed of seedAuthors) {
-      if (picks.length >= wanted) break;
+      if (gatherFull()) break;
 
       let response: LavalinkResponse | undefined;
       try {
@@ -2238,8 +2279,17 @@ export class MusicManager {
       for (const raw of response.data) consider(raw);
     }
 
+    const searchCounts = await flush();
     logger.info(
-      { guildId, strategy: 'artist-search', seeds: seedAuthors, picked: picks.length },
+      {
+        guildId,
+        strategy: 'artist-search',
+        seeds: seedAuthors,
+        picked: picks.length,
+        constrained,
+        gathered: searchCounts.before,
+        kept: searchCounts.after,
+      },
       'Autoplay selection',
     );
     return picks;

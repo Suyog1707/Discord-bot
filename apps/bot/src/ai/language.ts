@@ -349,3 +349,20 @@ export function resolveLanguage(input: LanguageInput): ResolvedLanguage {
 
   return UNKNOWN_LANGUAGE;
 }
+
+/**
+ * Every language a set of tags NAMES, ignoring nationality tags.
+ *
+ * `matchLanguageToken` returns the first table hit per tag, so "desi hip hop"
+ * counts as the (non-specific) desi row and contributes nothing here, while
+ * "hindi rap", "bollywood" and "filmi" each contribute Hindi. Callers that need
+ * a single unambiguous language check for a set of size one.
+ */
+export function specificLanguagesFromTags(tags: readonly string[]): ReadonlySet<string> {
+  const found = new Set<string>();
+  for (const tag of tags) {
+    const matched = matchLanguageToken(tag);
+    if (matched?.specific === true) found.add(matched.language);
+  }
+  return found;
+}

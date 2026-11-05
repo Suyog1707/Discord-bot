@@ -294,6 +294,9 @@ describe('strict language-specific autoplay', () => {
     expect(h.resolveKnown).not.toHaveBeenCalled();
   });
   it('does not guess English from Latin text or Hindi from shared Devanagari', async () => {
+    // A lone nationality tag and a Devanagari title both leave the seed's
+    // language unknown. An unknown seed no longer stops autoplay outright: it
+    // continues with the seed's own artist only, never with anybody else.
     const profiles = new TrackProfileResolver(
       { artistTags: () => Promise.resolve(['american']), trackTags: () => Promise.resolve([]) },
       new CacheService(),
@@ -301,12 +304,17 @@ describe('strict language-specific autoplay', () => {
     const h = harness({
       profiles,
       config: { languageSpecific: true },
-      pool: [familiar('Singer', 'Song', ['library'])],
+      pool: [familiar('Singer', 'Song', ['library']), familiar('Stranger', 'Other', ['library'])],
     });
     for (const title of ['Seed Song', 'मराठी गाणे']) {
-      expect(
-        await h.planner.generate(ROOM, [{ title, artist: 'Singer' }], 2, { background: false }),
-      ).toEqual([]);
+      const generated = await h.planner.generate(ROOM, [{ title, artist: 'Singer' }], 2, {
+        background: false,
+      });
+      expect(generated.every((entry) => entry.track.author === 'Singer')).toBe(true);
+      await h.session.release(
+        ROOM.roomId,
+        generated.map((entry) => entry.reservedKey),
+      );
     }
   });
 });
@@ -827,5 +835,284 @@ describe('AutoplayPlanner — behavioural similarity and track profiles', () => 
     const generated = await h.planner.generate(ROOM, hindiSeeds, 2, { background: false });
 
     expect(generated).toHaveLength(2);
+  });
+});
+
+/* ------------------------------------------- seed language + style constraint */
+
+/**
+ * Autoplay follows the language AND the style of the song the listener asked
+ * for: English stays English, Hindi rap stays Hindi rap, normal Hindi stays
+ * normal Hindi. These run the real resolver over a fake tag world, so the
+ * whole chain — classification, verdict, both pools and the refill fallback —
+ * is exercised end to end.
+ */
+const TAG_WORLD: Readonly<Record<string, readonly string[]>> = {
+  'Ed Sheeran': ['pop', 'british', 'singer-songwriter'],
+  'Taylor Swift': ['pop', 'american', 'country'],
+  Coldplay: ['rock', 'british', 'alternative'],
+  Eminem: ['rap', 'hip hop', 'american'],
+  'Seedhe Maut': ['hip hop', 'desi hip hop', 'hindi', 'indian'],
+  KR$NA: ['hip hop', 'desi hip hop', 'hindi rap'],
+  Divine: ['desi hip hop', 'hindi', 'rap'],
+  'Arijit Singh': ['bollywood', 'hindi', 'romantic'],
+  'Shreya Ghoshal': ['bollywood', 'filmi', 'hindi'],
+  'Marathi Singer': ['marathi'],
+};
+
+function worldProfiles(
+  artists: Readonly<Record<string, readonly string[]>> = TAG_WORLD,
+  tracks: Readonly<Record<string, readonly string[]>> = {},
+): TrackProfileResolver {
+  return new TrackProfileResolver(
+    {
+      artistTags: (artist) => Promise.resolve(artists[artist] ?? []),
+      trackTags: (_artist, title) => Promise.resolve(tracks[title] ?? []),
+    },
+    new CacheService(),
+  );
+}
+
+const authorsOf = (generated: readonly { readonly track: QueuedTrack }[]): string[] =>
+  generated.map((entry) => entry.track.author);
+
+/** A refill-path track: only the fields the fallback has. */
+const refill = (author: string, title: string) => ({ author, title, identifier: `yt:${title}` });
+
+describe('autoplay follows the seed language and style', () => {
+  it('keeps an English seed in English, in both pools and in the refill fallback', async () => {
+    const h = harness({
+      profiles: worldProfiles(),
+      config: { languageSpecific: true },
+      pool: [
+        familiar('Arijit Singh', 'Tum Hi Ho', ['history'], { userPlays: 30, completions: 30 }),
+        familiar('Taylor Swift', 'Love Story', ['history']),
+      ],
+      discoveries: [
+        scored(discovery('Arijit Singh', 'Channa Mereya'), 0.99),
+        scored(discovery('Coldplay', 'Yellow'), 0.9),
+      ],
+    });
+    const seed: readonly TrackSeed[] = [{ title: 'Perfect', artist: 'Ed Sheeran' }];
+
+    const generated = await h.planner.generate(ROOM, seed, 3, { background: false });
+
+    expect(generated.length).toBeGreaterThan(0);
+    expect(authorsOf(generated)).not.toContain('Arijit Singh');
+
+    const kept = await h.planner.constrainRefill(ROOM, seed, [
+      refill('Arijit Singh', 'Kesariya'),
+      refill('Ed Sheeran', 'Shape of You'),
+      refill('Seedhe Maut', 'Nanchaku'),
+    ]);
+    expect(kept.map((track) => track.author)).toEqual(['Ed Sheeran']);
+  });
+
+  it('keeps a Hindi rap seed on Hindi rap: no normal Hindi, no English rap', async () => {
+    const h = harness({
+      profiles: worldProfiles(),
+      config: { languageSpecific: true },
+      pool: [
+        familiar('KR$NA', 'Hola Amigo', ['history']),
+        familiar('Arijit Singh', 'Tum Hi Ho', ['history'], { userPlays: 30, completions: 30 }),
+        familiar('Eminem', 'Lose Yourself', ['history'], { userPlays: 30, completions: 30 }),
+      ],
+    });
+    const seed: readonly TrackSeed[] = [{ title: 'Khatta Flow', artist: 'Seedhe Maut' }];
+
+    const generated = await h.planner.generate(ROOM, seed, 3, { background: false });
+
+    expect(generated.length).toBeGreaterThan(0);
+    expect(new Set(authorsOf(generated))).toEqual(new Set(['KR$NA']));
+
+    const kept = await h.planner.constrainRefill(ROOM, seed, [
+      refill('Arijit Singh', 'Kesariya'),
+      refill('Eminem', 'Mockingbird'),
+      refill('Divine', 'Mere Gully Mein'),
+    ]);
+    expect(kept.map((track) => track.author)).toEqual(['Divine']);
+  });
+
+  it('keeps a normal Hindi seed off rap and off English', async () => {
+    const h = harness({
+      profiles: worldProfiles(),
+      config: { languageSpecific: true },
+      pool: [
+        familiar('Shreya Ghoshal', 'Teri Ore', ['history']),
+        familiar('Seedhe Maut', 'Nanchaku', ['history'], { userPlays: 30, completions: 30 }),
+        familiar('Ed Sheeran', 'Perfect', ['history'], { userPlays: 30, completions: 30 }),
+      ],
+    });
+    const seed: readonly TrackSeed[] = [{ title: 'Tum Hi Ho', artist: 'Arijit Singh' }];
+
+    const generated = await h.planner.generate(ROOM, seed, 3, { background: false });
+
+    expect(generated.length).toBeGreaterThan(0);
+    expect(new Set(authorsOf(generated))).toEqual(new Set(['Shreya Ghoshal']));
+
+    const kept = await h.planner.constrainRefill(ROOM, seed, [
+      refill('KR$NA', 'Hola Amigo'),
+      refill('Ed Sheeran', 'Photograph'),
+      refill('Shreya Ghoshal', 'Sunn Raha Hai'),
+    ]);
+    expect(kept.map((track) => track.author)).toEqual(['Shreya Ghoshal']);
+  });
+
+  it("classifies a romanized seed from the artist's history when nothing else says", async () => {
+    // Seedhe Maut has no artist tags in this world; one of their songs the
+    // room already played carries track tags naming Hindi and hip hop.
+    const { 'Seedhe Maut': _untagged, ...artists } = TAG_WORLD;
+    const h = harness({
+      profiles: worldProfiles(artists, { Nanchaku: ['hindi', 'hip hop'] }),
+      config: { languageSpecific: true },
+      pool: [
+        familiar('Seedhe Maut', 'Nanchaku', ['history']),
+        familiar('KR$NA', 'Hola Amigo', ['history']),
+        familiar('Arijit Singh', 'Tum Hi Ho', ['history'], { userPlays: 30, completions: 30 }),
+        familiar('Ed Sheeran', 'Perfect', ['history'], { userPlays: 30, completions: 30 }),
+      ],
+    });
+
+    const generated = await h.planner.generate(
+      ROOM,
+      [{ title: 'Khatta Flow', artist: 'Seedhe Maut' }],
+      3,
+      { background: false },
+    );
+
+    expect(generated.length).toBeGreaterThan(0);
+    for (const author of authorsOf(generated)) {
+      expect(['Seedhe Maut', 'KR$NA']).toContain(author);
+    }
+  });
+
+  it('restricts an unknown seed to its own and strongly co-played artists', async () => {
+    const seedArtist = identityOf('Obscure Act', 'x').artistKey;
+    const linked = identityOf('Linked Act', 'x').artistKey;
+    const weak = identityOf('Random', 'x').artistKey;
+    const behaviour: CooccurrenceSignals = {
+      tracks: new Map(),
+      artists: new Map([
+        [
+          seedArtist,
+          new Map([
+            [linked, 0.9],
+            [weak, 0.1],
+          ]),
+        ],
+      ]),
+    };
+    const h = harness({
+      profiles: worldProfiles(),
+      behaviour,
+      config: { languageSpecific: true },
+      pool: [
+        familiar('Obscure Act', 'Other One', ['history']),
+        familiar('Linked Act', 'Friend Song', ['history']),
+        familiar('Ed Sheeran', 'Perfect', ['history'], { userPlays: 30, completions: 30 }),
+        familiar('Random', 'Thing', ['history'], { userPlays: 30, completions: 30 }),
+      ],
+      discoveries: [scored(discovery('Arijit Singh', 'Channa Mereya'), 0.99)],
+    });
+    const seed: readonly TrackSeed[] = [{ title: 'Mystery', artist: 'Obscure Act' }];
+
+    const generated = await h.planner.generate(ROOM, seed, 4, { background: false });
+
+    expect(generated.length).toBeGreaterThan(0);
+    for (const author of authorsOf(generated)) {
+      expect(['Obscure Act', 'Linked Act']).toContain(author);
+    }
+
+    const kept = await h.planner.constrainRefill(ROOM, seed, [
+      refill('Ed Sheeran', 'Shape of You'),
+      refill('Random', 'Another Thing'),
+      refill('Obscure Act', 'Deep Cut'),
+      refill('Linked Act', 'B-Side'),
+    ]);
+    expect(kept.map((track) => track.author)).toEqual(['Obscure Act', 'Linked Act']);
+  });
+
+  it('adds nothing for an unknown seed with no linked music, rather than guessing', async () => {
+    const h = harness({
+      profiles: worldProfiles(),
+      config: { languageSpecific: true },
+      pool: [
+        familiar('Ed Sheeran', 'Perfect', ['history']),
+        familiar('Arijit Singh', 'Tum Hi Ho', ['history']),
+      ],
+      discoveries: [scored(discovery('Coldplay', 'Yellow'), 0.99)],
+    });
+    const seed: readonly TrackSeed[] = [{ title: 'Mystery', artist: 'Obscure Act' }];
+
+    expect(await h.planner.generate(ROOM, seed, 3, { background: false })).toEqual([]);
+    expect(h.resolveKnown).not.toHaveBeenCalled();
+    expect(h.resolveDiscovery).not.toHaveBeenCalled();
+    expect(
+      await h.planner.constrainRefill(ROOM, seed, [
+        refill('Ed Sheeran', 'Shape of You'),
+        refill('Arijit Singh', 'Kesariya'),
+      ]),
+    ).toEqual([]);
+  });
+
+  it('excludes an unknown-language candidate that has no link to the seed', async () => {
+    const h = harness({
+      profiles: worldProfiles(),
+      config: { languageSpecific: true },
+      pool: [
+        familiar('Mystery Band', 'Untagged', ['history'], { userPlays: 30, completions: 30 }),
+        familiar('Taylor Swift', 'Love Story', ['history']),
+      ],
+      discoveries: [scored(discovery('Nobody Knows', 'Who'), 0.99)],
+    });
+    const seed: readonly TrackSeed[] = [{ title: 'Perfect', artist: 'Ed Sheeran' }];
+
+    const generated = await h.planner.generate(ROOM, seed, 3, { background: false });
+
+    expect(generated.length).toBeGreaterThan(0);
+    expect(new Set(authorsOf(generated))).toEqual(new Set(['Taylor Swift']));
+  });
+
+  it('keeps the Devanagari caution: a bare Devanagari seed is not assumed Hindi', async () => {
+    const h = harness({
+      profiles: worldProfiles(),
+      config: { languageSpecific: true },
+      pool: [familiar('Arijit Singh', 'Tum Hi Ho', ['history'])],
+    });
+    // "Gaayak" has no tags: Devanagari alone could be Hindi or Marathi.
+    expect(
+      await h.planner.generate(ROOM, [{ title: 'मराठी गाणे', artist: 'Gaayak' }], 2, {
+        background: false,
+      }),
+    ).toEqual([]);
+  });
+
+  it('follows a Devanagari seed whose artist pins it to Marathi', async () => {
+    const h = harness({
+      profiles: worldProfiles(),
+      config: { languageSpecific: true },
+      pool: [
+        familiar('Arijit Singh', 'Tum Hi Ho', ['history'], { userPlays: 30, completions: 30 }),
+        familiar('Marathi Singer', 'Dusra Gaane', ['history']),
+      ],
+    });
+
+    const generated = await h.planner.generate(
+      ROOM,
+      [{ title: 'मराठी गाणे', artist: 'Marathi Singer' }],
+      2,
+      { background: false },
+    );
+
+    expect(generated.length).toBeGreaterThan(0);
+    expect(new Set(authorsOf(generated))).toEqual(new Set(['Marathi Singer']));
+  });
+
+  it('leaves the refill untouched when language isolation is off', async () => {
+    const h = harness({ profiles: worldProfiles(), config: { languageSpecific: false } });
+    const tracks = [refill('Arijit Singh', 'Kesariya'), refill('Ed Sheeran', 'Shape of You')];
+    expect(
+      await h.planner.constrainRefill(ROOM, [{ title: 'Perfect', artist: 'Ed Sheeran' }], tracks),
+    ).toEqual(tracks);
   });
 });

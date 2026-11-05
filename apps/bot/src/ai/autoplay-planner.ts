@@ -28,7 +28,18 @@ import { getLogger } from '../lib/logger.js';
 import type { QueuedTrack } from '../music/track.js';
 
 import {
+  judgeCandidate,
+  LINKED_ARTIST_MIN_WEIGHT,
+  UNKNOWN_CLASSIFICATION,
+  type Classification,
+  type ConstraintContext,
+  type ConstraintVerdict,
+  type SeedHistory,
+} from './autoplay-constraint.js';
+import {
+  artistSimilarity,
   neighbourhoodScore,
+  similarityBetween,
   type CooccurrenceService,
   type CooccurrenceSignals,
 } from './cooccurrence.js';
@@ -330,18 +341,19 @@ export class AutoplayPlanner implements AutoplayGenerator {
 
     const seedArtists = seeds.map((seed) => identityOf(seed.artist, seed.title).artistKey);
     const lead = seeds[0];
-    const sessionLanguage = this.#config.languageSpecific
-      ? lead === undefined
-        ? null
-        : ((await this.#services.profiles?.autoplayLanguage(lead).catch(() => null)) ?? null)
-      : seedLanguageOf(seeds);
-    if (this.#config.languageSpecific && sessionLanguage === null) {
-      logger.info(
-        { event: 'AUTOPLAY_LANGUAGE_UNKNOWN', roomId },
-        'Cannot establish the requested recording language; not guessing',
-      );
-      return [];
+    // Language isolation follows the LANGUAGE AND STYLE of the lead seed (the
+    // latest thing the listener asked for). The seed's own tags are usually
+    // empty (romanized titles), so its class leans on the artist's tags and the
+    // room's history; whatever stays unknown restricts autoplay to the seed's
+    // own and strongly linked artists instead of ending it.
+    let constraint: ConstraintContext | null = null;
+    if (this.#config.languageSpecific) {
+      if (lead === undefined) return [];
+      constraint = await this.#constraintFor(lead, pool, behaviour);
     }
+    const sessionLanguage = this.#config.languageSpecific
+      ? (constraint?.seed.language ?? null)
+      : seedLanguageOf(seeds);
     const now = Date.now();
     const scoringContext: FamiliarScoringContext = {
       profile,
@@ -407,28 +419,30 @@ export class AutoplayPlanner implements AutoplayGenerator {
     }
     const { exclusions } = pools;
     let { familiarRanked, familiarStrong, discoveryRanked } = pools;
-    if (this.#config.languageSpecific) {
-      const sameLanguage = async (candidate: { title: string; artist: string }): Promise<boolean> =>
-        (await this.#services.profiles?.autoplayLanguage(candidate).catch(() => null)) ===
-        sessionLanguage;
-      // Keep metadata concurrency bounded; a large library must not produce
-      // hundreds of simultaneous Last.fm requests.
-      const matches = async (candidates: readonly { title: string; artist: string }[]) => {
-        const flags: boolean[] = [];
-        for (let offset = 0; offset < candidates.length; offset += 8) {
-          flags.push(
-            ...(await Promise.all(candidates.slice(offset, offset + 8).map(sameLanguage))),
-          );
-        }
-        return flags;
+    if (constraint !== null) {
+      const tally = { language: 0, style: 0, unlinked: 0 };
+      const keep = async <T extends { readonly candidate: { title: string; artist: string } }>(
+        entries: readonly (T & { readonly artistKey: string })[],
+      ): Promise<readonly T[]> => {
+        const verdicts = await this.#judgeAll(
+          entries.map((entry) => ({ ...entry.candidate, artistKey: entry.artistKey })),
+          constraint,
+        );
+        return entries.filter((_entry, index) => {
+          const verdict = verdicts[index] ?? 'unlinked';
+          if (verdict !== 'allow') tally[verdict] += 1;
+          return verdict === 'allow';
+        });
       };
-      const familiarMatches = await matches(familiarRanked.map((entry) => entry.candidate));
-      const discoveryMatches = await matches(discoveryRanked.map((entry) => entry.candidate));
-      familiarRanked = familiarRanked.filter((_entry, index) => familiarMatches[index]);
-      discoveryRanked = discoveryRanked.filter((_entry, index) => discoveryMatches[index]);
+      familiarRanked = await keep(familiarRanked);
+      discoveryRanked = await keep(discoveryRanked);
       familiarStrong = familiarRanked.filter(
         (entry) => entry.score >= this.#config.familiarStrongScore,
       ).length;
+      this.#logConstraint(roomId, 'planner', constraint, {
+        kept: familiarRanked.length + discoveryRanked.length,
+        ...tally,
+      });
     }
 
     logger.info(
@@ -507,14 +521,14 @@ export class AutoplayPlanner implements AutoplayGenerator {
         const primary = kind === 'familiar' ? familiarQueue : discoveryQueue;
         const secondary = kind === 'familiar' ? discoveryQueue : familiarQueue;
 
-        let filled = await this.#fillSlot(room, primary, cycle, resolvers, sessionLanguage);
+        let filled = await this.#fillSlot(room, primary, cycle, resolvers, constraint);
         blocked += filled.blocked;
         // The plan asked for a kind the pool could not deliver (every candidate
         // failed to resolve, or lost its reservation). The other pool is a
         // better outcome than a hole — but only one swap, so a dead discovery
         // pool cannot turn the whole batch into discoveries.
         if (filled.entry === null && secondary.length > 0) {
-          filled = await this.#fillSlot(room, secondary, cycle, resolvers, sessionLanguage);
+          filled = await this.#fillSlot(room, secondary, cycle, resolvers, constraint);
           blocked += filled.blocked;
         }
         if (filled.entry !== null) results.push(filled.entry);
@@ -650,6 +664,164 @@ export class AutoplayPlanner implements AutoplayGenerator {
   }
 
   /**
+   * Filter a refill list (the music layer's YouTube-mix / artist-search
+   * fallback) by the same seed constraint the planner applies to its pools.
+   *
+   * That fallback has no language or style filter of its own, which is how
+   * other-language history leaked into a seed's autoplay. Order is preserved.
+   * Never throws: on an unexpected error nothing is let through, because the
+   * alternative is playing the very mix this exists to stop.
+   */
+  async constrainRefill<T extends { readonly title: string; readonly author: string }>(
+    room: RoomRef,
+    seeds: readonly TrackSeed[],
+    tracks: readonly T[],
+  ): Promise<readonly T[]> {
+    if (!this.#config.languageSpecific) return tracks;
+    try {
+      const lead = seeds[0];
+      if (lead === undefined) return [];
+      const { roomId, guildId } = room;
+      const snapshot = await this.#services.session.snapshot(roomId);
+      const present =
+        this.#resolvers?.presentListeners?.(room, snapshot.listenerIds) ?? snapshot.listenerIds;
+      const listenerIds = present.slice(0, this.#config.maxListeners);
+      const [pool, behaviour] = await Promise.all([
+        this.#services.familiar.pool(guildId, listenerIds).catch(() => []),
+        this.#services.cooccurrence?.signals(guildId, listenerIds).catch(() => EMPTY_SIGNALS) ??
+          Promise.resolve(EMPTY_SIGNALS),
+      ]);
+      const context = await this.#constraintFor(lead, pool, behaviour);
+      const verdicts = await this.#judgeAll(
+        tracks.map((track) => ({
+          title: track.title,
+          artist: track.author,
+          artistKey: identityOf(track.author, track.title).artistKey,
+        })),
+        context,
+      );
+      const tally = { language: 0, style: 0, unlinked: 0 };
+      const kept = tracks.filter((_track, index) => {
+        const verdict = verdicts[index] ?? 'unlinked';
+        if (verdict !== 'allow') tally[verdict] += 1;
+        return verdict === 'allow';
+      });
+      this.#logConstraint(roomId, 'refill', context, { kept: kept.length, ...tally });
+      return kept;
+    } catch (error) {
+      logger.warn({ err: error, roomId: room.roomId }, 'Refill constraint failed; dropping refill');
+      return [];
+    }
+  }
+
+  /**
+   * Classify the lead seed and work out which artists count as linked to it.
+   *
+   * History for the seed comes from the known pool (the artist's other songs,
+   * and songs the room's behaviour ties to this one) so a romanized seed with
+   * no tags can still be placed. Linked artists are the seed's strong
+   * co-occurrence neighbours: an unknown candidate from one of them is allowed.
+   */
+  async #constraintFor(
+    lead: TrackSeed,
+    pool: readonly FamiliarCandidate[],
+    behaviour: CooccurrenceSignals,
+  ): Promise<ConstraintContext> {
+    const seedIdentity = identityOf(lead.artist, lead.title);
+    const sameArtist = pool.filter((entry) => {
+      const identity = identityOf(entry.artist, entry.title);
+      return identity.artistKey === seedIdentity.artistKey && identity.key !== seedIdentity.key;
+    });
+    const coplayed = pool
+      .map((entry) => ({
+        title: entry.title,
+        artist: entry.artist,
+        weight: similarityBetween(
+          behaviour,
+          identityOf(entry.artist, entry.title).key,
+          seedIdentity.key,
+        ),
+      }))
+      .filter((entry) => entry.weight > 0)
+      .sort((a, b) => b.weight - a.weight);
+    const history: SeedHistory = { sameArtist, coplayed };
+
+    const seed: Classification =
+      (await this.#services.profiles?.autoplaySeedClass(lead, history).catch(() => null)) ??
+      UNKNOWN_CLASSIFICATION;
+
+    // Neighbours of the seed's artist: its own row plus every row that lists it.
+    const linked = new Set<string>();
+    const consider = (artistKey: string): void => {
+      if (
+        artistKey !== seedIdentity.artistKey &&
+        artistSimilarity(behaviour, seedIdentity.artistKey, artistKey) >= LINKED_ARTIST_MIN_WEIGHT
+      ) {
+        linked.add(artistKey);
+      }
+    };
+    for (const neighbour of behaviour.artists.get(seedIdentity.artistKey)?.keys() ?? []) {
+      consider(neighbour);
+    }
+    for (const [artistKey, row] of behaviour.artists) {
+      if (row.has(seedIdentity.artistKey)) consider(artistKey);
+    }
+
+    return { seed, seedArtistKeys: new Set([seedIdentity.artistKey]), linkedArtistKeys: linked };
+  }
+
+  async #classify(input: { title: string; artist: string }): Promise<Classification> {
+    return (
+      (await this.#services.profiles?.autoplayClass(input).catch(() => null)) ??
+      UNKNOWN_CLASSIFICATION
+    );
+  }
+
+  /** Verdicts for each candidate, with metadata concurrency kept bounded. */
+  async #judgeAll(
+    candidates: readonly { title: string; artist: string; artistKey: string }[],
+    context: ConstraintContext,
+  ): Promise<readonly ConstraintVerdict[]> {
+    // A large library must not produce hundreds of simultaneous Last.fm requests.
+    const verdicts: ConstraintVerdict[] = [];
+    for (let offset = 0; offset < candidates.length; offset += 8) {
+      verdicts.push(
+        ...(await Promise.all(
+          candidates
+            .slice(offset, offset + 8)
+            .map(async (candidate) =>
+              judgeCandidate(await this.#classify(candidate), candidate.artistKey, context),
+            ),
+        )),
+      );
+    }
+    return verdicts;
+  }
+
+  /** One compact line per constraint pass; the counts say why a pass came up empty. */
+  #logConstraint(
+    roomId: string,
+    path: 'planner' | 'refill',
+    context: ConstraintContext,
+    counts: { kept: number; language: number; style: number; unlinked: number },
+  ): void {
+    const { language, style, confidence, sources } = context.seed;
+    logger.info(
+      {
+        event: 'AUTOPLAY_CONSTRAINT',
+        roomId,
+        path,
+        seed: { language, style, confidence, sources },
+        kept: counts.kept,
+        excludedLanguage: counts.language,
+        excludedStyle: counts.style,
+        excludedUnlinked: counts.unlinked,
+      },
+      'Autoplay seed constraint',
+    );
+  }
+
+  /**
    * Fill one slot from one pool: the best remaining candidate that wins its
    * reservation and resolves to something playable that is not a duplicate.
    *
@@ -661,7 +833,7 @@ export class AutoplayPlanner implements AutoplayGenerator {
     queue: SlotCandidate[],
     cycle: CycleState,
     resolvers: PlannerResolvers,
-    sessionLanguage: string | null,
+    constraint: ConstraintContext | null,
   ): Promise<{ readonly entry: GeneratedTrack | null; readonly blocked: number }> {
     // Reservations and the resolvers are the room's; the logs name it too, so
     // two channels in one server can be told apart in a trace.
@@ -697,22 +869,23 @@ export class AutoplayPlanner implements AutoplayGenerator {
         continue;
       }
 
-      // The resolved upload speaks its own vocabulary; check it again.
-      if (
-        this.#config.languageSpecific &&
-        (await this.#services.profiles
-          ?.autoplayLanguage({
-            title: track.title,
-            artist: candidate.familiar?.artist ?? candidate.discovery?.artist ?? track.author,
-          })
-          .catch(() => null)) !== sessionLanguage
-      ) {
-        await this.#services.session.release(roomId, [candidate.key]).catch(() => undefined);
-        logger.debug(
-          { event: 'AUTOPLAY_LANGUAGE_REJECTED', roomId, sessionLanguage },
-          'Resolved recording language differs or cannot be established',
+      // The resolved upload speaks its own vocabulary (and may be a different
+      // song than the one planned); judge what will actually play.
+      if (constraint !== null) {
+        const artist = candidate.familiar?.artist ?? candidate.discovery?.artist ?? track.author;
+        const verdict = judgeCandidate(
+          await this.#classify({ title: track.title, artist }),
+          candidate.artistKey,
+          constraint,
         );
-        continue;
+        if (verdict !== 'allow') {
+          await this.#services.session.release(roomId, [candidate.key]).catch(() => undefined);
+          logger.debug(
+            { event: 'AUTOPLAY_CONSTRAINT_REJECTED', roomId, verdict },
+            'Resolved recording does not follow the seed language and style',
+          );
+          continue;
+        }
       }
       const resolvedKey = identityOf(track.author, track.title).key;
       if (cycle.isDuplicate(track.identifier, resolvedKey)) {
