@@ -3,6 +3,8 @@
 #
 #   pnpm docker:build   # build fresh images from the current code, delete the old ones
 #   pnpm docker:up      # (re)create the containers from those images and start them
+#   pnpm docker:restart # restart the running containers in place
+#   pnpm docker:logs    # pick a container from a list and follow its logs
 #   pnpm docker:down    # stop and remove the containers
 #
 # Extra arguments are passed to docker compose, for example
@@ -46,8 +48,36 @@ case "$command" in
     compose up -d "$@"
     remove_old_images
     ;;
+  restart)
+    # Restarts the existing containers (all, or the services named) without
+    # removing or recreating them. Code changes need docker:build + docker:up.
+    compose restart "$@"
+    ;;
+  logs)
+    # `pnpm docker:logs bot-main` skips the menu.
+    service=${1:-}
+    if [[ -z $service ]]; then
+      mapfile -t services < <(compose ps --services --status running)
+      if [[ ${#services[@]} -eq 0 ]]; then
+        echo "No containers are running. Start them with 'pnpm docker:up'." >&2
+        exit 1
+      fi
+      echo "Which container do you want the logs for?"
+      PS3="Enter a number: "
+      select choice in "${services[@]}" "all"; do
+        [[ -n ${choice:-} ]] && break
+        echo "Pick a number from the list."
+      done
+      [[ -n ${choice:-} ]] || exit 1 # no answer (Ctrl+D)
+      [[ $choice == all ]] && service="" || service=$choice
+    else
+      shift
+    fi
+    # --tail rather than --since: --since has returned nothing on this stack.
+    compose logs -f --tail=200 ${service:+"$service"} "$@"
+    ;;
   *)
-    echo "Usage: $0 build|up [docker compose args...]" >&2
+    echo "Usage: $0 build|up|restart|logs [docker compose args...]" >&2
     exit 2
     ;;
 esac

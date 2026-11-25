@@ -1,10 +1,11 @@
 # Local PostgreSQL and Redis are started alongside the bot infrastructure.
 # Bots, web, and migrations use the Docker-internal PostgreSQL and Redis URLs.
 #
-#   pnpm run docker:build  # build new images from the current code, delete old ones
-#   pnpm run docker:up     # create/start containers from the built images
-#   pnpm run docker:logs   # follow logs
-#   pnpm run docker:down   # stop
+#   pnpm run docker:build   # build new images from the current code, delete old ones
+#   pnpm run docker:up      # create/start containers from the built images
+#   pnpm run docker:restart # restart running containers in place
+#   pnpm run docker:logs    # choose a container and follow its logs
+#   pnpm run docker:down    # stop
 #
 # Those scripts pin DOCKER_CONTEXT=default. A machine running Docker Desktop
 # alongside the system daemon has two independent daemons, and Desktop makes

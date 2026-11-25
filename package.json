@@ -35,7 +35,8 @@
     "docker:build": "bash scripts/docker-stack.sh build",
     "docker:up": "bash scripts/docker-stack.sh up",
     "docker:down": "DOCKER_CONTEXT=${DOCKER_CONTEXT:-default} docker compose --env-file .env -f docker/docker-compose.yml down",
-    "docker:logs": "DOCKER_CONTEXT=${DOCKER_CONTEXT:-default} docker compose --env-file .env -f docker/docker-compose.yml logs -f",
+    "docker:restart": "bash scripts/docker-stack.sh restart",
+    "docker:logs": "bash scripts/docker-stack.sh logs",
     "clean": "turbo run clean && rm -rf node_modules .turbo",
     "prepare": "husky",
     "check:env:prod": "node scripts/check-env.mjs --production"
