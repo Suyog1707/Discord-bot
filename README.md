@@ -28,7 +28,8 @@ See [CHANGELOG.md](CHANGELOG.md) for what shipped in each phase and
 ```bash
 pnpm install                 # install workspace dependencies
 cp .env.example .env         # then fill in the Discord credentials
-pnpm run docker:up           # start PostgreSQL, Redis and Lavalink
+pnpm run docker:build        # build images from the current code (deletes old ones)
+pnpm run docker:up           # start PostgreSQL, Redis, Lavalink and the bots
 pnpm run check:env           # verify every variable before starting anything
 pnpm run db:generate         # generate the Prisma client
 pnpm run db:migrate          # create and apply the initial migration

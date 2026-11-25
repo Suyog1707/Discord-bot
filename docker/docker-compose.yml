@@ -1,7 +1,8 @@
 # Local PostgreSQL and Redis are started alongside the bot infrastructure.
 # Bots, web, and migrations use the Docker-internal PostgreSQL and Redis URLs.
 #
-#   pnpm run docker:up     # start
+#   pnpm run docker:build  # build new images from the current code, delete old ones
+#   pnpm run docker:up     # create/start containers from the built images
 #   pnpm run docker:logs   # follow logs
 #   pnpm run docker:down   # stop
 #
