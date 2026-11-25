@@ -22,3 +22,8 @@ docker
 docs
 **/coverage
 **/*.log
+
+# Repo tooling (Docker commands, backups, POT refresh) — not part of any image.
+# The web build runs check-web-middleware.mjs, so that one file stays in.
+scripts
+!scripts/check-web-middleware.mjs
