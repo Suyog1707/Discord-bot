@@ -37,10 +37,18 @@ remove_old_images() {
     --filter "label=com.docker.compose.project=${project}"
 }
 
-# "image-ref image-id" for every image the stack uses (built and downloaded).
+# "image-ref image-id fingerprint" for every image the stack uses (built and
+# downloaded). The fingerprint hashes the layers and settings: a fully cached
+# rebuild produces identical content but a new image ID (BuildKit adds a fresh
+# build record each time), so the ID alone would report a change that is not one.
 image_ids() {
   compose config --images | sort -u | while read -r ref; do
-    echo "$ref $(docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null || echo none)"
+    local id fingerprint
+    id=$(docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null || echo none)
+    fingerprint=$(docker image inspect \
+      --format '{{json .RootFS.Layers}}{{json .Config}}' "$ref" 2>/dev/null \
+      | sha256sum | cut -c1-16)
+    echo "$ref $id $fingerprint"
   done
 }
 
@@ -49,9 +57,9 @@ container_ids() {
   compose ps -a --format '{{.Service}} {{.ID}}' 2>/dev/null | sort
 }
 
-# Prints the refs whose image ID differs between two image_ids() snapshots.
+# Prints the refs whose content differs between two image_ids() snapshots.
 changed_images() {
-  join <(sort <<<"$1") <(sort <<<"$2") | awk '$2 != $3 { print $1 }'
+  join -o 0,1.3,2.3 <(sort <<<"$1") <(sort <<<"$2") | awk '$2 != $3 { print $1 }'
 }
 
 # Prints the services whose container is new or was replaced.
@@ -110,7 +118,7 @@ case "$command" in
     report "$changed" "$(recreated_containers "$containers_before" "$(container_ids)")"
     # A downloaded image's old version is untagged but has no Compose label,
     # so the prune below misses it: delete those by ID once nothing uses them.
-    while read -r ref old_id; do
+    while read -r ref old_id _; do
       [[ $old_id != none && $ref != "${project}-"* ]] || continue
       grep -qxF "$ref" <<<"$changed" || continue
       docker image rm "$old_id" >/dev/null 2>&1 \
