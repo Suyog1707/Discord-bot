@@ -34,6 +34,7 @@
     "pot:refresh": "node scripts/refresh-pot.mjs",
     "docker:build": "bash scripts/docker-stack.sh build",
     "docker:up": "bash scripts/docker-stack.sh up",
+    "docker:update": "bash scripts/docker-stack.sh update",
     "docker:down": "DOCKER_CONTEXT=${DOCKER_CONTEXT:-default} docker compose --env-file .env -f docker/docker-compose.yml down",
     "docker:restart": "bash scripts/docker-stack.sh restart",
     "docker:logs": "bash scripts/docker-stack.sh logs",

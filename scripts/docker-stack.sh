@@ -3,6 +3,7 @@
 #
 #   pnpm docker:build   # build fresh images from the current code, delete the old ones
 #   pnpm docker:up      # (re)create the containers from those images and start them
+#   pnpm docker:update  # pull newer third-party images, rebuild ours, recreate what changed
 #   pnpm docker:restart # restart the running containers in place
 #   pnpm docker:logs    # pick a container from a list and follow its logs
 #   pnpm docker:down    # stop and remove the containers
@@ -32,6 +33,14 @@ remove_old_images() {
     --filter "label=com.docker.compose.project=${project}"
 }
 
+# Image IDs of the downloaded (not built) images, one "ref id" per line.
+pulled_image_ids() {
+  compose config --images | sort -u | while read -r ref; do
+    [[ $ref == "${project}-"* ]] && continue # built locally, handled by prune
+    echo "$ref $(docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null || true)"
+  done
+}
+
 command=${1:-}
 shift || true
 
@@ -46,6 +55,27 @@ case "$command" in
     # Builds only images that do not exist yet; otherwise uses the ones from
     # `docker:build` and recreates any container whose image changed.
     compose up -d "$@"
+    remove_old_images
+    ;;
+  update)
+    before=$(pulled_image_ids)
+    echo "Pulling newer versions of the downloaded images..."
+    compose pull --ignore-buildable "$@"
+    echo "Rebuilding this project's images..."
+    compose build --pull "$@"
+    # Recreates only the containers whose image or config changed.
+    compose up -d "$@"
+    # A pulled image's old version is untagged but has no Compose label, so
+    # the prune below misses it: delete those by ID once nothing uses them.
+    while read -r ref old_id; do
+      [[ -n $old_id ]] || continue
+      new_id=$(docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null || true)
+      if [[ $new_id != "$old_id" ]]; then
+        echo "Updated $ref"
+        docker image rm "$old_id" >/dev/null 2>&1 \
+          || echo "  old $ref image is still in use; left in place"
+      fi
+    done <<<"$before"
     remove_old_images
     ;;
   restart)
@@ -77,7 +107,7 @@ case "$command" in
     compose logs -f --tail=200 ${service:+"$service"} "$@"
     ;;
   *)
-    echo "Usage: $0 build|up|restart|logs [docker compose args...]" >&2
+    echo "Usage: $0 build|up|update|restart|logs [docker compose args...]" >&2
     exit 2
     ;;
 esac

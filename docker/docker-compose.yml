@@ -3,6 +3,7 @@
 #
 #   pnpm run docker:build   # build new images from the current code, delete old ones
 #   pnpm run docker:up      # create/start containers from the built images
+#   pnpm run docker:update  # pull newer downloaded images, rebuild ours, recreate
 #   pnpm run docker:restart # restart running containers in place
 #   pnpm run docker:logs    # choose a container and follow its logs
 #   pnpm run docker:down    # stop
